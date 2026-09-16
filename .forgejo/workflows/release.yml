@@ -102,13 +102,13 @@ jobs:
         uses: https://data.forgejo.org/docker/login-action@v4
         with:
           registry: git.ow-ops.eu
-          username: ${{ vars.USERNAME }}
+          username: owl-bot
           password: ${{ secrets.FORGE_TOKEN }}
       - name: Login to codeberg.org
         uses: https://data.forgejo.org/docker/login-action@v4
         with:
           registry: codeberg.org
-          username: ${{ vars.USERNAME }}
+          username: owl-bot
           password: ${{ secrets.CODEBERG_TOKEN }}
       - name: Login to registry.erwanleboucher.dev
         uses: https://data.forgejo.org/docker/login-action@v4
@@ -346,17 +346,15 @@ jobs:
       - name: Login to git.ow-ops.eu
         env:
           FORGE_TOKEN: ${{ secrets.FORGE_TOKEN }}
-          USERNAME: ${{ vars.USERNAME }}
         run: |
           set -euo pipefail
-          echo "${FORGE_TOKEN}" | helm registry login git.ow-ops.eu --username "${USERNAME}" --password-stdin
+          echo "${FORGE_TOKEN}" | helm registry login git.ow-ops.eu --username owl-bot --password-stdin
       - name: Login to codeberg.org
         env:
           CODEBERG_TOKEN: ${{ secrets.CODEBERG_TOKEN }}
-          USERNAME: ${{ vars.USERNAME }}
         run: |
           set -euo pipefail
-          echo "${CODEBERG_TOKEN}" | helm registry login codeberg.org --username "${USERNAME}" --password-stdin
+          echo "${CODEBERG_TOKEN}" | helm registry login codeberg.org --username owl-bot --password-stdin
       - name: Login to registry.erwanleboucher.dev
         env:
           APOCI_REGISTRY_TOKEN: ${{ secrets.APOCI_REGISTRY_TOKEN }}
@@ -426,13 +424,12 @@ jobs:
           COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
           FORGE_TOKEN: ${{ secrets.FORGE_TOKEN }}
           CODEBERG_TOKEN: ${{ secrets.CODEBERG_TOKEN }}
-          USERNAME: ${{ vars.USERNAME }}
           APOCI_REGISTRY_TOKEN: ${{ secrets.APOCI_REGISTRY_TOKEN }}
         run: |
           set -euo pipefail
           # helm registry login only fills helm's config; cosign reads the
           # docker config, so it needs its own login.
-          echo "${FORGE_TOKEN}" | cosign login git.ow-ops.eu --username "${USERNAME}" --password-stdin
-          echo "${CODEBERG_TOKEN}" | cosign login codeberg.org --username "${USERNAME}" --password-stdin
+          echo "${FORGE_TOKEN}" | cosign login git.ow-ops.eu --username owl-bot --password-stdin
+          echo "${CODEBERG_TOKEN}" | cosign login codeberg.org --username owl-bot --password-stdin
           echo "${APOCI_REGISTRY_TOKEN}" | cosign login registry.erwanleboucher.dev --username eleboucher --password-stdin
           xargs cosign sign --yes --key env://COSIGN_KEY < chart-digests.txt

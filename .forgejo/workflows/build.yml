@@ -28,13 +28,13 @@ jobs:
         uses: https://data.forgejo.org/docker/login-action@v4
         with:
           registry: git.ow-ops.eu
-          username: ${{ vars.USERNAME }}
+          username: owl-bot
           password: ${{ secrets.FORGE_TOKEN }}
       - name: Login to codeberg.org
         uses: https://data.forgejo.org/docker/login-action@v4
         with:
           registry: codeberg.org
-          username: ${{ vars.USERNAME }}
+          username: owl-bot
           password: ${{ secrets.CODEBERG_TOKEN }}
       - name: Login to registry.erwanleboucher.dev
         uses: https://data.forgejo.org/docker/login-action@v4
