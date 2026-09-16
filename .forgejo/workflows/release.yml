@@ -38,16 +38,16 @@ jobs:
           set -euo pipefail
           CONTENT="$(git-cliff --config cliff.toml --latest --strip all)"
           printf 'content<<EOF\n%s\nEOF\n' "$CONTENT" >> "$GITHUB_OUTPUT"
-      - name: Create Codeberg release
+      - name: Create release
         id: create
         env:
-          CODEBERG_TOKEN: ${{ secrets.CODEBERG_TOKEN }}
+          FORGE_TOKEN: ${{ secrets.FORGE_TOKEN }}
           RELEASE_BODY: ${{ steps.changelog.outputs.content }}
         run: |
           set -euo pipefail
           TAG="${GITHUB_REF#refs/tags/}"
-          if [ -z "${CODEBERG_TOKEN:-}" ]; then
-            echo "CODEBERG_TOKEN secret is empty or missing" >&2
+          if [ -z "${FORGE_TOKEN:-}" ]; then
+            echo "FORGE_TOKEN secret is empty or missing" >&2
             exit 1
           fi
           RESPONSE="$(jq -n \
@@ -57,10 +57,10 @@ jobs:
             '{tag_name: $tag, name: $name, body: $body, draft: false, prerelease: false}' \
             | curl -sS -X POST \
                 -w '\n%{http_code}' \
-                -H "Authorization: token ${CODEBERG_TOKEN}" \
+                -H "Authorization: token ${FORGE_TOKEN}" \
                 -H "Content-Type: application/json" \
                 --data-binary @- \
-                "https://codeberg.org/api/v1/repos/${GITHUB_REPOSITORY}/releases")"
+                "https://git.ow-ops.eu/api/v1/repos/${GITHUB_REPOSITORY}/releases")"
           HTTP_CODE="${RESPONSE##*$'\n'}"
           BODY="${RESPONSE%$'\n'*}"
           if [ "$HTTP_CODE" != "201" ]; then
@@ -98,6 +98,12 @@ jobs:
           tool: cargo-edit
       - name: Set version from git tag
         run: cargo set-version "${GITHUB_REF#refs/tags/v}"
+      - name: Login to git.ow-ops.eu
+        uses: https://data.forgejo.org/docker/login-action@v4
+        with:
+          registry: git.ow-ops.eu
+          username: ${{ vars.USERNAME }}
+          password: ${{ secrets.FORGE_TOKEN }}
       - name: Login to codeberg.org
         uses: https://data.forgejo.org/docker/login-action@v4
         with:
@@ -115,6 +121,7 @@ jobs:
         uses: https://data.forgejo.org/docker/metadata-action@v6
         with:
           images: |
+            git.ow-ops.eu/towonel/towonel-node
             codeberg.org/towonel/towonel-node
             registry.erwanleboucher.dev/eleboucher/towonel-node
           tags: |
@@ -137,8 +144,8 @@ jobs:
           secrets: |
             SCCACHE_AWS_ACCESS_KEY_ID=${{ secrets.SCCACHE_AWS_ACCESS_KEY_ID }}
             SCCACHE_AWS_SECRET_ACCESS_KEY=${{ secrets.SCCACHE_AWS_SECRET_ACCESS_KEY }}
-          cache-from: type=registry,ref=codeberg.org/towonel/towonel-buildcache:node
-          cache-to: type=registry,ref=codeberg.org/towonel/towonel-buildcache:node,mode=max,ignore-error=true
+          cache-from: type=registry,ref=git.ow-ops.eu/towonel/towonel-buildcache:node
+          cache-to: type=registry,ref=git.ow-ops.eu/towonel/towonel-buildcache:node,mode=max,ignore-error=true
       - name: Extract node binaries
         uses: https://data.forgejo.org/docker/build-push-action@v7
         with:
@@ -152,12 +159,13 @@ jobs:
           secrets: |
             SCCACHE_AWS_ACCESS_KEY_ID=${{ secrets.SCCACHE_AWS_ACCESS_KEY_ID }}
             SCCACHE_AWS_SECRET_ACCESS_KEY=${{ secrets.SCCACHE_AWS_SECRET_ACCESS_KEY }}
-          cache-from: type=registry,ref=codeberg.org/towonel/towonel-buildcache:node
+          cache-from: type=registry,ref=git.ow-ops.eu/towonel/towonel-buildcache:node
       - name: Compute agent image metadata
         id: meta-agent
         uses: https://data.forgejo.org/docker/metadata-action@v6
         with:
           images: |
+            git.ow-ops.eu/towonel/towonel-agent
             codeberg.org/towonel/towonel-agent
             registry.erwanleboucher.dev/eleboucher/towonel-agent
           tags: |
@@ -180,8 +188,8 @@ jobs:
           secrets: |
             SCCACHE_AWS_ACCESS_KEY_ID=${{ secrets.SCCACHE_AWS_ACCESS_KEY_ID }}
             SCCACHE_AWS_SECRET_ACCESS_KEY=${{ secrets.SCCACHE_AWS_SECRET_ACCESS_KEY }}
-          cache-from: type=registry,ref=codeberg.org/towonel/towonel-buildcache:agent
-          cache-to: type=registry,ref=codeberg.org/towonel/towonel-buildcache:agent,mode=max,ignore-error=true
+          cache-from: type=registry,ref=git.ow-ops.eu/towonel/towonel-buildcache:agent
+          cache-to: type=registry,ref=git.ow-ops.eu/towonel/towonel-buildcache:agent,mode=max,ignore-error=true
       - name: Extract agent binaries
         uses: https://data.forgejo.org/docker/build-push-action@v7
         with:
@@ -195,12 +203,13 @@ jobs:
           secrets: |
             SCCACHE_AWS_ACCESS_KEY_ID=${{ secrets.SCCACHE_AWS_ACCESS_KEY_ID }}
             SCCACHE_AWS_SECRET_ACCESS_KEY=${{ secrets.SCCACHE_AWS_SECRET_ACCESS_KEY }}
-          cache-from: type=registry,ref=codeberg.org/towonel/towonel-buildcache:agent
+          cache-from: type=registry,ref=git.ow-ops.eu/towonel/towonel-buildcache:agent
       - name: Compute hub-caddy image metadata
         id: meta-hub-caddy
         uses: https://data.forgejo.org/docker/metadata-action@v6
         with:
           images: |
+            git.ow-ops.eu/towonel/towonel-hub-caddy
             codeberg.org/towonel/towonel-hub-caddy
             registry.erwanleboucher.dev/eleboucher/towonel-hub-caddy
           tags: |
@@ -223,8 +232,8 @@ jobs:
           secrets: |
             SCCACHE_AWS_ACCESS_KEY_ID=${{ secrets.SCCACHE_AWS_ACCESS_KEY_ID }}
             SCCACHE_AWS_SECRET_ACCESS_KEY=${{ secrets.SCCACHE_AWS_SECRET_ACCESS_KEY }}
-          cache-from: type=registry,ref=codeberg.org/towonel/towonel-buildcache:hub-caddy
-          cache-to: type=registry,ref=codeberg.org/towonel/towonel-buildcache:hub-caddy,mode=max,ignore-error=true
+          cache-from: type=registry,ref=git.ow-ops.eu/towonel/towonel-buildcache:hub-caddy
+          cache-to: type=registry,ref=git.ow-ops.eu/towonel/towonel-buildcache:hub-caddy,mode=max,ignore-error=true
       - name: Install cosign
         run: |
           set -euo pipefail
@@ -250,10 +259,13 @@ jobs:
         run: |
           set -euo pipefail
           cosign sign --yes --key env://COSIGN_KEY \
+            "git.ow-ops.eu/towonel/towonel-node@${NODE_DIGEST}" \
             "codeberg.org/towonel/towonel-node@${NODE_DIGEST}" \
             "registry.erwanleboucher.dev/eleboucher/towonel-node@${NODE_DIGEST}" \
+            "git.ow-ops.eu/towonel/towonel-agent@${AGENT_DIGEST}" \
             "codeberg.org/towonel/towonel-agent@${AGENT_DIGEST}" \
             "registry.erwanleboucher.dev/eleboucher/towonel-agent@${AGENT_DIGEST}" \
+            "git.ow-ops.eu/towonel/towonel-hub-caddy@${HUB_CADDY_DIGEST}" \
             "codeberg.org/towonel/towonel-hub-caddy@${HUB_CADDY_DIGEST}" \
             "registry.erwanleboucher.dev/eleboucher/towonel-hub-caddy@${HUB_CADDY_DIGEST}"
       - name: Stage and archive
@@ -287,9 +299,9 @@ jobs:
               --bundle "${ARCHIVE}.cosign.bundle" \
               "${ARCHIVE}"
           done
-      - name: Upload assets to Codeberg release
+      - name: Upload release assets
         env:
-          CODEBERG_TOKEN: ${{ secrets.CODEBERG_TOKEN }}
+          FORGE_TOKEN: ${{ secrets.FORGE_TOKEN }}
           RELEASE_ID: ${{ needs.release.outputs.release_id }}
           TAG: ${{ needs.release.outputs.tag }}
         run: |
@@ -299,10 +311,10 @@ jobs:
             local response http_code body
             response="$(curl -sS -X POST \
               -w '\n%{http_code}' \
-              -H "Authorization: token ${CODEBERG_TOKEN}" \
+              -H "Authorization: token ${FORGE_TOKEN}" \
               -H "Content-Type: application/octet-stream" \
               --data-binary "@${file}" \
-              "https://codeberg.org/api/v1/repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}/assets?name=$(basename "${file}")")"
+              "https://git.ow-ops.eu/api/v1/repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}/assets?name=$(basename "${file}")")"
             http_code="${response##*$'\n'}"
             body="${response%$'\n'*}"
             if [ "$http_code" != "201" ]; then
@@ -331,6 +343,13 @@ jobs:
           # Pin Helm 3 so `helm push` keeps emitting the "Digest:" line the
           # chart-signing step parses; Helm 4 changed plugin/OCI behaviour.
           version: v3.21.4
+      - name: Login to git.ow-ops.eu
+        env:
+          FORGE_TOKEN: ${{ secrets.FORGE_TOKEN }}
+          USERNAME: ${{ vars.USERNAME }}
+        run: |
+          set -euo pipefail
+          echo "${FORGE_TOKEN}" | helm registry login git.ow-ops.eu --username "${USERNAME}" --password-stdin
       - name: Login to codeberg.org
         env:
           CODEBERG_TOKEN: ${{ secrets.CODEBERG_TOKEN }}
@@ -373,22 +392,18 @@ jobs:
             NAME="$(basename "$chart")"
             helm dependency build "$chart"
             helm package "$chart" --version "${VERSION}" --app-version "${VERSION}"
-            OUTPUT="$(helm push "${NAME}-${VERSION}.tgz" "oci://codeberg.org/towonel/charts" 2>&1)"
-            echo "$OUTPUT"
-            DIGEST="$(echo "$OUTPUT" | sed -n 's/^Digest: //p')"
-            if [ -z "$DIGEST" ]; then
-              echo "failed to parse digest for ${NAME}" >&2
-              exit 1
-            fi
-            echo "codeberg.org/towonel/charts/${NAME}@${DIGEST}" >> chart-digests.txt
-            OUTPUT="$(helm push "${NAME}-${VERSION}.tgz" "oci://registry.erwanleboucher.dev/eleboucher/charts" 2>&1)"
-            echo "$OUTPUT"
-            DIGEST="$(echo "$OUTPUT" | sed -n 's/^Digest: //p')"
-            if [ -z "$DIGEST" ]; then
-              echo "failed to parse digest for ${NAME} on registry.erwanleboucher.dev" >&2
-              exit 1
-            fi
-            echo "registry.erwanleboucher.dev/eleboucher/charts/${NAME}@${DIGEST}" >> chart-digests.txt
+            for REPO in git.ow-ops.eu/towonel/charts \
+                        codeberg.org/towonel/charts \
+                        registry.erwanleboucher.dev/eleboucher/charts; do
+              OUTPUT="$(helm push "${NAME}-${VERSION}.tgz" "oci://${REPO}" 2>&1)"
+              echo "$OUTPUT"
+              DIGEST="$(echo "$OUTPUT" | sed -n 's/^Digest: //p')"
+              if [ -z "$DIGEST" ]; then
+                echo "failed to parse digest for ${NAME} on ${REPO}" >&2
+                exit 1
+              fi
+              echo "${REPO}/${NAME}@${DIGEST}" >> chart-digests.txt
+            done
           done
       - name: Install cosign
         run: |
@@ -409,6 +424,7 @@ jobs:
         env:
           COSIGN_KEY: ${{ secrets.COSIGN_PRIVATE_KEY }}
           COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
+          FORGE_TOKEN: ${{ secrets.FORGE_TOKEN }}
           CODEBERG_TOKEN: ${{ secrets.CODEBERG_TOKEN }}
           USERNAME: ${{ vars.USERNAME }}
           APOCI_REGISTRY_TOKEN: ${{ secrets.APOCI_REGISTRY_TOKEN }}
@@ -416,6 +432,7 @@ jobs:
           set -euo pipefail
           # helm registry login only fills helm's config; cosign reads the
           # docker config, so it needs its own login.
+          echo "${FORGE_TOKEN}" | cosign login git.ow-ops.eu --username "${USERNAME}" --password-stdin
           echo "${CODEBERG_TOKEN}" | cosign login codeberg.org --username "${USERNAME}" --password-stdin
           echo "${APOCI_REGISTRY_TOKEN}" | cosign login registry.erwanleboucher.dev --username eleboucher --password-stdin
           xargs cosign sign --yes --key env://COSIGN_KEY < chart-digests.txt

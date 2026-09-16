@@ -24,6 +24,12 @@ jobs:
       - name: Compute build timestamp
         id: build-meta
         run: echo "created=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+      - name: Login to git.ow-ops.eu
+        uses: https://data.forgejo.org/docker/login-action@v4
+        with:
+          registry: git.ow-ops.eu
+          username: ${{ vars.USERNAME }}
+          password: ${{ secrets.FORGE_TOKEN }}
       - name: Login to codeberg.org
         uses: https://data.forgejo.org/docker/login-action@v4
         with:
@@ -41,6 +47,7 @@ jobs:
         uses: https://data.forgejo.org/docker/metadata-action@v6
         with:
           images: |
+            git.ow-ops.eu/towonel/towonel-node
             codeberg.org/towonel/towonel-node
             registry.erwanleboucher.dev/eleboucher/towonel-node
           tags: |
@@ -49,7 +56,7 @@ jobs:
           labels: |
             org.opencontainers.image.title=towonel
             org.opencontainers.image.description=Towonel hub/edge node — Iroh-based tunnel control plane and data plane
-            org.opencontainers.image.documentation=https://codeberg.org/towonel/towonel/src/branch/main/README.md
+            org.opencontainers.image.documentation=https://git.ow-ops.eu/towonel/towonel/src/branch/main/README.md
             org.opencontainers.image.authors=Erwan Leboucher <erwanleboucher@gmail.com>
             org.opencontainers.image.vendor=Erwan Leboucher
       - name: Build and push towonel-node
@@ -71,13 +78,14 @@ jobs:
           secrets: |
             SCCACHE_AWS_ACCESS_KEY_ID=${{ secrets.SCCACHE_AWS_ACCESS_KEY_ID }}
             SCCACHE_AWS_SECRET_ACCESS_KEY=${{ secrets.SCCACHE_AWS_SECRET_ACCESS_KEY }}
-          cache-from: type=registry,ref=codeberg.org/towonel/towonel-buildcache:node
-          cache-to: type=registry,ref=codeberg.org/towonel/towonel-buildcache:node,mode=max,ignore-error=true
+          cache-from: type=registry,ref=git.ow-ops.eu/towonel/towonel-buildcache:node
+          cache-to: type=registry,ref=git.ow-ops.eu/towonel/towonel-buildcache:node,mode=max,ignore-error=true
       - name: Compute agent image metadata
         id: meta-agent
         uses: https://data.forgejo.org/docker/metadata-action@v6
         with:
           images: |
+            git.ow-ops.eu/towonel/towonel-agent
             codeberg.org/towonel/towonel-agent
             registry.erwanleboucher.dev/eleboucher/towonel-agent
           tags: |
@@ -86,7 +94,7 @@ jobs:
           labels: |
             org.opencontainers.image.title=towonel-agent
             org.opencontainers.image.description=Towonel agent — exposes local services through a towonel hub
-            org.opencontainers.image.documentation=https://codeberg.org/towonel/towonel/src/branch/main/README.md
+            org.opencontainers.image.documentation=https://git.ow-ops.eu/towonel/towonel/src/branch/main/README.md
             org.opencontainers.image.authors=Erwan Leboucher <erwanleboucher@gmail.com>
             org.opencontainers.image.vendor=Erwan Leboucher
       - name: Build and push towonel-agent
@@ -108,13 +116,14 @@ jobs:
           secrets: |
             SCCACHE_AWS_ACCESS_KEY_ID=${{ secrets.SCCACHE_AWS_ACCESS_KEY_ID }}
             SCCACHE_AWS_SECRET_ACCESS_KEY=${{ secrets.SCCACHE_AWS_SECRET_ACCESS_KEY }}
-          cache-from: type=registry,ref=codeberg.org/towonel/towonel-buildcache:agent
-          cache-to: type=registry,ref=codeberg.org/towonel/towonel-buildcache:agent,mode=max,ignore-error=true
+          cache-from: type=registry,ref=git.ow-ops.eu/towonel/towonel-buildcache:agent
+          cache-to: type=registry,ref=git.ow-ops.eu/towonel/towonel-buildcache:agent,mode=max,ignore-error=true
       - name: Compute hub-caddy image metadata
         id: meta-hub-caddy
         uses: https://data.forgejo.org/docker/metadata-action@v6
         with:
           images: |
+            git.ow-ops.eu/towonel/towonel-hub-caddy
             codeberg.org/towonel/towonel-hub-caddy
             registry.erwanleboucher.dev/eleboucher/towonel-hub-caddy
           tags: |
@@ -123,7 +132,7 @@ jobs:
           labels: |
             org.opencontainers.image.title=towonel-hub-caddy
             org.opencontainers.image.description=Towonel hub bundled with Caddy (L4 PROXY-protocol shifter for privileged ports)
-            org.opencontainers.image.documentation=https://codeberg.org/towonel/towonel/src/branch/main/README.md
+            org.opencontainers.image.documentation=https://git.ow-ops.eu/towonel/towonel/src/branch/main/README.md
             org.opencontainers.image.authors=Erwan Leboucher <erwanleboucher@gmail.com>
             org.opencontainers.image.vendor=Erwan Leboucher
       - name: Build and push towonel-hub-caddy
@@ -145,5 +154,5 @@ jobs:
           secrets: |
             SCCACHE_AWS_ACCESS_KEY_ID=${{ secrets.SCCACHE_AWS_ACCESS_KEY_ID }}
             SCCACHE_AWS_SECRET_ACCESS_KEY=${{ secrets.SCCACHE_AWS_SECRET_ACCESS_KEY }}
-          cache-from: type=registry,ref=codeberg.org/towonel/towonel-buildcache:hub-caddy
-          cache-to: type=registry,ref=codeberg.org/towonel/towonel-buildcache:hub-caddy,mode=max,ignore-error=true
+          cache-from: type=registry,ref=git.ow-ops.eu/towonel/towonel-buildcache:hub-caddy
+          cache-to: type=registry,ref=git.ow-ops.eu/towonel/towonel-buildcache:hub-caddy,mode=max,ignore-error=true

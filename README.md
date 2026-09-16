@@ -3,7 +3,7 @@
 Self-hosted tunnel for exposing HTTP(S) services behind NAT, CGNAT, or
 dynamic IPs without opening inbound ports.
 
-[![CI](https://codeberg.org/towonel/towonel/actions/workflows/ci.yml/badge.svg)](https://codeberg.org/towonel/towonel/actions/workflows/ci.yml)
+[![CI](https://git.ow-ops.eu/towonel/towonel/actions/workflows/ci.yml/badge.svg)](https://git.ow-ops.eu/towonel/towonel/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Rust 2024](https://img.shields.io/badge/rust-2024-orange.svg)](https://www.rust-lang.org/)
 [![Matrix](https://img.shields.io/badge/matrix-join%20chat-0dbd8b?logo=matrix&logoColor=white)](https://matrix.to/#/!N0IMRJojScLMh5pvQtJJpG6aVR4F_i3q9cITIjinWOE?via=erwanleboucher.dev)
@@ -42,14 +42,14 @@ You need:
 On the VPS:
 
 ```bash
-docker pull codeberg.org/towonel/towonel-node:latest
+docker pull git.ow-ops.eu/towonel/towonel-node:latest
 docker run -d --name towonel \
   -p 443:443 -p 8443:8443 -p 51820:51820/udp \
   -v towonel-data:/data \
   -e TOWONEL_HUB_PUBLIC_URL=https://hub.example.eu \
   -e TOWONEL_EDGE_ADVERTISED_ADDRESSES=hub.example.eu:443 \
   -e TOWONEL_EDGE_TLS_ACME_EMAIL=ops@example.eu \
-  codeberg.org/towonel/towonel-node:latest
+  git.ow-ops.eu/towonel/towonel-node:latest
 ```
 
 The image pins `TOWONEL_DATA_DIR=/data`; every path-shaped env var defaults
@@ -79,7 +79,7 @@ docker run -d --name towonel \
   -e TOWONEL_HUB_PUBLIC_URL=https://hub.example.eu \
   -e TOWONEL_EDGE_ADVERTISED_ADDRESSES=hub.example.eu:443 \
   -e TOWONEL_EDGE_TLS_ACME_EMAIL=ops@example.eu \
-  codeberg.org/towonel/towonel-hub-caddy:latest
+  git.ow-ops.eu/towonel/towonel-hub-caddy:latest
 ```
 
 Replace the baked Caddyfile by mounting one at `/etc/caddy/Caddyfile`.
@@ -111,7 +111,7 @@ docker run -d --name towonel-agent \
   -e TOWONEL_AGENT_SERVICES='[
     {"hostname":"app.alice.example.eu","origin":"127.0.0.1:8443"}
   ]' \
-  codeberg.org/towonel/towonel-agent:latest
+  git.ow-ops.eu/towonel/towonel-agent:latest
 ```
 
 ### 4. Point DNS
@@ -426,7 +426,7 @@ environment surface.
 ### Kubernetes (Helm)
 
 Charts are published to
-`oci://codeberg.org/towonel/charts/towonel-{node,agent}` on every release,
+`oci://git.ow-ops.eu/towonel/charts/towonel-{node,agent}` on every release,
 image pinned by digest and signed with cosign. `towonel-node` runs the
 hub, the edge, or both in one process (`hub.enabled` / `edge.enabled`,
 both on by default); hub-only renders a Deployment, an enabled edge a
