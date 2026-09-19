@@ -27,6 +27,7 @@ pub const PATH_LABELS: [&str; 3] = ["direct", "relay", "custom"];
 pub struct AgentMetrics {
     pub edge_session_reconnects: IntCounterVec,
     pub edge_session_state: IntGaugeVec,
+    pub edge_identity_mismatches: IntCounterVec,
     pub edge_path: IntGaugeVec,
     pub streams_accepted: IntCounter,
     pub streams_completed: IntCounter,
@@ -52,6 +53,12 @@ impl AgentMetrics {
                 &r,
                 "towonel_agent_edge_session_state",
                 "1 while a session to the edge is held, 0 otherwise",
+                &["edge"],
+            ),
+            edge_identity_mismatches: register_counter_vec(
+                &r,
+                "towonel_agent_edge_identity_mismatches_total",
+                "Dials refused because the edge presented a key other than the advertised endpoint id",
                 &["edge"],
             ),
             edge_path: register_gauge_vec(

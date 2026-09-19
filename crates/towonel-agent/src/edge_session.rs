@@ -3,13 +3,15 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
-use iroh::endpoint::{PathEvent, PathEventStream};
+use iroh::endpoint::{
+    ConnectError, ConnectionError, PathEvent, PathEventStream, TransportErrorCode,
+};
 use iroh::{Endpoint, EndpointAddr, RelayUrl, TransportAddr};
 use tokio::net::lookup_host;
 use tokio::task::JoinSet;
 use tokio_stream::StreamExt as _;
 use tokio_util::sync::CancellationToken;
-use tracing::{Instrument, debug, info, info_span, warn};
+use tracing::{Instrument, debug, error, info, info_span, warn};
 
 use towonel_common::edge_cred::AuthFrame;
 use towonel_common::protocol::ALPN_TUNNEL;
@@ -27,6 +29,13 @@ const DNS_TIMEOUT: Duration = Duration::from_secs(5);
 const REDIAL_DELAY: Duration = Duration::from_secs(5);
 /// Cap on the redial backoff when an edge keeps failing to connect.
 const REDIAL_MAX_DELAY: Duration = Duration::from_mins(1);
+
+/// Redialing can't fix a mismatch; this just has to recover once the hub's
+/// topology is corrected.
+const IDENTITY_MISMATCH_COOLDOWN: Duration = Duration::from_mins(5);
+
+/// TLS alert 48, `unknown_ca`: iroh's raw-public-key verifier rejected the peer.
+const TLS_ALERT_UNKNOWN_CA: u8 = 48;
 
 struct ActiveSupervisor {
     token: CancellationToken,
@@ -182,7 +191,7 @@ async fn supervise(
         REDIAL_DELAY,
         REDIAL_MAX_DELAY,
         || async move {
-            let session = dial_and_serve(
+            let session = match dial_and_serve(
                 endpoint,
                 contact,
                 service_map,
@@ -190,13 +199,46 @@ async fn supervise(
                 edge_cred,
                 relay_urls,
             )
-            .await?;
+            .await
+            {
+                Ok(session) => session,
+                Err(e) if is_identity_mismatch(&e) => {
+                    metrics
+                        .edge_identity_mismatches
+                        .with_label_values(&[&contact.id.fmt_short().to_string()])
+                        .inc();
+                    error!(
+                        addrs = ?contact.addrs,
+                        cooldown_secs = IDENTITY_MISMATCH_COOLDOWN.as_secs(),
+                        "edge answered with a different endpoint identity than the hub \
+                         advertised; the address belongs to another node"
+                    );
+                    // Ok, not Err: the supervisor would treat it as transient.
+                    tokio::time::sleep(IDENTITY_MISMATCH_COOLDOWN).await;
+                    return Ok(());
+                }
+                Err(e) => return Err(e),
+            };
             debug!(session_secs = session.as_secs(), "session ended; redialing");
             Ok(())
         },
     )
     .instrument(span)
     .await;
+}
+
+/// True when the peer's key didn't match the endpoint id we dialed. Only our
+/// own alert counts; the peer's would arrive as `ConnectionClosed`.
+fn is_identity_mismatch(err: &anyhow::Error) -> bool {
+    err.chain().any(|source| {
+        matches!(
+            source.downcast_ref::<ConnectError>(),
+            Some(ConnectError::Connection {
+                source: ConnectionError::TransportError(e),
+                ..
+            }) if e.code == TransportErrorCode::crypto(TLS_ALERT_UNKNOWN_CA)
+        )
+    })
 }
 
 /// Returns the elapsed session duration on success, or the dial error.
@@ -417,6 +459,35 @@ mod tests {
 
     const V4: &str = "203.0.113.1:80";
     const V6: &str = "[2001:db8::1]:80";
+
+    /// Context-wrapped like `dial_and_serve` reports it, so the chain walk is
+    /// what's under test.
+    fn dial_error(alert: u8) -> anyhow::Error {
+        let transport = iroh::endpoint::TransportError::new(
+            TransportErrorCode::crypto(alert),
+            "invalid peer certificate: UnknownIssuer".to_string(),
+        );
+        anyhow::Error::new(ConnectError::from(ConnectionError::TransportError(
+            transport,
+        )))
+        .context("connect to edge b1f027564a failed")
+    }
+
+    #[test]
+    fn unknown_ca_is_an_identity_mismatch() {
+        assert!(is_identity_mismatch(&dial_error(TLS_ALERT_UNKNOWN_CA)));
+    }
+
+    #[test]
+    fn other_crypto_alerts_are_not() {
+        // 42, bad_certificate.
+        assert!(!is_identity_mismatch(&dial_error(42)));
+    }
+
+    #[test]
+    fn unrelated_errors_are_not() {
+        assert!(!is_identity_mismatch(&anyhow::anyhow!("dns lookup failed")));
+    }
 
     #[test]
     fn loopback_is_routable() {
