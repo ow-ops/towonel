@@ -8,6 +8,11 @@ use std::time::{Duration, Instant};
 /// inheriting the escalation from an earlier failure burst.
 const HUB_LINK_STABLE_AFTER: Duration = Duration::from_mins(1);
 
+/// A half-open link (hub gone without FIN/RST) otherwise parks the read loop
+/// until TCP gives up, so the edge never redials or re-registers.
+const HUB_LINK_KEEPALIVE_IDLE: Duration = Duration::from_secs(30);
+const HUB_LINK_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
+
 use anyhow::Context;
 use backon::{BackoffBuilder, ExponentialBuilder};
 use tokio::io::AsyncWrite;
@@ -139,6 +144,18 @@ pub async fn run_supervisor(
     drain_pending_control(&handle);
 }
 
+fn configure_hub_link_socket(stream: &TcpStream) {
+    if let Err(e) = stream.set_nodelay(true) {
+        tracing::debug!(error = %e, "hub_link set_nodelay failed");
+    }
+    let keepalive = socket2::TcpKeepalive::new()
+        .with_time(HUB_LINK_KEEPALIVE_IDLE)
+        .with_interval(HUB_LINK_KEEPALIVE_INTERVAL);
+    if let Err(e) = socket2::SockRef::from(stream).set_tcp_keepalive(&keepalive) {
+        tracing::debug!(error = %e, "hub_link set SO_KEEPALIVE failed");
+    }
+}
+
 async fn run_once(
     cfg: &HubLinkConfig,
     handle: &HubLinkHandle,
@@ -147,9 +164,7 @@ async fn run_once(
     let stream = TcpStream::connect(&cfg.addr)
         .await
         .with_context(|| format!("connect to hub {}", cfg.addr))?;
-    if let Err(e) = stream.set_nodelay(true) {
-        tracing::debug!(error = %e, "hub_link set_nodelay failed");
-    }
+    configure_hub_link_socket(&stream);
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = tokio::io::BufReader::new(read_half);
 

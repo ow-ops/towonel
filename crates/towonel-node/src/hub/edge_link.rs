@@ -26,6 +26,24 @@ use super::live_edges::EdgeId;
 
 const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// A half-open edge (node gone without FIN/RST) otherwise parks `read_loop`
+/// until TCP gives up, and stays in `live_edges` handing agents an endpoint id
+/// nobody answers for.
+const EDGE_LINK_KEEPALIVE_IDLE: Duration = Duration::from_secs(30);
+const EDGE_LINK_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
+
+fn configure_edge_link_socket(stream: &TcpStream) {
+    if let Err(e) = stream.set_nodelay(true) {
+        tracing::debug!(error = %e, "edge_link set_nodelay failed");
+    }
+    let keepalive = socket2::TcpKeepalive::new()
+        .with_time(EDGE_LINK_KEEPALIVE_IDLE)
+        .with_interval(EDGE_LINK_KEEPALIVE_INTERVAL);
+    if let Err(e) = socket2::SockRef::from(stream).set_tcp_keepalive(&keepalive) {
+        tracing::debug!(error = %e, "edge_link set SO_KEEPALIVE failed");
+    }
+}
+
 const MAX_INFLIGHT_CONTROL: usize = 32;
 
 pub type LinkPsk = [u8; 32];
@@ -118,9 +136,7 @@ async fn handle_connection(
     route_rx: broadcast::Receiver<RouteTable>,
     shutdown: CancellationToken,
 ) -> anyhow::Result<()> {
-    if let Err(e) = stream.set_nodelay(true) {
-        tracing::debug!(error = %e, "edge_link set_nodelay failed");
-    }
+    configure_edge_link_socket(&stream);
     let (read_half, write_half) = stream.into_split();
     let mut reader = tokio::io::BufReader::new(read_half);
 
