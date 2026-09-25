@@ -1736,6 +1736,10 @@ async fn udp_listen_loop(
         .metrics
         .udp_datagrams_dropped
         .with_label_values(&[&tenant_label, &binding.service]);
+    let udp_sessions_active = ctx
+        .metrics
+        .udp_sessions_active
+        .with_label_values(&[&tenant_label, &binding.service]);
 
     let mut cmsg = udp_source::cmsg_buffer();
     let mut chunk = bytes::BytesMut::zeroed(UDP_RECV_CHUNK);
@@ -1781,7 +1785,9 @@ async fn udp_listen_loop(
                     let ctx_for_session = Arc::clone(&ctx);
                     let sessions_for_session = Arc::clone(&sessions);
                     let tx_for_cleanup = tx.clone();
+                    let active = GaugeGuard::inc(&udp_sessions_active);
                     tokio::spawn(async move {
+                        let _active = active;
                         udp_session_pump(
                             socket_for_session,
                             peer_addr,

@@ -34,6 +34,7 @@ pub struct EdgeMetrics {
     /// otherwise-global `connections_rejected_overload` to a listener. Bounded
     /// by the active UDP-listener count.
     pub udp_sessions_rejected: IntCounterVec,
+    pub udp_sessions_active: IntGaugeVec,
     pub udp_datagrams_dropped: IntCounterVec,
     /// Per-tenant mirrors of the global series above, labelled with the
     /// hex-encoded `TenantId`. Bounded by the active tenant count; the
@@ -172,6 +173,13 @@ impl EdgeMetrics {
                 "towonel_edge_udp_sessions_rejected_total",
                 "New UDP sessions refused at the per-listener \
                  TOWONEL_EDGE_MAX_UDP_SESSIONS_PER_LISTENER cap, by listener.",
+                &["tenant", "service"],
+            ),
+            udp_sessions_active: register_gauge_vec(
+                &r,
+                "towonel_edge_udp_sessions_active",
+                "UDP sessions currently open, by listener. Each holds one \
+                 agent stream, like a TCP connection.",
                 &["tenant", "service"],
             ),
             udp_datagrams_dropped: register_counter_vec(
