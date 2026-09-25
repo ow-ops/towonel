@@ -7,7 +7,7 @@ pub const ALPN_TUNNEL: &[u8] = b"towonel/tunnel/1";
 ///
 /// Advertised as QUIC `max_concurrent_bidi_streams` and enforced by the
 /// agent's accept semaphore; the lower of the two is the real limit.
-pub const TUNNEL_MAX_CONCURRENT_STREAMS: u32 = 256;
+pub const TUNNEL_MAX_CONCURRENT_STREAMS: u32 = 100_000;
 
 /// Per-stream receive window.
 ///

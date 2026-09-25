@@ -14,7 +14,7 @@ use towonel_common::hostname::wildcard_lookup;
 use towonel_common::metrics::GaugeGuard;
 use towonel_common::tunnel::{
     COPY_BUF_SIZE, ClientAddrs, DatagramFrameReader, MAX_UDP_DATAGRAM, TCP_ROUTE_PREFIX,
-    UDP_ROUTE_PREFIX, copy_buf_counting, forward_quic_to_writer, read_handshake,
+    UDP_ROUTE_PREFIX, copy_buf_counting, copy_tcp_counting, forward_quic_to_writer, read_handshake,
     write_datagram_frame,
 };
 
@@ -31,10 +31,8 @@ const STREAM_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_
 
 /// Cap on concurrent in-flight streams per edge connection. A buggy or
 /// compromised edge can open bi-streams in a tight loop; without a bound the
-/// agent would spawn an unbounded number of buffer-holding tasks and OOM.
-/// Reaching the cap applies QUIC backpressure rather than dropping streams.
-/// 256 bounds worst-case copy buffers to ~16 MiB (64 KiB each) so a traffic
-/// burst fits in a small container; 1024 allowed more than a 64 Mi pod.
+/// agent would spawn an unbounded number of tasks and OOM. Reaching the cap
+/// applies QUIC backpressure rather than dropping streams.
 const MAX_CONCURRENT_STREAMS: usize =
     towonel_common::protocol::TUNNEL_MAX_CONCURRENT_STREAMS as usize;
 
@@ -663,8 +661,7 @@ async fn forward_plain(
     // while the client waits for the origin's banner.
     write_proxy_header(&mut origin, proxy, addrs).await?;
 
-    let (origin_read, mut origin_write) = origin.into_split();
-    let mut origin_read = io::BufReader::with_capacity(COPY_BUF_SIZE, origin_read);
+    let (mut origin_read, mut origin_write) = origin.into_split();
 
     let q2o = async {
         let res = forward_quic_to_writer(quic_recv, &mut origin_write).await;
@@ -672,7 +669,7 @@ async fn forward_plain(
         res
     };
     let o2q = async {
-        let res = copy_buf_counting(&mut origin_read, quic_send).await;
+        let res = copy_tcp_counting(&mut origin_read, quic_send).await;
         drop(quic_send.finish());
         res
     };
@@ -727,8 +724,7 @@ async fn handle_tcp_stream(
             return Err(e);
         }
 
-        let (origin_read, mut origin_write) = origin.into_split();
-        let mut origin_read = io::BufReader::with_capacity(COPY_BUF_SIZE, origin_read);
+        let (mut origin_read, mut origin_write) = origin.into_split();
 
         let q2o = async {
             let res = forward_quic_to_writer(&mut quic_recv, &mut origin_write).await;
@@ -736,7 +732,7 @@ async fn handle_tcp_stream(
             res
         };
         let o2q = async {
-            let res = copy_buf_counting(&mut origin_read, &mut quic_send).await;
+            let res = copy_tcp_counting(&mut origin_read, &mut quic_send).await;
             drop(quic_send.finish());
             res
         };

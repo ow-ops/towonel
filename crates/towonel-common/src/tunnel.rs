@@ -97,6 +97,37 @@ where
     }
 }
 
+/// Like [`copy_buf_counting`], but only holds a buffer while the socket is
+/// readable, so idle connections cost none.
+pub async fn copy_tcp_counting<W>(
+    reader: &mut tokio::net::tcp::OwnedReadHalf,
+    writer: &mut W,
+) -> (u64, std::io::Result<()>)
+where
+    W: AsyncWrite + Unpin,
+{
+    let mut total = 0u64;
+    loop {
+        if let Err(e) = reader.readable().await {
+            return (total, Err(e));
+        }
+        let mut buf = vec![0u8; COPY_BUF_SIZE];
+        loop {
+            match reader.try_read(&mut buf) {
+                Ok(0) => return (total, writer.flush().await),
+                Ok(n) => {
+                    if let Err(e) = writer.write_all(buf.get(..n).unwrap_or(&buf)).await {
+                        return (total, Err(e));
+                    }
+                    total = total.saturating_add(n as u64);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(e) => return (total, Err(e)),
+            }
+        }
+    }
+}
+
 /// Original client `SocketAddr` and the edge-facing destination `SocketAddr`.
 /// Both are forwarded to the agent so it can emit a PROXY v2 header to the
 /// origin.
@@ -404,6 +435,30 @@ fn frame_eof() -> std::io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn copy_tcp_counting_copies_until_eof() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let payload: Vec<u8> = (0..3 * COPY_BUF_SIZE + 17)
+            .map(|i| u8::try_from(i % 251).unwrap())
+            .collect();
+        let sent = payload.clone();
+        let writer = tokio::spawn(async move {
+            let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+            s.write_all(&sent).await.unwrap();
+        });
+
+        let (stream, _) = listener.accept().await.unwrap();
+        let (mut read, _write) = stream.into_split();
+        let mut out = Vec::new();
+        let (n, res) = copy_tcp_counting(&mut read, &mut out).await;
+        writer.await.unwrap();
+
+        res.unwrap();
+        assert_eq!(n, payload.len() as u64);
+        assert_eq!(out, payload);
+    }
 
     #[tokio::test]
     async fn roundtrip_handshake_v4() {

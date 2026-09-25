@@ -66,6 +66,8 @@ pub struct OverloadRejectCounters {
     pub udp_session: IntCounter,
     /// Agent iroh-connection permit pool exhausted.
     pub iroh_agent: IntCounter,
+    /// Agent session at its concurrent-stream cap.
+    pub agent_stream: IntCounter,
 }
 
 #[derive(Clone)]
@@ -102,7 +104,8 @@ impl OverloadRejectCounters {
             "Connections/sessions dropped because an edge concurrency cap was \
              saturated, by which cap fired (tcp_inflight = global inflight \
              semaphore, udp_session = per-listener UDP session cap, \
-             iroh_agent = agent permit pool). Sustained values mean an \
+             iroh_agent = agent permit pool, agent_stream = agent session \
+             at its concurrent-stream cap). Sustained values mean an \
              accept-time DoS or an under-sized cap.",
             &["reason"],
         );
@@ -110,6 +113,7 @@ impl OverloadRejectCounters {
             tcp_inflight: vec.with_label_values(&[overload_reject_reason::TCP_INFLIGHT]),
             udp_session: vec.with_label_values(&[overload_reject_reason::UDP_SESSION]),
             iroh_agent: vec.with_label_values(&[overload_reject_reason::IROH_AGENT]),
+            agent_stream: vec.with_label_values(&[overload_reject_reason::AGENT_STREAM]),
         }
     }
 }
@@ -249,6 +253,7 @@ pub mod overload_reject_reason {
     pub const TCP_INFLIGHT: &str = "tcp_inflight";
     pub const UDP_SESSION: &str = "udp_session";
     pub const IROH_AGENT: &str = "iroh_agent";
+    pub const AGENT_STREAM: &str = "agent_stream";
 }
 
 pub mod prepare_reject_reason {

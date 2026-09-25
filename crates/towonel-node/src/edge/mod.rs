@@ -24,9 +24,9 @@ use towonel_common::sni::extract_sni;
 use towonel_common::tls_policy::TlsMode;
 use towonel_common::tunnel::{
     CONTROL_STATUS_INTERNAL_ERROR, CONTROL_STATUS_INVALID, CONTROL_STATUS_NOT_IMPLEMENTED,
-    CONTROL_STATUS_OK, COPY_BUF_SIZE, ClientAddrs, DatagramFrameReader, MAX_UDP_DATAGRAM,
-    TCP_ROUTE_PREFIX, UDP_ROUTE_PREFIX, copy_buf_counting, forward_quic_to_writer,
-    read_control_prefix, write_control_status, write_datagram_frame, write_handshake,
+    CONTROL_STATUS_OK, ClientAddrs, DatagramFrameReader, MAX_UDP_DATAGRAM, TCP_ROUTE_PREFIX,
+    UDP_ROUTE_PREFIX, copy_tcp_counting, forward_quic_to_writer, read_control_prefix,
+    write_control_status, write_datagram_frame, write_handshake,
 };
 
 use self::health::{EdgeMetrics, session_reject_reason};
@@ -836,6 +836,9 @@ async fn handle_connection(
 const PICK_AGENT_ATTEMPTS: u32 = 3;
 const PICK_AGENT_BACKOFF: Duration = Duration::from_millis(200);
 
+/// `open_bi` blocks while the agent is at its concurrent-stream cap.
+const AGENT_STREAM_OPEN_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// Shuffle `candidates` for fair spread, then try each agent's session.
 /// `refresh` is called between attempts to pick up route-table updates that
 /// landed during the supersede window. Returns the first stream that opens.
@@ -1256,7 +1259,15 @@ async fn open_agent_stream(
         ctx.metrics.route_no_session_total.inc();
         anyhow::bail!("agent {} has no active session", agent_id.fmt_short());
     };
-    match session.open_stream().await {
+    let Ok(opened) = tokio::time::timeout(AGENT_STREAM_OPEN_TIMEOUT, session.open_stream()).await
+    else {
+        ctx.metrics.connections_rejected_overload.agent_stream.inc();
+        anyhow::bail!(
+            "agent {} session at its stream cap for {AGENT_STREAM_OPEN_TIMEOUT:?}",
+            agent_id.fmt_short()
+        );
+    };
+    match opened {
         Ok(pair) => Ok(pair),
         Err(e) => {
             // Capture the tenant before removing so we can tell the hub the
@@ -1553,11 +1564,10 @@ async fn pipe_tcp(
 ) -> anyhow::Result<(u64, u64)> {
     write_handshake(&mut send_stream, route_key, client_addrs).await?;
 
-    let (tcp_read, mut tcp_write) = tcp_stream.into_split();
-    let mut tcp_read = tokio::io::BufReader::with_capacity(COPY_BUF_SIZE, tcp_read);
+    let (mut tcp_read, mut tcp_write) = tcp_stream.into_split();
 
     let c2a = async {
-        let (n, res) = copy_buf_counting(&mut tcp_read, &mut send_stream).await;
+        let (n, res) = copy_tcp_counting(&mut tcp_read, &mut send_stream).await;
         if let Err(ref e) = res {
             warn!(%route_key, "client->agent forward: {e}");
         }
