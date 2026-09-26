@@ -183,6 +183,7 @@ impl TestHub {
             live_edges: Arc::new(super::live_edges::LiveEdges::new()),
             live_agents: Arc::new(super::live_agents::LiveAgents::new()),
             route_rebuild_notify: Arc::new(tokio::sync::Notify::new()),
+            mesh_changes: tokio::sync::broadcast::channel(256).0,
             web_enabled: true,
             console_url: Some("https://console.test.example".to_string()),
             mailer: Some(Arc::clone(&mailer) as super::mail::SharedMailer),

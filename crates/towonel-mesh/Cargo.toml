@@ -1,0 +1,17 @@
+[package]
+name = "towonel-mesh"
+version.workspace = true
+rust-version.workspace = true
+edition = "2024"
+publish = false
+
+[dependencies]
+towonel-common = { path = "../towonel-common" }
+anyhow = { workspace = true }
+iroh = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

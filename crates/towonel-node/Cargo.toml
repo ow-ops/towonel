@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 towonel-common = { path = "../towonel-common" }
+towonel-mesh = { path = "../towonel-mesh" }
 iroh = { workspace = true }
 sea-orm = { workspace = true }
 sea-orm-migration = { workspace = true }
@@ -62,6 +63,7 @@ smallvec = { workspace = true }
 fastrand = { workspace = true }
 envy = { workspace = true }
 tabled = { workspace = true }
+qrcode = { workspace = true }
 totp-rs = { workspace = true }
 ppp = { workspace = true }
 ipnet = { workspace = true }
@@ -72,6 +74,7 @@ utoipa-swagger-ui = { workspace = true }
 openssl = { version = "0.10", features = ["vendored"] }
 
 [dev-dependencies]
+rqrr = { workspace = true }
 
 [package.metadata.cargo-machete]
 # `openssl` is declared only to force the `vendored` feature on the

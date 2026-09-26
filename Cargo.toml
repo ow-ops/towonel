@@ -93,6 +93,7 @@ resolver = "3"
 members = [
   "crates/towonel-common",
   "crates/towonel-agent",
+  "crates/towonel-mesh",
   "crates/towonel-node",
   "crates/e2e-runner",
 ]
@@ -220,6 +221,8 @@ petname = { version = "3", default-features = false, features = [
 ] }
 envy = "0.4"
 tabled = "0.21"
+qrcode = { version = "0.14", default-features = false }
+rqrr = { version = "0.11", default-features = false }
 ipnet = "2"
 httparse = "1"
 http = "1"

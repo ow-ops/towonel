@@ -420,6 +420,7 @@ impl Hub {
             live_edges: Arc::new(live_edges::LiveEdges::new()),
             live_agents: Arc::clone(&live_agents),
             route_rebuild_notify: Arc::clone(&route_rebuild_notify),
+            mesh_changes: tokio::sync::broadcast::channel(256).0,
             web_enabled: self.p.web_enabled,
             console_url: self.p.console_url.clone(),
             mailer: self.p.mailer.clone(),

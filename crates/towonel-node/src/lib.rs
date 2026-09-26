@@ -2,6 +2,8 @@ mod admin;
 mod config;
 mod edge;
 mod hub;
+mod mesh_cli;
+mod mesh_qr;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -91,6 +93,38 @@ enum Command {
     Settings {
         #[command(subcommand)]
         action: SettingsAction,
+    },
+    /// Join this machine to a tenant's private mesh.
+    Mesh {
+        #[command(subcommand)]
+        action: MeshAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum MeshAction {
+    /// Add this device to the mesh: browser sign-in, or `--auth-key` for
+    /// servers. Renews the device key when it has expired.
+    Up {
+        #[arg(long, env = "TOWONEL_HUB_URL")]
+        hub_url: Option<String>,
+        #[arg(long, env = "TOWONEL_MESH_AUTH_KEY", hide_env_values = true)]
+        auth_key: Option<String>,
+        /// Defaults to the hostname.
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long, env = "TOWONEL_MESH_STATE_DIR")]
+        state_dir: Option<PathBuf>,
+    },
+    /// Show this device and the peers it can see.
+    Status {
+        #[arg(long, env = "TOWONEL_MESH_STATE_DIR")]
+        state_dir: Option<PathBuf>,
+        /// Keep running and redraw when peers change.
+        #[arg(long)]
+        watch: bool,
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -570,6 +604,19 @@ pub async fn run() -> anyhow::Result<()> {
             EdgeAction::List { hub_url, api_key } => {
                 admin::edge::cmd_edge_list(hub_url, api_key).await
             }
+        },
+        Some(Command::Mesh { action }) => match action {
+            MeshAction::Up {
+                hub_url,
+                auth_key,
+                name,
+                state_dir,
+            } => mesh_cli::cmd_up(hub_url, auth_key, name, state_dir).await,
+            MeshAction::Status {
+                state_dir,
+                watch,
+                json,
+            } => mesh_cli::cmd_status(state_dir, watch, json).await,
         },
         Some(Command::Settings { action }) => match action {
             SettingsAction::GetPortQuota { hub_url, api_key } => {

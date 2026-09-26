@@ -1,5 +1,6 @@
 //! Mesh control plane. Devices sign requests with their iroh endpoint key.
 
+use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -7,11 +8,15 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use axum::body::Bytes;
 use axum::extract::{ConnectInfo, Path, State};
 use axum::http::{HeaderMap, StatusCode};
-use axum::response::Response;
+use axum::response::sse::{Event, KeepAlive, Sse};
+use axum::response::{IntoResponse, Response};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use tokio::sync::{broadcast, mpsc};
+use tokio_stream::StreamExt;
+use tokio_stream::wrappers::ReceiverStream;
 use tracing::warn;
 use utoipa::ToSchema;
 
@@ -40,6 +45,7 @@ use crate::hub::db::mesh::{
 const ENROLL_AUTH_DOMAIN: &str = "towonel/mesh-enroll/v1";
 const CRED_AUTH_DOMAIN: &str = "towonel/mesh-cred/v1";
 const NETMAP_AUTH_DOMAIN: &str = "towonel/mesh-netmap/v1";
+const NETMAP_STREAM_AUTH_DOMAIN: &str = "towonel/mesh-netmap-stream/v1";
 const DEVICE_CODE_AUTH_DOMAIN: &str = "towonel/mesh-device-code/v1";
 const DEVICE_POLL_AUTH_DOMAIN: &str = "towonel/mesh-device-poll/v1";
 
@@ -481,6 +487,7 @@ pub(super) async fn delete_device(
                 serde_json::json!({"tenant_id": tenant_id.to_string()}),
             )
             .await;
+            notify_mesh_change(&state, tenant_id);
             json_ok(serde_json::json!({"ok": true}))
         }
         Err(e) => {
@@ -561,6 +568,7 @@ pub(super) async fn post_enroll(
     )
     .await;
 
+    notify_mesh_change(&state, device.tenant_id);
     enroll_response(&state, StatusCode::CREATED, &device)
 }
 
@@ -655,22 +663,89 @@ pub(super) async fn get_netmap(State(state): State<Arc<AppState>>, headers: Head
         Ok(d) => d,
         Err(resp) => return resp,
     };
-    let devices = match state.db.list_mesh_devices(&device.tenant_id).await {
-        Ok(d) => d,
+    match build_netmap(&state, &device).await {
+        Ok(netmap) => json_ok(netmap),
         Err(e) => {
-            warn!(error = %e, "list_mesh_devices failed");
-            return internal_error();
+            warn!(error = %e, "build_netmap failed");
+            internal_error()
         }
+    }
+}
+
+/// SSE: a `netmap` event on connect and after every change to the tenant's
+/// devices. Ends with `revoked` or `key_expired` when the device loses access.
+pub(super) async fn get_netmap_stream(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Response {
+    let device = match authenticated_device(&state, &headers, NETMAP_STREAM_AUTH_DOMAIN, &[]).await
+    {
+        Ok(d) => d,
+        Err(resp) => return resp,
     };
+    // Subscribe before the first snapshot so no change slips in between.
+    let changes = state.mesh_changes.subscribe();
+    let (tx, rx) = mpsc::channel(4);
+    tokio::spawn(stream_netmap(state, device, changes, tx));
+    Sse::new(ReceiverStream::new(rx).map(Ok::<_, Infallible>))
+        .keep_alive(KeepAlive::default())
+        .into_response()
+}
+
+async fn stream_netmap(
+    state: Arc<AppState>,
+    device: MeshDeviceRow,
+    mut changes: broadcast::Receiver<TenantId>,
+    tx: mpsc::Sender<Event>,
+) {
+    loop {
+        let (event, last) = match netmap_event(&state, &device.device_id).await {
+            Ok(step) => step,
+            Err(e) => {
+                warn!(error = %e, "netmap stream snapshot failed");
+                return;
+            }
+        };
+        if tx.send(event).await.is_err() || last {
+            return;
+        }
+        loop {
+            tokio::select! {
+                () = tx.closed() => return,
+                change = changes.recv() => match change {
+                    Ok(tenant) if tenant == device.tenant_id => break,
+                    Ok(_) => {}
+                    Err(broadcast::error::RecvError::Lagged(_)) => break,
+                    Err(broadcast::error::RecvError::Closed) => return,
+                },
+            }
+        }
+    }
+}
+
+/// The next event and whether it ends the stream.
+async fn netmap_event(state: &AppState, device_id: &DeviceId) -> anyhow::Result<(Event, bool)> {
+    let Some(device) = state.db.get_mesh_device(device_id).await? else {
+        return Ok((Event::default().event("revoked").data("{}"), true));
+    };
+    if device.key_expires_at_ms.is_some_and(|t| t <= now_ms_i64()) {
+        return Ok((Event::default().event("key_expired").data("{}"), true));
+    }
+    let netmap = build_netmap(state, &device).await?;
+    Ok((Event::default().event("netmap").json_data(&netmap)?, false))
+}
+
+async fn build_netmap(state: &AppState, device: &MeshDeviceRow) -> anyhow::Result<NetmapResponse> {
+    let devices = state.db.list_mesh_devices(&device.tenant_id).await?;
     let peers = devices
         .iter()
         .filter(|d| d.device_id != device.device_id)
         .map(DeviceView::from)
         .collect();
     let signer = state.signer.as_ref();
-    json_ok(NetmapResponse {
+    Ok(NetmapResponse {
         tenant_id: device.tenant_id.to_string(),
-        this_device: DeviceView::from(&device),
+        this_device: DeviceView::from(device),
         peers,
         hub_keys: vec![HubKeyView {
             kid: signer.kid(),
@@ -678,6 +753,12 @@ pub(super) async fn get_netmap(State(state): State<Arc<AppState>>, headers: Head
         }],
         relay_url: state.identity.relay_url.clone(),
     })
+}
+
+pub(super) fn notify_mesh_change(state: &AppState, tenant_id: TenantId) {
+    if state.mesh_changes.send(tenant_id).is_err() {
+        tracing::debug!("mesh change: no netmap streams");
+    }
 }
 
 pub(super) async fn post_device_code(
@@ -929,6 +1010,7 @@ async fn enroll_with_code(
         serde_json::json!({"tenant_id": tenant_id.to_string(), "name": device.name}),
     )
     .await;
+    notify_mesh_change(state, *tenant_id);
     enroll_response(state, StatusCode::CREATED, &device)
 }
 
@@ -957,6 +1039,7 @@ async fn renew_device(
         last_seen_at_ms: Some(now),
         ..existing.clone()
     };
+    notify_mesh_change(state, existing.tenant_id);
     enroll_response(state, StatusCode::OK, &renewed)
 }
 

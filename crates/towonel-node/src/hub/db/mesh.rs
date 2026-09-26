@@ -10,6 +10,8 @@ use towonel_common::mesh::{DeviceId, MESH_IPV4_MAX_HOST, mesh_ipv4};
 use super::Db;
 use super::entities::{mesh_auth_keys, mesh_device_codes, mesh_devices};
 
+const LAST_SEEN_RESOLUTION_MS: i64 = 60_000;
+
 pub struct NewMeshAuthKey<'a> {
     pub id: &'a str,
     pub tenant_id: &'a TenantId,
@@ -429,6 +431,7 @@ impl Db {
             .collect()
     }
 
+    /// At most one write per device per minute.
     pub async fn touch_mesh_device(&self, device_id: &DeviceId, now_ms: i64) -> anyhow::Result<()> {
         mesh_devices::Entity::update_many()
             .col_expr(
@@ -436,6 +439,11 @@ impl Db {
                 sea_orm::sea_query::Expr::value(now_ms),
             )
             .filter(mesh_devices::Column::DeviceId.eq(device_id.to_vec()))
+            .filter(
+                mesh_devices::Column::LastSeenAtMs
+                    .is_null()
+                    .or(mesh_devices::Column::LastSeenAtMs.lt(now_ms - LAST_SEEN_RESOLUTION_MS)),
+            )
             .exec(&self.conn)
             .await?;
         Ok(())

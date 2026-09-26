@@ -664,3 +664,137 @@ async fn expired_device_code_is_rejected() {
     let (s, _) = poll(&hub, &client, &device).await;
     assert_eq!(s, 410);
 }
+
+struct EventStream {
+    resp: reqwest::Response,
+    buf: String,
+}
+
+impl EventStream {
+    async fn open(hub: &TestHub, client: &reqwest::Client, device: &Device) -> Self {
+        let resp = client
+            .get(hub.url("/v1/mesh/netmap/stream"))
+            .header(
+                reqwest::header::AUTHORIZATION,
+                device.sign("towonel/mesh-netmap-stream/v1", &[]),
+            )
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        Self {
+            resp,
+            buf: String::new(),
+        }
+    }
+
+    /// Next named event, skipping keep-alives. `None` when the stream ends.
+    async fn next(&mut self) -> Option<(String, Value)> {
+        loop {
+            if let Some(end) = self.buf.find("\n\n") {
+                let frame: String = self.buf.drain(..end + 2).collect();
+                let mut event = None;
+                let mut data = String::new();
+                for line in frame.lines() {
+                    if let Some(v) = line.strip_prefix("event:") {
+                        event = Some(v.trim().to_string());
+                    } else if let Some(v) = line.strip_prefix("data:") {
+                        data.push_str(v.trim());
+                    }
+                }
+                if let Some(event) = event {
+                    return Some((event, serde_json::from_str(&data).unwrap()));
+                }
+                continue;
+            }
+            let chunk = tokio::time::timeout(std::time::Duration::from_secs(5), self.resp.chunk())
+                .await
+                .expect("timed out waiting for an event")
+                .unwrap()?;
+            self.buf.push_str(std::str::from_utf8(&chunk).unwrap());
+        }
+    }
+}
+
+#[tokio::test]
+async fn netmap_stream_pushes_peer_changes() {
+    let hub = TestHub::start().await;
+    let client = reqwest::Client::new();
+    let tenant = new_tenant(&hub, &client, "mesh-o").await;
+    let key = mint_key(&hub, &client, &tenant, json!({"reusable": true})).await;
+    let first = Device::new(1);
+    let second = Device::new(2);
+    enroll(&hub, &client, &first, &key, "first").await;
+
+    let mut stream = EventStream::open(&hub, &client, &first).await;
+    let (event, map) = stream.next().await.unwrap();
+    assert_eq!(event, "netmap");
+    assert!(map["peers"].as_array().unwrap().is_empty());
+
+    enroll(&hub, &client, &second, &key, "second").await;
+    let (event, map) = stream.next().await.unwrap();
+    assert_eq!(event, "netmap");
+    assert_eq!(map["peers"][0]["device_id"], second.id_hex());
+
+    let resp = client
+        .delete(hub.url(&format!(
+            "/v1/tenants/{}/mesh/devices/{}",
+            tenant.id(),
+            second.id_hex()
+        )))
+        .bearer_auth(OPERATOR_KEY)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let (_, map) = stream.next().await.unwrap();
+    assert!(map["peers"].as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn netmap_stream_ends_when_device_is_revoked() {
+    let hub = TestHub::start().await;
+    let client = reqwest::Client::new();
+    let tenant = new_tenant(&hub, &client, "mesh-p").await;
+    let key = mint_key(&hub, &client, &tenant, json!({})).await;
+    let device = Device::new(1);
+    enroll(&hub, &client, &device, &key, "d").await;
+
+    let mut stream = EventStream::open(&hub, &client, &device).await;
+    assert_eq!(stream.next().await.unwrap().0, "netmap");
+
+    client
+        .delete(hub.url(&format!(
+            "/v1/tenants/{}/mesh/devices/{}",
+            tenant.id(),
+            device.id_hex()
+        )))
+        .bearer_auth(OPERATOR_KEY)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(stream.next().await.unwrap().0, "revoked");
+    assert!(stream.next().await.is_none());
+}
+
+#[tokio::test]
+async fn netmap_stream_ignores_other_tenants() {
+    let hub = TestHub::start().await;
+    let client = reqwest::Client::new();
+    let a = new_tenant(&hub, &client, "mesh-q1").await;
+    let b = new_tenant(&hub, &client, "mesh-q2").await;
+    let key_a = mint_key(&hub, &client, &a, json!({"reusable": true})).await;
+    let key_b = mint_key(&hub, &client, &b, json!({})).await;
+    let watcher = Device::new(1);
+    enroll(&hub, &client, &watcher, &key_a, "watcher").await;
+
+    let mut stream = EventStream::open(&hub, &client, &watcher).await;
+    stream.next().await.unwrap();
+
+    enroll(&hub, &client, &Device::new(2), &key_b, "elsewhere").await;
+    enroll(&hub, &client, &Device::new(3), &key_a, "neighbour").await;
+    let (_, map) = stream.next().await.unwrap();
+    let peers = map["peers"].as_array().unwrap();
+    assert_eq!(peers.len(), 1);
+    assert_eq!(peers[0]["name"], "neighbour");
+}

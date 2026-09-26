@@ -221,6 +221,8 @@ pub struct AppState {
     pub live_agents: Arc<super::live_agents::LiveAgents>,
     /// Fed via [`trigger_route_rebuild`]; drained by the coalescer task.
     pub route_rebuild_notify: Arc<tokio::sync::Notify>,
+    /// Tenants whose mesh devices changed; drives netmap streams.
+    pub mesh_changes: broadcast::Sender<towonel_common::identity::TenantId>,
     pub web_enabled: bool,
     /// Web console base URL for user-facing links; falls back to `public_url`.
     pub console_url: Option<String>,
@@ -718,6 +720,7 @@ fn signed_public_routes() -> Router<Arc<AppState>> {
         .route("/v1/agent/refresh", post(agent_refresh::post_refresh))
         .route("/v1/mesh/cred", post(mesh::post_cred))
         .route("/v1/mesh/netmap", get(mesh::get_netmap))
+        .route("/v1/mesh/netmap/stream", get(mesh::get_netmap_stream))
 }
 
 #[derive(Debug, Clone)]

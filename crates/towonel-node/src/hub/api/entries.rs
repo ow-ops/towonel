@@ -746,6 +746,7 @@ pub(super) async fn delete_tenant(
     state.policy_update(|p| p.remove(&tenant_id));
 
     remove_tenant_from_port_index(&state, &tenant_id);
+    super::mesh::notify_mesh_change(&state, tenant_id);
     trigger_route_rebuild(&state);
 
     json_ok(serde_json::json!({
