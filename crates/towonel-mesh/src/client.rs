@@ -8,7 +8,7 @@ use towonel_common::auth::sign_auth_header;
 use towonel_common::hub_error;
 use towonel_common::time::now_ms;
 
-use crate::api::{DeviceCode, Enrolled, Netmap};
+use crate::api::{Cred, DeviceCode, Enrolled, Netmap};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -71,6 +71,24 @@ impl MeshClient {
             return Ok(Poll::Pending);
         }
         decode(&bytes).map(|e| Poll::Enrolled(Box::new(e)))
+    }
+
+    pub async fn cred(&self) -> anyhow::Result<Cred> {
+        #[derive(serde::Deserialize)]
+        struct Resp {
+            cred: Cred,
+        }
+        let (_, bytes) = self
+            .post_raw("/v1/mesh/cred", "towonel/mesh-cred/v1", Vec::new())
+            .await?;
+        decode::<Resp>(&bytes).map(|r| r.cred)
+    }
+
+    pub async fn report_endpoint(&self, addr: &iroh::EndpointAddr) -> anyhow::Result<()> {
+        let body = serde_json::to_vec(addr)?;
+        self.post_raw("/v1/mesh/endpoint", "towonel/mesh-endpoint/v1", body)
+            .await
+            .map(drop)
     }
 
     pub async fn netmap(&self) -> anyhow::Result<Netmap> {

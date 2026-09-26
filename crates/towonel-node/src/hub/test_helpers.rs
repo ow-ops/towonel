@@ -186,6 +186,7 @@ impl TestHub {
             mesh_changes: tokio::sync::broadcast::channel(256).0,
             web_enabled: true,
             console_url: Some("https://console.test.example".to_string()),
+            mesh_dns_domain: "towonel.internal".to_string(),
             mailer: Some(Arc::clone(&mailer) as super::mail::SharedMailer),
             ports_require_reservation,
             user_port_quota,

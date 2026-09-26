@@ -9,6 +9,7 @@ pub mod login_challenges;
 pub mod mesh_auth_keys;
 pub mod mesh_device_codes;
 pub mod mesh_devices;
+pub mod mesh_policies;
 pub mod password_reset_tokens;
 pub mod port_reservations;
 pub mod sessions;

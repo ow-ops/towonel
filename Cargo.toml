@@ -223,6 +223,7 @@ envy = "0.4"
 tabled = "0.21"
 qrcode = { version = "0.14", default-features = false }
 rqrr = { version = "0.11", default-features = false }
+tun-rs = { version = "2.8", features = ["async_tokio"] }
 ipnet = "2"
 httparse = "1"
 http = "1"

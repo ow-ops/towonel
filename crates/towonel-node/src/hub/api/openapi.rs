@@ -104,6 +104,9 @@ impl Modify for OperatorSecurity {
         super::mesh::delete_auth_key,
         super::mesh::list_devices,
         super::mesh::delete_device,
+        super::mesh::get_policy,
+        super::mesh::put_policy,
+        super::mesh::delete_policy,
         super::mesh::get_device_code,
         super::mesh::post_approve_device_code,
     ),
@@ -140,6 +143,9 @@ pub struct UserApiDoc;
         super::mesh::delete_auth_key,
         super::mesh::list_devices,
         super::mesh::delete_device,
+        super::mesh::get_policy,
+        super::mesh::put_policy,
+        super::mesh::delete_policy,
     ),
 )]
 pub struct OperatorApiDoc;

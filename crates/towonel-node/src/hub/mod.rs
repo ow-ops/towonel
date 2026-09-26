@@ -14,6 +14,8 @@ pub mod signing;
 #[cfg(test)]
 mod api_tests;
 #[cfg(test)]
+mod mesh_peer_tests;
+#[cfg(test)]
 mod mesh_tests;
 #[cfg(test)]
 mod observability_tests;
@@ -254,6 +256,7 @@ pub struct HubParams {
     pub tls: Option<crate::config::TlsConfig>,
     pub web_enabled: bool,
     pub console_url: Option<String>,
+    pub mesh_dns_domain: String,
     pub ports_require_reservation: bool,
     pub user_port_quota: i64,
     pub max_udp_port_range: u16,
@@ -423,6 +426,7 @@ impl Hub {
             mesh_changes: tokio::sync::broadcast::channel(256).0,
             web_enabled: self.p.web_enabled,
             console_url: self.p.console_url.clone(),
+            mesh_dns_domain: self.p.mesh_dns_domain.clone(),
             mailer: self.p.mailer.clone(),
             ports_require_reservation: self.p.ports_require_reservation,
             user_port_quota: self.p.user_port_quota,

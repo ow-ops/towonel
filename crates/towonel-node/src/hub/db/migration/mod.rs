@@ -33,6 +33,8 @@ mod m20260624_000000_drop_app_settings;
 mod m20260916_000000_port_reservation_ranges;
 mod m20260926_000000_mesh;
 mod m20260926_000001_mesh_device_codes;
+mod m20260926_000002_mesh_device_endpoint;
+mod m20260926_000003_mesh_policies;
 
 pub struct Migrator;
 
@@ -76,6 +78,8 @@ impl MigratorTrait for Migrator {
             Box::new(m20260916_000000_port_reservation_ranges::Migration),
             Box::new(m20260926_000000_mesh::Migration),
             Box::new(m20260926_000001_mesh_device_codes::Migration),
+            Box::new(m20260926_000002_mesh_device_endpoint::Migration),
+            Box::new(m20260926_000003_mesh_policies::Migration),
         ]
     }
 }

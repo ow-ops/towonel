@@ -14,6 +14,8 @@ pub struct Device {
     pub key_expires_at_ms: Option<i64>,
     pub created_at_ms: i64,
     pub last_seen_at_ms: Option<i64>,
+    #[serde(default)]
+    pub endpoint: Option<iroh::EndpointAddr>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -53,4 +55,8 @@ pub struct Netmap {
     pub peers: Vec<Device>,
     pub hub_keys: Vec<HubKey>,
     pub relay_url: Option<String>,
+    #[serde(default)]
+    pub policy: Option<crate::policy::Policy>,
+    #[serde(default)]
+    pub dns_domain: String,
 }

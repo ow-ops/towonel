@@ -24,6 +24,7 @@ use towonel_common::edge_cred::Kid;
 use towonel_common::identity::TenantId;
 use towonel_common::mesh::{DeviceId, MESH_CRED_VERSION, MeshCred, mesh_ipv6};
 use towonel_common::time::now_ms;
+use towonel_mesh::policy::Policy;
 
 use super::auth::{client_ip_key, new_id};
 use super::ports::authorize_tenant;
@@ -46,6 +47,7 @@ const ENROLL_AUTH_DOMAIN: &str = "towonel/mesh-enroll/v1";
 const CRED_AUTH_DOMAIN: &str = "towonel/mesh-cred/v1";
 const NETMAP_AUTH_DOMAIN: &str = "towonel/mesh-netmap/v1";
 const NETMAP_STREAM_AUTH_DOMAIN: &str = "towonel/mesh-netmap-stream/v1";
+const ENDPOINT_AUTH_DOMAIN: &str = "towonel/mesh-endpoint/v1";
 const DEVICE_CODE_AUTH_DOMAIN: &str = "towonel/mesh-device-code/v1";
 const DEVICE_POLL_AUTH_DOMAIN: &str = "towonel/mesh-device-poll/v1";
 
@@ -70,6 +72,7 @@ const MS_PER_DAY: i64 = 24 * 60 * 60 * 1000;
 const MAX_TAGS: usize = 16;
 const MAX_LABEL_LEN: usize = 63;
 const MAX_OS_LEN: usize = 32;
+const MAX_ENDPOINT_ADDRS: usize = 16;
 const ENROLL_RETRIES: u32 = 4;
 
 /// Same message for unknown, expired and spent keys: no oracle.
@@ -135,6 +138,9 @@ struct DeviceView {
     key_expires_at_ms: Option<i64>,
     created_at_ms: i64,
     last_seen_at_ms: Option<i64>,
+    /// Serialized `iroh::EndpointAddr`: relay URL and direct addresses.
+    #[schema(value_type = Option<Object>)]
+    endpoint: Option<serde_json::Value>,
 }
 
 impl From<&MeshDeviceRow> for DeviceView {
@@ -150,6 +156,7 @@ impl From<&MeshDeviceRow> for DeviceView {
             key_expires_at_ms: d.key_expires_at_ms,
             created_at_ms: d.created_at_ms,
             last_seen_at_ms: d.last_seen_at_ms,
+            endpoint: d.endpoint.clone(),
         }
     }
 }
@@ -203,6 +210,19 @@ struct NetmapResponse {
     hub_keys: Vec<HubKeyView>,
     #[serde(skip_serializing_if = "Option::is_none")]
     relay_url: Option<String>,
+    /// Absent: devices apply the built-in default policy.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    policy: Option<serde_json::Value>,
+    /// Devices resolve as `<name>.<dns_domain>`.
+    dns_domain: String,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+struct PolicyResponse {
+    /// `null` while the tenant uses the default policy.
+    #[schema(value_type = Option<Object>)]
+    policy: Option<serde_json::Value>,
+    version: i64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -672,6 +692,211 @@ pub(super) async fn get_netmap(State(state): State<Arc<AppState>>, headers: Head
     }
 }
 
+#[utoipa::path(
+    get,
+    path = "/v1/tenants/{id}/mesh/policy",
+    tag = "mesh",
+    params(("id" = String, Path, description = "Tenant id")),
+    responses(
+        (status = 200, description = "Current policy", body = PolicyResponse),
+        (status = 403, description = "Not a member of this tenant"),
+    ),
+    security(("session_cookie" = []), ("api_key" = []), ("operator_key" = [])),
+)]
+pub(super) async fn get_policy(
+    State(state): State<Arc<AppState>>,
+    principal: Principal,
+    Path(id): Path<String>,
+) -> Response {
+    let tenant_id = match tenant_for(&state, &principal, &id).await {
+        Ok(t) => t,
+        Err(resp) => return resp,
+    };
+    match state.db.get_mesh_policy(&tenant_id).await {
+        Ok(stored) => {
+            let (policy, version) = stored.map_or((None, 0), |(p, v)| (Some(p), v));
+            json_ok(PolicyResponse { policy, version })
+        }
+        Err(e) => {
+            warn!(error = %e, "get_mesh_policy failed");
+            internal_error()
+        }
+    }
+}
+
+#[utoipa::path(
+    put,
+    path = "/v1/tenants/{id}/mesh/policy",
+    tag = "mesh",
+    params(("id" = String, Path, description = "Tenant id")),
+    request_body(content = Object, description = "`{rules: [{from, to, ports, proto}], tests: [{from, to, port, proto, allow}]}`"),
+    responses(
+        (status = 200, description = "Saved and pushed to devices", body = PolicyResponse),
+        (status = 400, description = "Invalid policy or a failing test"),
+        (status = 403, description = "Not a member of this tenant"),
+    ),
+    security(("session_cookie" = []), ("api_key" = []), ("operator_key" = [])),
+)]
+pub(super) async fn put_policy(
+    State(state): State<Arc<AppState>>,
+    principal: Principal,
+    Path(id): Path<String>,
+    axum::Json(body): axum::Json<serde_json::Value>,
+) -> Response {
+    let tenant_id = match tenant_for(&state, &principal, &id).await {
+        Ok(t) => t,
+        Err(resp) => return resp,
+    };
+    let policy: Policy = match serde_json::from_value(body) {
+        Ok(p) => p,
+        Err(e) => return invalid_request(format!("invalid policy: {e}")),
+    };
+    if let Err(e) = policy.validate() {
+        return invalid_request(format!("{e:#}"));
+    }
+    let devices = match state.db.list_mesh_devices(&tenant_id).await {
+        Ok(d) => d,
+        Err(e) => {
+            warn!(error = %e, "list_mesh_devices failed");
+            return internal_error();
+        }
+    };
+    let lookup = |name: &str| devices.iter().find(|d| d.name == name).map(policy_subject);
+    if let Err(e) = policy.run_tests(lookup) {
+        return invalid_request(format!("{e:#}"));
+    }
+    let value = match serde_json::to_value(&policy) {
+        Ok(v) => v,
+        Err(e) => {
+            warn!(error = %e, "policy serialization failed");
+            return internal_error();
+        }
+    };
+    let (_, actor_user_id) = actor(&principal);
+    let version = match state
+        .db
+        .put_mesh_policy(&tenant_id, value.clone(), actor_user_id, now_ms_i64())
+        .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            warn!(error = %e, "put_mesh_policy failed");
+            return internal_error();
+        }
+    };
+    audit(
+        &state,
+        actor(&principal),
+        "mesh.policy.update",
+        "mesh_policy",
+        &tenant_id.to_string(),
+        serde_json::json!({"version": version, "rules": policy.rules.len()}),
+    )
+    .await;
+    notify_mesh_change(&state, tenant_id);
+    json_ok(PolicyResponse {
+        policy: Some(value),
+        version,
+    })
+}
+
+#[utoipa::path(
+    delete,
+    path = "/v1/tenants/{id}/mesh/policy",
+    tag = "mesh",
+    params(("id" = String, Path, description = "Tenant id")),
+    responses(
+        (status = 200, description = "Back to the default policy"),
+        (status = 403, description = "Not a member of this tenant"),
+    ),
+    security(("session_cookie" = []), ("api_key" = []), ("operator_key" = [])),
+)]
+pub(super) async fn delete_policy(
+    State(state): State<Arc<AppState>>,
+    principal: Principal,
+    Path(id): Path<String>,
+) -> Response {
+    let tenant_id = match tenant_for(&state, &principal, &id).await {
+        Ok(t) => t,
+        Err(resp) => return resp,
+    };
+    match state.db.delete_mesh_policy(&tenant_id).await {
+        Ok(_) => {
+            audit(
+                &state,
+                actor(&principal),
+                "mesh.policy.reset",
+                "mesh_policy",
+                &tenant_id.to_string(),
+                serde_json::json!({}),
+            )
+            .await;
+            notify_mesh_change(&state, tenant_id);
+            json_ok(serde_json::json!({"ok": true}))
+        }
+        Err(e) => {
+            warn!(error = %e, "delete_mesh_policy failed");
+            internal_error()
+        }
+    }
+}
+
+/// What a policy sees of a device: its tags and owner.
+fn policy_subject(d: &MeshDeviceRow) -> MeshCred {
+    MeshCred {
+        version: MESH_CRED_VERSION,
+        kid: 0,
+        device_id: d.device_id,
+        tenant_id: d.tenant_id,
+        ipv4: d.ipv4,
+        ipv6: mesh_ipv6(&d.tenant_id, &d.device_id),
+        tags: d.tags.clone(),
+        owner: d.user_id.clone(),
+        not_after_ms: 0,
+    }
+}
+
+pub(super) async fn post_endpoint(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let device = match authenticated_device(&state, &headers, ENDPOINT_AUTH_DOMAIN, &body).await {
+        Ok(d) => d,
+        Err(resp) => return resp,
+    };
+    let addr: iroh::EndpointAddr = match serde_json::from_slice(&body) {
+        Ok(a) => a,
+        Err(e) => return invalid_request(format!("invalid endpoint address: {e}")),
+    };
+    if addr.id.as_bytes() != &device.device_id {
+        return invalid_request("endpoint id does not match the signing device");
+    }
+    if addr.addrs.len() > MAX_ENDPOINT_ADDRS {
+        return invalid_request(format!("at most {MAX_ENDPOINT_ADDRS} addresses"));
+    }
+    let value = match serde_json::to_value(&addr) {
+        Ok(v) => v,
+        Err(e) => {
+            warn!(error = %e, "EndpointAddr serialization failed");
+            return internal_error();
+        }
+    };
+    match state
+        .db
+        .set_mesh_device_endpoint(&device.device_id, &value)
+        .await
+    {
+        Ok(true) => notify_mesh_change(&state, device.tenant_id),
+        Ok(false) => {}
+        Err(e) => {
+            warn!(error = %e, "set_mesh_device_endpoint failed");
+            return internal_error();
+        }
+    }
+    json_ok(serde_json::json!({"ok": true}))
+}
+
 /// SSE: a `netmap` event on connect and after every change to the tenant's
 /// devices. Ends with `revoked` or `key_expired` when the device loses access.
 pub(super) async fn get_netmap_stream(
@@ -743,6 +968,11 @@ async fn build_netmap(state: &AppState, device: &MeshDeviceRow) -> anyhow::Resul
         .map(DeviceView::from)
         .collect();
     let signer = state.signer.as_ref();
+    let policy = state
+        .db
+        .get_mesh_policy(&device.tenant_id)
+        .await?
+        .map(|(p, _)| p);
     Ok(NetmapResponse {
         tenant_id: device.tenant_id.to_string(),
         this_device: DeviceView::from(device),
@@ -752,6 +982,8 @@ async fn build_netmap(state: &AppState, device: &MeshDeviceRow) -> anyhow::Resul
             public_key_b64: B64.encode(signer.public_key().as_bytes()),
         }],
         relay_url: state.identity.relay_url.clone(),
+        policy,
+        dns_domain: state.mesh_dns_domain.clone(),
     })
 }
 

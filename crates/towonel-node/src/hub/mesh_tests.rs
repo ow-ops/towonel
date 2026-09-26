@@ -798,3 +798,93 @@ async fn netmap_stream_ignores_other_tenants() {
     assert_eq!(peers.len(), 1);
     assert_eq!(peers[0]["name"], "neighbour");
 }
+
+async fn put_policy(
+    hub: &TestHub,
+    client: &reqwest::Client,
+    tenant: &TenantKeypair,
+    policy: Value,
+) -> (u16, Value) {
+    let resp = client
+        .put(hub.url(&format!("/v1/tenants/{}/mesh/policy", tenant.id())))
+        .bearer_auth(OPERATOR_KEY)
+        .json(&policy)
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status().as_u16();
+    (status, resp.json().await.unwrap_or(Value::Null))
+}
+
+#[tokio::test]
+async fn policy_is_validated_tested_versioned_and_pushed() {
+    let hub = TestHub::start().await;
+    let client = reqwest::Client::new();
+    let tenant = new_tenant(&hub, &client, "mesh-r").await;
+    let server_key = mint_key(&hub, &client, &tenant, json!({"tags": ["tag:nas"]})).await;
+    let user_key = mint_key(&hub, &client, &tenant, json!({})).await;
+    let nas = Device::new(1);
+    enroll(&hub, &client, &nas, &server_key, "nas").await;
+    enroll(&hub, &client, &Device::new(2), &user_key, "laptop").await;
+    let policy_url = hub.url(&format!("/v1/tenants/{}/mesh/policy", tenant.id()));
+
+    let (s, body) = get_json(&client, &policy_url, Some(OPERATOR_KEY)).await;
+    assert_eq!(s, 200);
+    assert!(body["policy"].is_null());
+    assert_eq!(body["version"], 0);
+
+    let (s, body) = put_policy(
+        &hub,
+        &client,
+        &tenant,
+        json!({"rules": [{"from": ["group:x"], "to": ["*"]}]}),
+    )
+    .await;
+    assert_eq!(s, 400, "{body}");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("unknown selector")
+    );
+
+    let failing = json!({
+        "rules": [{"from": ["tenant"], "to": ["tag:nas"], "ports": ["22"]}],
+        "tests": [{"from": "laptop", "to": "nas", "port": 80, "allow": true}]
+    });
+    let (s, body) = put_policy(&hub, &client, &tenant, failing).await;
+    assert_eq!(s, 400, "{body}");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("expected allow"),
+        "{body}"
+    );
+
+    let good = json!({
+        "rules": [{"from": ["tenant"], "to": ["tag:nas"], "ports": ["22"], "proto": "tcp"}],
+        "tests": [
+            {"from": "laptop", "to": "nas", "port": 22, "allow": true},
+            {"from": "nas", "to": "laptop", "port": 22, "allow": false}
+        ]
+    });
+    let (s, body) = put_policy(&hub, &client, &tenant, good.clone()).await;
+    assert_eq!(s, 200, "{body}");
+    assert_eq!(body["version"], 1);
+    let (_, body) = put_policy(&hub, &client, &tenant, good).await;
+    assert_eq!(body["version"], 2);
+
+    let (_, map) = netmap(&hub, &client, &nas).await;
+    assert_eq!(map["policy"]["rules"][0]["to"][0], "tag:nas");
+
+    let resp = client
+        .delete(&policy_url)
+        .bearer_auth(OPERATOR_KEY)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let (_, map) = netmap(&hub, &client, &nas).await;
+    assert!(map.get("policy").is_none_or(Value::is_null));
+}

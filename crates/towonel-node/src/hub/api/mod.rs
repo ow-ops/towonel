@@ -226,6 +226,7 @@ pub struct AppState {
     pub web_enabled: bool,
     /// Web console base URL for user-facing links; falls back to `public_url`.
     pub console_url: Option<String>,
+    pub mesh_dns_domain: String,
     pub mailer: Option<super::mail::SharedMailer>,
     pub ports_require_reservation: bool,
     /// Per-user port reservation quota. `0` means unlimited.
@@ -598,6 +599,12 @@ fn tenant_member_routes() -> Router<Arc<AppState>> {
         )
         .route("/v1/tenants/{id}/mesh/devices", get(mesh::list_devices))
         .route(
+            "/v1/tenants/{id}/mesh/policy",
+            get(mesh::get_policy)
+                .put(mesh::put_policy)
+                .delete(mesh::delete_policy),
+        )
+        .route(
             "/v1/tenants/{id}/mesh/devices/{device_id}",
             delete(mesh::delete_device),
         )
@@ -721,6 +728,7 @@ fn signed_public_routes() -> Router<Arc<AppState>> {
         .route("/v1/mesh/cred", post(mesh::post_cred))
         .route("/v1/mesh/netmap", get(mesh::get_netmap))
         .route("/v1/mesh/netmap/stream", get(mesh::get_netmap_stream))
+        .route("/v1/mesh/endpoint", post(mesh::post_endpoint))
 }
 
 #[derive(Debug, Clone)]

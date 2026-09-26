@@ -14,6 +14,7 @@ pub struct Model {
     pub key_expires_at_ms: Option<i64>,
     pub created_at_ms: i64,
     pub last_seen_at_ms: Option<i64>,
+    pub endpoint: Option<Json>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

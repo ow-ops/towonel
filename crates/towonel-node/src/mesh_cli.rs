@@ -6,11 +6,15 @@ use std::time::Duration;
 
 use anyhow::{Context, bail};
 use tabled::{Table, Tabled, settings::Style};
+use tokio::io::AsyncWriteExt;
+use tokio_util::sync::CancellationToken;
 use towonel_common::hub_error::HubApiError;
 use towonel_common::time::now_ms;
 use towonel_mesh::api::{Device, Enrolled, Netmap};
 use towonel_mesh::client::is_transient;
-use towonel_mesh::{Enrollment, MeshClient, Poll, StateDir, StreamEvent};
+use towonel_mesh::{
+    Enrollment, MeshClient, MeshNode, NodeOptions, Poll, StateDir, Stopped, StreamEvent, local,
+};
 
 const OS: &str = std::env::consts::OS;
 const MAX_RECONNECT_DELAY: Duration = Duration::from_mins(1);
@@ -22,6 +26,102 @@ pub async fn cmd_up(
     state_dir: Option<PathBuf>,
 ) -> anyhow::Result<()> {
     let state = open_state(state_dir)?;
+    let hub_url = enroll_if_needed(&state, hub_url, auth_key, name).await?;
+    run(&state, &hub_url).await
+}
+
+/// Runs until Ctrl-C / SIGTERM, or until the hub removes this device.
+async fn run(state: &StateDir, hub_url: &str) -> anyhow::Result<()> {
+    let key = state.device_key()?;
+    let node = MeshNode::start(
+        MeshClient::new(hub_url, key.clone())?,
+        key,
+        NodeOptions::default(),
+    )
+    .await?;
+    let cancel = CancellationToken::new();
+    let api = tokio::spawn(local::serve(
+        node.clone(),
+        local::socket_path(state.path()),
+        cancel.clone(),
+    ));
+    let tun = match towonel_mesh::tun::Tun::create(&node) {
+        Ok(tun) => {
+            println!(
+                "Routing the mesh through {} (MTU {}).",
+                towonel_mesh::tun::DEVICE_NAME,
+                towonel_mesh::tun::MTU
+            );
+            configure_dns(&node.netmap().borrow().dns_domain);
+            Some(tokio::spawn(tun.run(node.clone(), cancel.clone())))
+        }
+        Err(e) => {
+            println!(
+                "Overlay IPs are not routed ({e:#}). Run as root or with CAP_NET_ADMIN for that; \
+                 `towonel mesh connect` and `nc` work without it."
+            );
+            None
+        }
+    };
+    println!("Mesh is up. Keep this running; press Ctrl-C to stop.");
+
+    let result = tokio::select! {
+        () = towonel_common::shutdown::shutdown_signal() => Ok(()),
+        reason = node.stopped() => match reason {
+            Some(Stopped::Revoked) => Err(anyhow::anyhow!("this device was removed from the mesh")),
+            Some(Stopped::KeyExpired) => Err(anyhow::anyhow!(
+                "this device's key expired; run `towonel mesh up` to renew it"
+            )),
+            None => Ok(()),
+        },
+    };
+    cancel.cancel();
+    node.shutdown().await;
+    if let Some(tun) = tun {
+        drop(tun.await);
+    }
+    match api.await {
+        Ok(Err(e)) => eprintln!("local api: {e:#}"),
+        Err(e) => eprintln!("local api task: {e}"),
+        Ok(Ok(())) => {}
+    }
+    result
+}
+
+/// Split DNS for the mesh domain through systemd-resolved; the settings go
+/// away with the interface.
+fn configure_dns(domain: &str) {
+    let dev = towonel_mesh::tun::DEVICE_NAME;
+    let resolver = towonel_mesh::dns::RESOLVER.to_string();
+    let routing_domain = format!("~{domain}");
+    let ok = [
+        vec!["dns", dev, resolver.as_str()],
+        vec!["domain", dev, routing_domain.as_str()],
+    ]
+    .iter()
+    .all(|args| {
+        std::process::Command::new("resolvectl")
+            .args(args)
+            .status()
+            .is_ok_and(|s| s.success())
+    });
+    if ok {
+        println!("Mesh names resolve as <device>.{domain}.");
+    } else {
+        println!(
+            "Could not set up DNS for {domain} (no systemd-resolved?). Point {domain} at {resolver} \
+             to use device names."
+        );
+    }
+}
+
+/// Returns the hub URL to run against.
+async fn enroll_if_needed(
+    state: &StateDir,
+    hub_url: Option<String>,
+    auth_key: Option<String>,
+    name: Option<String>,
+) -> anyhow::Result<String> {
     let existing = state.load_enrollment()?;
     let hub_url = hub_url
         .or_else(|| existing.as_ref().map(|e| e.hub_url.clone()))
@@ -35,7 +135,7 @@ pub async fn cmd_up(
                 let enrollment = enrollment_from(&hub_url, &netmap.tenant_id, &netmap.this_device);
                 state.save_enrollment(&enrollment)?;
                 println!("Already in the mesh as {}.", describe(&enrollment));
-                return Ok(());
+                return Ok(hub_url);
             }
             Err(e) if hub_code(&e) == Some("key_expired") => {
                 println!("This device's key expired; sign in to renew it.\n");
@@ -59,7 +159,62 @@ pub async fn cmd_up(
     let enrollment = enrollment_from(&hub_url, &enrolled.tenant_id, &enrolled.device);
     state.save_enrollment(&enrollment)?;
     println!("Joined the mesh as {}.", describe(&enrollment));
+    Ok(hub_url)
+}
+
+pub async fn cmd_nc(state_dir: Option<PathBuf>, peer: String, port: u16) -> anyhow::Result<()> {
+    let state = open_state(state_dir)?;
+    let stream = local::dial(state.path(), &peer, port).await?;
+    let (mut read, mut write) = stream.into_split();
+    let upstream = async {
+        let res = tokio::io::copy(&mut tokio::io::stdin(), &mut write).await;
+        drop(write.shutdown().await);
+        res
+    };
+    let mut stdout = tokio::io::stdout();
+    let downstream = tokio::io::copy(&mut read, &mut stdout);
+    let (up, down) = tokio::join!(upstream, downstream);
+    // The reader going away (`| head`) is a normal end, not an error.
+    let broken_pipe = |e: &std::io::Error| e.kind() == std::io::ErrorKind::BrokenPipe;
+    up.or_else(|e| if broken_pipe(&e) { Ok(0) } else { Err(e) })?;
+    down.or_else(|e| if broken_pipe(&e) { Ok(0) } else { Err(e) })?;
     Ok(())
+}
+
+pub async fn cmd_connect(
+    state_dir: Option<PathBuf>,
+    target: String,
+    local: Option<String>,
+) -> anyhow::Result<()> {
+    let state = open_state(state_dir)?;
+    let (peer, port) = target
+        .rsplit_once(':')
+        .and_then(|(p, port)| Some((p.to_string(), port.parse::<u16>().ok()?)))
+        .context("expected <peer>:<port>, e.g. nas:22")?;
+    let local = local.unwrap_or_else(|| format!("127.0.0.1:{port}"));
+    let listener = tokio::net::TcpListener::bind(&local)
+        .await
+        .with_context(|| format!("cannot listen on {local}"))?;
+    // Fail now rather than on the first connection if the daemon is down.
+    local::status(state.path()).await?;
+    println!("Forwarding {local} to {peer}:{port}. Press Ctrl-C to stop.");
+    let state_dir = state.path().to_path_buf();
+    loop {
+        let (tcp, _) = tokio::select! {
+            () = towonel_common::shutdown::shutdown_signal() => return Ok(()),
+            accepted = listener.accept() => accepted?,
+        };
+        let (state_dir, peer) = (state_dir.clone(), peer.clone());
+        tokio::spawn(async move {
+            match local::dial(&state_dir, &peer, port).await {
+                Ok(mut mesh) => {
+                    let mut tcp = tcp;
+                    drop(tokio::io::copy_bidirectional(&mut tcp, &mut mesh).await);
+                }
+                Err(e) => eprintln!("{peer}:{port}: {e:#}"),
+            }
+        });
+    }
 }
 
 pub async fn cmd_status(state_dir: Option<PathBuf>, watch: bool, json: bool) -> anyhow::Result<()> {
@@ -71,7 +226,11 @@ pub async fn cmd_status(state_dir: Option<PathBuf>, watch: bool, json: bool) -> 
 
     if !watch {
         let netmap = client.netmap().await.map_err(explain)?;
-        return print_netmap(&netmap, json);
+        if json {
+            return print_netmap(&netmap, true, None);
+        }
+        let paths = local::status(state.path()).await.ok();
+        return print_netmap(&netmap, false, paths.as_deref());
     }
 
     let mut delay = Duration::from_secs(1);
@@ -84,7 +243,7 @@ pub async fn cmd_status(state_dir: Option<PathBuf>, watch: bool, json: bool) -> 
                         if !json {
                             print!("\x1b[2J\x1b[H");
                         }
-                        print_netmap(&netmap, json)?;
+                        print_netmap(&netmap, json, None)?;
                     }
                     Ok(Some(StreamEvent::Revoked)) => {
                         bail!("this device was removed from the mesh")
@@ -168,9 +327,16 @@ struct PeerRow {
     os: String,
     #[tabled(rename = "LAST SEEN")]
     last_seen: String,
+    #[tabled(rename = "PATH")]
+    path: String,
 }
 
-fn print_netmap(netmap: &Netmap, json: bool) -> anyhow::Result<()> {
+/// `paths` comes from the local daemon; `None` when it isn't running.
+fn print_netmap(
+    netmap: &Netmap,
+    json: bool,
+    paths: Option<&[local::PeerLine]>,
+) -> anyhow::Result<()> {
     if json {
         println!("{}", serde_json::to_string_pretty(netmap)?);
         return Ok(());
@@ -183,6 +349,14 @@ fn print_netmap(netmap: &Netmap, json: bool) -> anyhow::Result<()> {
         last_seen: d
             .last_seen_at_ms
             .map_or_else(|| "-".to_string(), |t| ago(now, t)),
+        path: paths
+            .and_then(|ps| ps.iter().find(|p| p.ipv4 == d.ipv4))
+            .map_or("-", |p| match (p.connected, p.relayed) {
+                (true, Some(true)) => "relay",
+                (true, _) => "direct",
+                (false, _) => "idle",
+            })
+            .to_string(),
     };
     let mut rows = vec![row(
         &netmap.this_device,

@@ -103,8 +103,9 @@ enum Command {
 
 #[derive(Subcommand)]
 enum MeshAction {
-    /// Add this device to the mesh: browser sign-in, or `--auth-key` for
-    /// servers. Renews the device key when it has expired.
+    /// Add this device to the mesh (browser sign-in, or `--auth-key` for
+    /// servers) and keep it connected. Renews the device key when it has
+    /// expired. Run it under systemd or similar to keep it up.
     Up {
         #[arg(long, env = "TOWONEL_HUB_URL")]
         hub_url: Option<String>,
@@ -113,6 +114,24 @@ enum MeshAction {
         /// Defaults to the hostname.
         #[arg(long)]
         name: Option<String>,
+        #[arg(long, env = "TOWONEL_MESH_STATE_DIR")]
+        state_dir: Option<PathBuf>,
+    },
+    /// Pipe stdin/stdout to a TCP port on a peer, e.g.
+    /// `ssh -o ProxyCommand="towonel mesh nc %h %p" nas`.
+    Nc {
+        peer: String,
+        port: u16,
+        #[arg(long, env = "TOWONEL_MESH_STATE_DIR")]
+        state_dir: Option<PathBuf>,
+    },
+    /// Forward a local port to a peer, e.g. `towonel mesh connect nas:5432`.
+    Connect {
+        /// `<peer>:<port>`; the peer is a device name or overlay IP.
+        target: String,
+        /// Local listen address. Defaults to `127.0.0.1:<port>`.
+        #[arg(long)]
+        local: Option<String>,
         #[arg(long, env = "TOWONEL_MESH_STATE_DIR")]
         state_dir: Option<PathBuf>,
     },
@@ -612,6 +631,16 @@ pub async fn run() -> anyhow::Result<()> {
                 name,
                 state_dir,
             } => mesh_cli::cmd_up(hub_url, auth_key, name, state_dir).await,
+            MeshAction::Nc {
+                peer,
+                port,
+                state_dir,
+            } => mesh_cli::cmd_nc(state_dir, peer, port).await,
+            MeshAction::Connect {
+                target,
+                local,
+                state_dir,
+            } => mesh_cli::cmd_connect(state_dir, target, local).await,
             MeshAction::Status {
                 state_dir,
                 watch,
@@ -886,6 +915,7 @@ async fn build_hub_params(
         tls: config.hub.tls.clone(),
         web_enabled: config.hub.web_enabled,
         console_url: config.hub.console_url.clone(),
+        mesh_dns_domain: config.hub.mesh_dns_domain.clone(),
         ports_require_reservation: config.hub.ports_require_reservation,
         user_port_quota: config.hub.user_port_quota,
         max_udp_port_range: config.hub.max_udp_port_range,

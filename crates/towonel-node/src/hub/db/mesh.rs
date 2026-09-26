@@ -8,7 +8,7 @@ use towonel_common::identity::TenantId;
 use towonel_common::mesh::{DeviceId, MESH_IPV4_MAX_HOST, mesh_ipv4};
 
 use super::Db;
-use super::entities::{mesh_auth_keys, mesh_device_codes, mesh_devices};
+use super::entities::{mesh_auth_keys, mesh_device_codes, mesh_devices, mesh_policies};
 
 const LAST_SEEN_RESOLUTION_MS: i64 = 60_000;
 
@@ -88,6 +88,8 @@ pub struct MeshDeviceRow {
     pub key_expires_at_ms: Option<i64>,
     pub created_at_ms: i64,
     pub last_seen_at_ms: Option<i64>,
+    /// Serialized `iroh::EndpointAddr` last reported by the device.
+    pub endpoint: Option<serde_json::Value>,
 }
 
 fn tenant_from_bytes(bytes: &[u8]) -> anyhow::Result<TenantId> {
@@ -165,6 +167,7 @@ impl TryFrom<mesh_devices::Model> for MeshDeviceRow {
             key_expires_at_ms: m.key_expires_at_ms,
             created_at_ms: m.created_at_ms,
             last_seen_at_ms: m.last_seen_at_ms,
+            endpoint: m.endpoint,
         })
     }
 }
@@ -288,6 +291,7 @@ impl Db {
             key_expires_at_ms: ActiveValue::Set(d.key_expires_at_ms),
             created_at_ms: ActiveValue::Set(d.now_ms),
             last_seen_at_ms: ActiveValue::Set(Some(d.now_ms)),
+            endpoint: ActiveValue::Set(None),
         };
         let inserted = mesh_devices::Entity::insert(model)
             .exec_with_returning(&txn)
@@ -447,6 +451,79 @@ impl Db {
             .exec(&self.conn)
             .await?;
         Ok(())
+    }
+
+    /// `Ok(false)` when the stored endpoint was already `endpoint`.
+    pub async fn set_mesh_device_endpoint(
+        &self,
+        device_id: &DeviceId,
+        endpoint: &serde_json::Value,
+    ) -> anyhow::Result<bool> {
+        let unchanged = self
+            .get_mesh_device(device_id)
+            .await?
+            .is_some_and(|d| d.endpoint.as_ref() == Some(endpoint));
+        if unchanged {
+            return Ok(false);
+        }
+        mesh_devices::Entity::update_many()
+            .col_expr(
+                mesh_devices::Column::Endpoint,
+                sea_orm::sea_query::Expr::value(endpoint.clone()),
+            )
+            .filter(mesh_devices::Column::DeviceId.eq(device_id.to_vec()))
+            .exec(&self.conn)
+            .await?;
+        Ok(true)
+    }
+
+    /// The stored policy and its version, `None` for the default policy.
+    pub async fn get_mesh_policy(
+        &self,
+        tenant_id: &TenantId,
+    ) -> anyhow::Result<Option<(serde_json::Value, i64)>> {
+        Ok(
+            mesh_policies::Entity::find_by_id(tenant_id.as_bytes().to_vec())
+                .one(&self.conn)
+                .await?
+                .map(|m| (m.policy, m.version)),
+        )
+    }
+
+    /// Returns the new version.
+    pub async fn put_mesh_policy(
+        &self,
+        tenant_id: &TenantId,
+        policy: serde_json::Value,
+        updated_by: Option<&str>,
+        now_ms: i64,
+    ) -> anyhow::Result<i64> {
+        let txn = self.conn.begin().await?;
+        let version = mesh_policies::Entity::find_by_id(tenant_id.as_bytes().to_vec())
+            .one(&txn)
+            .await?
+            .map_or(1, |m| m.version + 1);
+        mesh_policies::Entity::delete_by_id(tenant_id.as_bytes().to_vec())
+            .exec(&txn)
+            .await?;
+        mesh_policies::Entity::insert(mesh_policies::ActiveModel {
+            tenant_id: ActiveValue::Set(tenant_id.as_bytes().to_vec()),
+            policy: ActiveValue::Set(policy),
+            version: ActiveValue::Set(version),
+            updated_at_ms: ActiveValue::Set(now_ms),
+            updated_by: ActiveValue::Set(updated_by.map(str::to_string)),
+        })
+        .exec(&txn)
+        .await?;
+        txn.commit().await?;
+        Ok(version)
+    }
+
+    pub async fn delete_mesh_policy(&self, tenant_id: &TenantId) -> anyhow::Result<u64> {
+        let res = mesh_policies::Entity::delete_by_id(tenant_id.as_bytes().to_vec())
+            .exec(&self.conn)
+            .await?;
+        Ok(res.rows_affected)
     }
 
     pub async fn delete_mesh_device(
