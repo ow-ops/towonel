@@ -1,4 +1,4 @@
-.PHONY: build test lint fmt check docker docker-agent docker-node up down e2e release clean mesh-android mesh-bindings
+.PHONY: build test lint fmt check docker docker-agent docker-node up down e2e release clean mesh-android mesh-bindings e2e-mesh
 
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 
@@ -43,6 +43,11 @@ e2e:
 		echo "test-runner exit code: $$code"; \
 		docker compose --env-file .env.e2e -f docker-compose.e2e.yml down -v; \
 		exit $$code
+
+# Mesh with real TUN devices in containers.
+e2e-mesh:
+	cargo build --release -p towonel-node
+	./tests/e2e/mesh.sh
 
 # Mesh client library for the mobile apps (crates/towonel-mesh-ffi).
 # arm64 for phones, x86_64 for the emulator. Needs ANDROID_NDK_HOME.
