@@ -280,6 +280,72 @@ async fn packets_route_between_peers_with_policy() {
     assert_eq!(recv_packet(&mut laptop_rx).await, None);
 }
 
+struct Collect(tokio::sync::mpsc::UnboundedSender<Vec<u8>>);
+
+impl towonel_mesh_ffi::MeshListener for Collect {
+    fn on_packet(&self, packet: Vec<u8>) {
+        drop(self.0.send(packet));
+    }
+    fn on_peers_changed(&self, _peers: Vec<towonel_mesh_ffi::Device>) {}
+    fn on_stopped(&self, _reason: towonel_mesh_ffi::StopReason) {}
+}
+
+/// The entry points the mobile and desktop apps call, end to end.
+#[tokio::test]
+async fn ffi_mesh_carries_packets() {
+    let hub = TestHub::start().await;
+    let client = reqwest::Client::new();
+    let (_, user_key) = Box::pin(user_tenant(&hub, &client)).await;
+    let dir = std::env::temp_dir().join(format!("towonel-ffi-test-{}", std::process::id()));
+
+    let mut meshes = Vec::new();
+    let mut inboxes = Vec::new();
+    for name in ["tablet", "desktop"] {
+        let mesh = towonel_mesh_ffi::Mesh::new(dir.join(name).display().to_string()).unwrap();
+        assert!(mesh.enrollment().unwrap().is_none());
+        let info = mesh
+            .enroll_with_auth_key(hub.base_url.clone(), user_key.clone(), name.to_string())
+            .await
+            .unwrap();
+        assert_eq!(mesh.enrollment().unwrap().unwrap().ipv4, info.ipv4);
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        mesh.start(std::sync::Arc::new(Collect(tx))).await.unwrap();
+        meshes.push((mesh, info));
+        inboxes.push(rx);
+    }
+    let (tablet, tablet_info) = &meshes[0];
+    let (desktop, desktop_info) = &meshes[1];
+
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !tablet.peers().iter().any(|p| p.name == "desktop") {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap();
+
+    let packet = ipv4_udp(&tablet_info.ipv4, &desktop_info.ipv4, 1111, 2222, 64);
+    let received = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            // The first packets can be lost while the peer's endpoint propagates.
+            tablet.send_packet(packet.to_vec());
+            if let Ok(Some(p)) =
+                tokio::time::timeout(Duration::from_millis(300), inboxes[1].recv()).await
+            {
+                return p;
+            }
+        }
+    })
+    .await
+    .expect("packet never arrived");
+    assert_eq!(received, packet.to_vec());
+
+    tablet.stop().await;
+    desktop.stop().await;
+    drop(meshes);
+    drop(std::fs::remove_dir_all(&dir));
+}
+
 /// What `towonel mesh nc` / `connect` / `status` do through the daemon.
 #[tokio::test]
 async fn local_socket_dials_and_reports_peers() {

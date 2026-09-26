@@ -1,4 +1,4 @@
-.PHONY: build test lint fmt check docker docker-agent docker-node up down e2e release clean
+.PHONY: build test lint fmt check docker docker-agent docker-node up down e2e release clean mesh-android mesh-bindings
 
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 
@@ -43,6 +43,28 @@ e2e:
 		echo "test-runner exit code: $$code"; \
 		docker compose --env-file .env.e2e -f docker-compose.e2e.yml down -v; \
 		exit $$code
+
+# Mesh client library for the mobile apps (crates/towonel-mesh-ffi).
+# arm64 for phones, x86_64 for the emulator. Needs ANDROID_NDK_HOME.
+ANDROID_API ?= 26
+NDK_BIN = $(ANDROID_NDK_HOME)/toolchains/llvm/prebuilt/linux-x86_64/bin
+
+mesh-android:
+	for target in aarch64-linux-android x86_64-linux-android; do \
+		t=$$(echo $$target | tr - _); T=$$(echo $$t | tr a-z A-Z); \
+		env CC_$$t=$(NDK_BIN)/$${target}$(ANDROID_API)-clang AR_$$t=$(NDK_BIN)/llvm-ar \
+			CARGO_TARGET_$${T}_LINKER=$(NDK_BIN)/$${target}$(ANDROID_API)-clang \
+			cargo build --release -p towonel-mesh-ffi --target $$target || exit 1; \
+	done
+
+# Kotlin and Swift sources for the FFI, into target/bindings.
+mesh-bindings:
+	cargo build -p towonel-mesh-ffi
+	for lang in kotlin swift; do \
+		cargo run -p towonel-mesh-ffi --features bindgen --bin uniffi-bindgen -- \
+			generate --library target/debug/libtowonel_mesh_ffi.so --language $$lang \
+			--out-dir target/bindings/$$lang --no-format || exit 1; \
+	done
 
 release:
 	@test -n "$(V)" || (echo "usage: make release V=0.1.0" && exit 1)

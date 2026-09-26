@@ -74,6 +74,7 @@ utoipa-swagger-ui = { workspace = true }
 openssl = { version = "0.10", features = ["vendored"] }
 
 [dev-dependencies]
+towonel-mesh-ffi = { path = "../towonel-mesh-ffi" }
 rqrr = { workspace = true }
 
 [package.metadata.cargo-machete]

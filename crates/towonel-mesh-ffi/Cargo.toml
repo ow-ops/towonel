@@ -1,0 +1,30 @@
+[package]
+name = "towonel-mesh-ffi"
+version.workspace = true
+rust-version.workspace = true
+edition = "2024"
+publish = false
+
+[lib]
+# cdylib: Android .so; staticlib: iOS xcframework; lib: tests.
+crate-type = ["cdylib", "staticlib", "lib"]
+
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/bin/uniffi-bindgen.rs"
+required-features = ["bindgen"]
+
+[features]
+bindgen = ["uniffi/cli"]
+
+[dependencies]
+towonel-mesh = { path = "../towonel-mesh" }
+anyhow = { workspace = true }
+bytes = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["sync", "time"] }
+towonel-common = { path = "../towonel-common" }
+uniffi = { workspace = true }
+
+# No `[lints] workspace = true`: UniFFI's generated scaffolding needs
+# `unsafe`, which the workspace forbids.
