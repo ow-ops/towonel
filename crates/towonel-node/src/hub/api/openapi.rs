@@ -99,6 +99,13 @@ impl Modify for OperatorSecurity {
         super::invites::delete_invite,
         super::invites::post_invite_hostnames,
         super::invites::delete_invite_hostname,
+        super::mesh::post_auth_key,
+        super::mesh::list_auth_keys,
+        super::mesh::delete_auth_key,
+        super::mesh::list_devices,
+        super::mesh::delete_device,
+        super::mesh::get_device_code,
+        super::mesh::post_approve_device_code,
     ),
 )]
 pub struct UserApiDoc;
@@ -128,6 +135,11 @@ pub struct UserApiDoc;
         super::users::list_users,
         super::users::get_user,
         super::users::post_user_disable,
+        super::mesh::post_auth_key,
+        super::mesh::list_auth_keys,
+        super::mesh::delete_auth_key,
+        super::mesh::list_devices,
+        super::mesh::delete_device,
     ),
 )]
 pub struct OperatorApiDoc;

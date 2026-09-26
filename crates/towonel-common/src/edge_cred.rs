@@ -150,7 +150,7 @@ impl<'a> Cursor<'a> {
     }
 }
 
-mod serde_tenant_id_bytes {
+pub(crate) mod serde_tenant_id_bytes {
     use super::TenantId;
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
 

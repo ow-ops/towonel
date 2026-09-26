@@ -31,6 +31,8 @@ mod m20260622_000000_invites_region_default;
 mod m20260623_000000_drop_invites_hostnames_gin;
 mod m20260624_000000_drop_app_settings;
 mod m20260916_000000_port_reservation_ranges;
+mod m20260926_000000_mesh;
+mod m20260926_000001_mesh_device_codes;
 
 pub struct Migrator;
 
@@ -72,6 +74,8 @@ impl MigratorTrait for Migrator {
             Box::new(m20260623_000000_drop_invites_hostnames_gin::Migration),
             Box::new(m20260624_000000_drop_app_settings::Migration),
             Box::new(m20260916_000000_port_reservation_ranges::Migration),
+            Box::new(m20260926_000000_mesh::Migration),
+            Box::new(m20260926_000001_mesh_device_codes::Migration),
         ]
     }
 }

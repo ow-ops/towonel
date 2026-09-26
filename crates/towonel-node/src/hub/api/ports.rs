@@ -392,7 +392,7 @@ pub(super) async fn delete_port(
 
 /// `Ok(None)` for operator principals (skip the quota check at the call site).
 /// `Ok(Some(user_id))` for users who own the tenant. 403 otherwise.
-async fn authorize_tenant(
+pub(super) async fn authorize_tenant(
     state: &Arc<AppState>,
     principal: &Principal,
     tenant_id: &TenantId,

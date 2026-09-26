@@ -12,6 +12,7 @@ use zeroize::Zeroizing;
 use towonel_common::edge_cred::{EdgeCred, EdgeCredSig, Kid};
 use towonel_common::identity::{PQ_SEED_LEN, PqPublicKey};
 use towonel_common::kek::HubKek;
+use towonel_common::mesh::{MESH_CRED_SIGN_CONTEXT, MeshCred};
 
 use super::db::Db;
 
@@ -71,6 +72,15 @@ impl HubSigner {
         let sig = self
             .priv_key
             .try_sign(&bytes, b"")
+            .map_err(|e| anyhow::anyhow!("ml-dsa-65 sign: {e}"))?;
+        Ok((bytes, sig))
+    }
+
+    pub fn sign_mesh_cred(&self, cred: &MeshCred) -> anyhow::Result<(Vec<u8>, EdgeCredSig)> {
+        let bytes = cred.to_cbor()?;
+        let sig = self
+            .priv_key
+            .try_sign(&bytes, MESH_CRED_SIGN_CONTEXT)
             .map_err(|e| anyhow::anyhow!("ml-dsa-65 sign: {e}"))?;
         Ok((bytes, sig))
     }
@@ -164,6 +174,29 @@ mod tests {
         };
         let (bytes, sig) = signer.sign_edge_cred(&cred).unwrap();
         assert!(verify_edge_cred(signer.public_key(), &bytes, &sig));
+    }
+
+    #[test]
+    fn mesh_cred_sig_is_domain_separated() {
+        use towonel_common::mesh::{MESH_CRED_VERSION, mesh_ipv4, mesh_ipv6, verify_mesh_cred};
+
+        let signer = HubSigner::generate(7).unwrap();
+        let tenant = TenantKeypair::generate().id();
+        let device_id = [3u8; 32];
+        let cred = MeshCred {
+            version: MESH_CRED_VERSION,
+            kid: signer.kid(),
+            device_id,
+            tenant_id: tenant,
+            ipv4: mesh_ipv4(1).unwrap(),
+            ipv6: mesh_ipv6(&tenant, &device_id),
+            tags: vec![],
+            owner: Some("user-1".to_string()),
+            not_after_ms: 1_700_000_000_000,
+        };
+        let (bytes, sig) = signer.sign_mesh_cred(&cred).unwrap();
+        assert!(verify_mesh_cred(signer.public_key(), &bytes, &sig));
+        assert!(!verify_edge_cred(signer.public_key(), &bytes, &sig));
     }
 
     #[test]

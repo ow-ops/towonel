@@ -3023,7 +3023,7 @@ async fn signup_invite_rejects_malformed_recipient_email() {
 }
 
 /// Sign up + verify + log in; returns the session cookie header value.
-async fn signup_and_login_user(
+pub(super) async fn signup_and_login_user(
     hub: &TestHub,
     client: &reqwest::Client,
     email: &str,
@@ -3533,7 +3533,7 @@ async fn unlink_blocks_self_lockout_when_no_password_and_no_other_identity() {
     assert_eq!(body["error"]["code"], "would_lock_out");
 }
 
-async fn user_id_by_email(hub: &TestHub, email: &str) -> String {
+pub(super) async fn user_id_by_email(hub: &TestHub, email: &str) -> String {
     hub.state
         .db
         .find_user_by_email(email)

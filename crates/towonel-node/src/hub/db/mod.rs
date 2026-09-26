@@ -9,6 +9,7 @@ pub mod auth_tokens;
 pub(super) mod entities;
 mod invites;
 pub mod login_challenges;
+pub mod mesh;
 mod migration;
 pub mod port_reservations;
 pub mod sessions;

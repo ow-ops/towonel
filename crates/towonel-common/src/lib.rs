@@ -8,6 +8,7 @@ pub mod hub_error;
 pub mod identity;
 pub mod invite;
 pub mod kek;
+pub mod mesh;
 pub mod metrics;
 pub mod ownership;
 pub mod process_metrics;

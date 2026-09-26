@@ -14,6 +14,8 @@ pub mod signing;
 #[cfg(test)]
 mod api_tests;
 #[cfg(test)]
+mod mesh_tests;
+#[cfg(test)]
 mod observability_tests;
 #[cfg(test)]
 mod test_helpers;
@@ -251,6 +253,7 @@ pub struct HubParams {
     pub link_psk: Option<Arc<[u8; 32]>>,
     pub tls: Option<crate::config::TlsConfig>,
     pub web_enabled: bool,
+    pub console_url: Option<String>,
     pub ports_require_reservation: bool,
     pub user_port_quota: i64,
     pub max_udp_port_range: u16,
@@ -418,6 +421,7 @@ impl Hub {
             live_agents: Arc::clone(&live_agents),
             route_rebuild_notify: Arc::clone(&route_rebuild_notify),
             web_enabled: self.p.web_enabled,
+            console_url: self.p.console_url.clone(),
             mailer: self.p.mailer.clone(),
             ports_require_reservation: self.p.ports_require_reservation,
             user_port_quota: self.p.user_port_quota,

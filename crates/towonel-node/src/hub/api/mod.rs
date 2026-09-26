@@ -5,6 +5,7 @@ mod auth;
 mod bootstrap;
 mod entries;
 mod invites;
+mod mesh;
 mod metrics_handler;
 pub(in crate::hub) mod oidc;
 mod openapi;
@@ -221,6 +222,8 @@ pub struct AppState {
     /// Fed via [`trigger_route_rebuild`]; drained by the coalescer task.
     pub route_rebuild_notify: Arc<tokio::sync::Notify>,
     pub web_enabled: bool,
+    /// Web console base URL for user-facing links; falls back to `public_url`.
+    pub console_url: Option<String>,
     pub mailer: Option<super::mail::SharedMailer>,
     pub ports_require_reservation: bool,
     /// Per-user port reservation quota. `0` means unlimited.
@@ -583,6 +586,19 @@ fn tenant_member_routes() -> Router<Arc<AppState>> {
             delete(ports::delete_port),
         )
         .route("/v1/ports/available", get(ports::get_available_ports))
+        .route(
+            "/v1/tenants/{id}/mesh/auth-keys",
+            post(mesh::post_auth_key).get(mesh::list_auth_keys),
+        )
+        .route(
+            "/v1/tenants/{id}/mesh/auth-keys/{key_id}",
+            delete(mesh::delete_auth_key),
+        )
+        .route("/v1/tenants/{id}/mesh/devices", get(mesh::list_devices))
+        .route(
+            "/v1/tenants/{id}/mesh/devices/{device_id}",
+            delete(mesh::delete_device),
+        )
 }
 
 fn invites_routes() -> Router<Arc<AppState>> {
@@ -607,7 +623,9 @@ fn invites_routes() -> Router<Arc<AppState>> {
 }
 
 fn rate_limited_routes(web_enabled: bool) -> Router<Arc<AppState>> {
-    let mut r = Router::new().route("/v1/bootstrap", post(bootstrap::post_bootstrap));
+    let mut r = Router::new()
+        .route("/v1/bootstrap", post(bootstrap::post_bootstrap))
+        .route("/v1/mesh/enroll", post(mesh::post_enroll));
     if web_enabled {
         r = r
             .route("/v1/auth/signup", post(auth::post_signup))
@@ -666,7 +684,14 @@ fn rate_limited_routes(web_enabled: bool) -> Router<Arc<AppState>> {
             .route("/v1/auth/oidc/{provider}/link", post(oidc::link))
             .route("/v1/auth/oidc/{provider}/unlink", post(oidc::unlink))
             .route("/v1/auth/oidc/identities", get(oidc::list_identities))
-            .route("/v1/auth/oidc/{provider}/callback", get(oidc::callback));
+            .route("/v1/auth/oidc/{provider}/callback", get(oidc::callback))
+            .route("/v1/mesh/device-code", post(mesh::post_device_code))
+            .route("/v1/mesh/device-code/poll", post(mesh::post_device_poll))
+            .route("/v1/mesh/device-code/{code}", get(mesh::get_device_code))
+            .route(
+                "/v1/mesh/device-code/{code}/approve",
+                post(mesh::post_approve_device_code),
+            );
     }
     r
 }
@@ -691,6 +716,8 @@ fn signed_public_routes() -> Router<Arc<AppState>> {
         .route("/v1/entries", post(entries::post_entry))
         .route("/v1/tenants/{id}/entries", get(entries::get_tenant_entries))
         .route("/v1/agent/refresh", post(agent_refresh::post_refresh))
+        .route("/v1/mesh/cred", post(mesh::post_cred))
+        .route("/v1/mesh/netmap", get(mesh::get_netmap))
 }
 
 #[derive(Debug, Clone)]

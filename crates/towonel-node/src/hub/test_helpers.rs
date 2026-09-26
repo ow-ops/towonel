@@ -184,6 +184,7 @@ impl TestHub {
             live_agents: Arc::new(super::live_agents::LiveAgents::new()),
             route_rebuild_notify: Arc::new(tokio::sync::Notify::new()),
             web_enabled: true,
+            console_url: Some("https://console.test.example".to_string()),
             mailer: Some(Arc::clone(&mailer) as super::mail::SharedMailer),
             ports_require_reservation,
             user_port_quota,

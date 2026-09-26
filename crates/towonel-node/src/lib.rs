@@ -838,6 +838,7 @@ async fn build_hub_params(
         link_psk: config.hub.link_psk.clone(),
         tls: config.hub.tls.clone(),
         web_enabled: config.hub.web_enabled,
+        console_url: config.hub.console_url.clone(),
         ports_require_reservation: config.hub.ports_require_reservation,
         user_port_quota: config.hub.user_port_quota,
         max_udp_port_range: config.hub.max_udp_port_range,
