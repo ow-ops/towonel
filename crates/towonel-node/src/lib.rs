@@ -53,11 +53,13 @@ enum Command {
         #[command(subcommand)]
         action: EntryAction,
     },
-    /// Manage agent keypairs (for static tenant allowlists -- stateless
-    /// agents derive their key from the invite seed and don't need this).
+    /// Run an agent: tunnel services in this network through the edges.
+    /// Configured by `TOWONEL_AGENT_*` and `TOWONEL_INVITE_TOKEN`.
     Agent {
         #[command(subcommand)]
-        action: AgentAction,
+        action: Option<AgentAction>,
+        #[command(flatten)]
+        args: towonel_agent::AgentArgs,
     },
     /// Operator-only: manage tenant invite tokens.
     Invite {
@@ -245,7 +247,8 @@ enum EntryAction {
 
 #[derive(Subcommand)]
 enum AgentAction {
-    /// Generate a new agent keypair and save to disk.
+    /// Generate a new agent keypair and save to disk (for static tenant
+    /// allowlists; stateless agents derive their key from the invite seed).
     Init {
         #[arg(long, default_value = "agent.key")]
         key_path: PathBuf,
@@ -487,12 +490,17 @@ pub async fn run() -> anyhow::Result<()> {
         .install_default()
         .expect("failed to install ring CryptoProvider");
 
-    let _telemetry = towonel_common::telemetry::init("towonel", SOFTWARE_VERSION);
-
     let cli = Cli::parse();
+    // Agents keep their own service name so dashboards don't mix them with nodes.
+    let service = match cli.command {
+        Some(Command::Agent { action: None, .. }) => "towonel-agent",
+        _ => "towonel",
+    };
+    let _telemetry = towonel_common::telemetry::init(service, SOFTWARE_VERSION);
 
     match cli.command {
         None | Some(Command::Serve) => run_node().await,
+        Some(Command::Agent { action: None, args }) => Box::pin(towonel_agent::run(args)).await,
         Some(Command::Tenant { action }) => match action {
             TenantAction::Init { key_path } => {
                 admin::tenant::cmd_keypair_init(&key_path, admin::tenant::KeypairKind::Tenant).await
@@ -527,11 +535,10 @@ pub async fn run() -> anyhow::Result<()> {
                 admin::entry::cmd_entry_list(hub_url, key_path).await
             }
         },
-        Some(Command::Agent { action }) => match action {
-            AgentAction::Init { key_path } => {
-                admin::tenant::cmd_keypair_init(&key_path, admin::tenant::KeypairKind::Agent).await
-            }
-        },
+        Some(Command::Agent {
+            action: Some(AgentAction::Init { key_path }),
+            ..
+        }) => admin::tenant::cmd_keypair_init(&key_path, admin::tenant::KeypairKind::Agent).await,
         Some(Command::Invite { action }) => match action {
             InviteAction::Create {
                 hub_url,

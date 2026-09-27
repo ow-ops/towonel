@@ -12,6 +12,7 @@ path = "src/main.rs"
 [dependencies]
 towonel-common = { path = "../towonel-common" }
 towonel-mesh = { path = "../towonel-mesh", features = ["tun"] }
+towonel-agent = { path = "../towonel-agent" }
 iroh = { workspace = true }
 sea-orm = { workspace = true }
 sea-orm-migration = { workspace = true }

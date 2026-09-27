@@ -7625,6 +7625,7 @@ dependencies = [
  "tower",
  "tower-http 0.7.0",
  "tower_governor",
+ "towonel-agent",
  "towonel-common",
  "towonel-mesh",
  "towonel-mesh-ffi",
