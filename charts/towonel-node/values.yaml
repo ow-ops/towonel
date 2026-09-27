@@ -92,7 +92,7 @@ controllers:
       main:
         image:
           # -- Image repository.
-          repository: codeberg.org/towonel/towonel-node
+          repository: git.ow-ops.eu/towonel/towonel-node
           # -- Image tag; defaults to the chart appVersion.
           tag: "{{ .Chart.AppVersion }}"
           # -- Pin the image by digest (sha256:...); the release pipeline fills it.
