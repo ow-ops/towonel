@@ -1739,7 +1739,7 @@ checksum = "d0881ea181b1df73ff77ffaaf9c7544ecc11e82fba9b5f27b262a3c73a332555"
 
 [[package]]
 name = "e2e-runner"
-version = "1.8.0"
+version = "1.9.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -7462,7 +7462,7 @@ dependencies = [
 
 [[package]]
 name = "towonel"
-version = "1.8.0"
+version = "1.9.0"
 dependencies = [
  "iroh",
  "tokio",
@@ -7471,7 +7471,7 @@ dependencies = [
 
 [[package]]
 name = "towonel-agent"
-version = "1.8.0"
+version = "1.9.0"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -7502,7 +7502,7 @@ dependencies = [
 
 [[package]]
 name = "towonel-common"
-version = "1.8.0"
+version = "1.9.0"
 dependencies = [
  "aes-gcm 0.11.1",
  "anyhow",
@@ -7539,7 +7539,7 @@ dependencies = [
 
 [[package]]
 name = "towonel-mesh"
-version = "1.8.0"
+version = "1.9.0"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -7559,7 +7559,7 @@ dependencies = [
 
 [[package]]
 name = "towonel-mesh-ffi"
-version = "1.8.0"
+version = "1.9.0"
 dependencies = [
  "anyhow",
  "bytes",
@@ -7572,7 +7572,7 @@ dependencies = [
 
 [[package]]
 name = "towonel-node"
-version = "1.8.0"
+version = "1.9.0"
 dependencies = [
  "aes-gcm 0.11.1",
  "anyhow",
