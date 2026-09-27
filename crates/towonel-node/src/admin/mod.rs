@@ -6,6 +6,7 @@ pub mod acme;
 pub mod edge;
 pub mod entry;
 pub mod invite;
+pub mod mesh;
 pub mod port;
 pub mod settings;
 pub mod signup_invite;
@@ -76,6 +77,17 @@ pub fn resolve_tenant_key_path(flag: Option<PathBuf>) -> anyhow::Result<PathBuf>
              and pass its path via --key-path."
         )
     })
+}
+
+/// For endpoints tenant members may call: a personal API key (`twk_…`) from
+/// `TOWONEL_API_KEY`, else the operator key.
+pub fn resolve_api_key(flag: Option<String>) -> anyhow::Result<String> {
+    flag.or_else(|| {
+        std::env::var("TOWONEL_API_KEY")
+            .ok()
+            .filter(|v| !v.is_empty())
+    })
+    .map_or_else(|| resolve_operator_key(None), Ok)
 }
 
 pub fn resolve_operator_key(flag: Option<String>) -> anyhow::Result<String> {

@@ -1,7 +1,9 @@
 use anyhow::Context;
 use tabled::{Table, Tabled, settings::Style};
 
-use super::{JSON_CONTENT_TYPE, check_response, resolve_hub_url, resolve_operator_key};
+use super::{
+    JSON_CONTENT_TYPE, check_response, resolve_api_key, resolve_hub_url, resolve_operator_key,
+};
 
 #[derive(serde::Serialize)]
 struct ReserveReq<'a> {
@@ -29,7 +31,7 @@ pub async fn cmd_port_reserve(
     label: Option<String>,
 ) -> anyhow::Result<()> {
     let hub_url = resolve_hub_url(hub_url);
-    let api_key = resolve_operator_key(api_key)?;
+    let api_key = resolve_api_key(api_key)?;
 
     let url = format!(
         "{}/v1/tenants/{tenant_id}/ports",
@@ -71,7 +73,7 @@ pub async fn cmd_port_release(
     port: u16,
 ) -> anyhow::Result<()> {
     let hub_url = resolve_hub_url(hub_url);
-    let api_key = resolve_operator_key(api_key)?;
+    let api_key = resolve_api_key(api_key)?;
 
     let url = format!(
         "{}/v1/tenants/{tenant_id}/ports/{protocol}/{port}",
@@ -123,7 +125,7 @@ pub async fn cmd_port_list(
     tenant_id: String,
 ) -> anyhow::Result<()> {
     let hub_url = resolve_hub_url(hub_url);
-    let api_key = resolve_operator_key(api_key)?;
+    let api_key = resolve_api_key(api_key)?;
 
     let url = format!(
         "{}/v1/tenants/{tenant_id}/ports",
@@ -240,7 +242,7 @@ pub async fn cmd_port_available(
     count: Option<u16>,
 ) -> anyhow::Result<()> {
     let hub_url = resolve_hub_url(hub_url);
-    let api_key = resolve_operator_key(api_key)?;
+    let api_key = resolve_api_key(api_key)?;
 
     let count_q = count.map(|c| format!("&count={c}")).unwrap_or_default();
     let url = format!(

@@ -148,6 +148,39 @@ enum MeshAction {
         #[arg(long, env = "TOWONEL_MESH_STATE_DIR")]
         state_dir: Option<PathBuf>,
     },
+    /// Mint an auth key that adds devices to a tenant's mesh, e.g. for
+    /// the agent chart: `--k8s-secret towonel-mesh | kubectl apply -f -`.
+    AuthKey {
+        /// Defaults to `TOWONEL_HUB_URL`, else the invite token's hub.
+        #[arg(long)]
+        hub_url: Option<String>,
+        /// Personal API key (`twk_…`) or operator key. Defaults to
+        /// `TOWONEL_API_KEY`, else the operator key.
+        #[arg(long)]
+        api_key: Option<String>,
+        /// Tenant (tunnel) the devices join.
+        #[arg(long, required_unless_present = "invite_token")]
+        tenant_id: Option<String>,
+        /// The agent's invite token, instead of `--tenant-id`.
+        #[arg(long, env = "TOWONEL_INVITE_TOKEN", hide_env_values = true)]
+        invite_token: Option<String>,
+        /// `tag:<name>`; repeatable. Tagged devices never expire.
+        #[arg(long = "tag")]
+        tags: Vec<String>,
+        /// Add more than one device, e.g. one per chart replica.
+        #[arg(long)]
+        reusable: bool,
+        /// 1-90, default 90.
+        #[arg(long)]
+        expires_in_days: Option<i64>,
+        /// Print a Kubernetes Secret with this name instead of the bare key.
+        /// Implies `--reusable`, since every replica joins with it.
+        #[arg(long)]
+        k8s_secret: Option<String>,
+        /// Namespace for `--k8s-secret`.
+        #[arg(long, requires = "k8s_secret")]
+        namespace: Option<String>,
+    },
     /// Show this device and the peers it can see.
     Status {
         #[arg(long, env = "TOWONEL_MESH_STATE_DIR")]
@@ -667,6 +700,28 @@ pub async fn run() -> anyhow::Result<()> {
                 local,
                 state_dir,
             } => mesh_cli::cmd_connect(state_dir, target, local).await,
+            MeshAction::AuthKey {
+                hub_url,
+                api_key,
+                tenant_id,
+                invite_token,
+                tags,
+                reusable,
+                expires_in_days,
+                k8s_secret,
+                namespace,
+            } => {
+                let req = admin::mesh::AuthKeyRequest {
+                    tenant_id,
+                    invite_token,
+                    tags,
+                    reusable,
+                    expires_in_days,
+                    k8s_secret,
+                    namespace,
+                };
+                admin::mesh::cmd_mesh_auth_key(hub_url, api_key, req).await
+            }
             MeshAction::Status {
                 state_dir,
                 watch,
