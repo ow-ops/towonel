@@ -652,7 +652,7 @@ async fn service_map_forwards_only_listed_ports() {
     let (_, agent_key) = post_json(
         &client,
         &hub.url(&format!("/v1/tenants/{}/mesh/auth-keys", tenant.id())),
-        json!({"tags": ["tag:agent"]}),
+        json!({"tags": ["tag:agent"], "reusable": true}),
         Some(OPERATOR_KEY),
     )
     .await;
@@ -690,6 +690,50 @@ async fn service_map_forwards_only_listed_ports() {
         .await
         .unwrap_err();
     assert!(err.to_string().contains("nothing is listening"), "{err}");
+
+    // Peers see what the agent serves.
+    let mut netmap = laptop.node.netmap();
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        netmap.wait_for(|m| {
+            m.peers
+                .iter()
+                .any(|p| p.name == "agent" && p.services == [5432])
+        }),
+    )
+    .await
+    .expect("services never reached the netmap")
+    .unwrap();
+
+    // By tag, skipping a replica that's down even though it claims the port.
+    let down_key = iroh::SecretKey::from([8; 32]);
+    let down = MeshClient::new(&hub.base_url, down_key).unwrap();
+    down.enroll(agent_key["token"].as_str().unwrap(), "agent-down", "linux")
+        .await
+        .unwrap();
+    down.report_services(&[5432]).await.unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        netmap.wait_for(|m| {
+            m.peers
+                .iter()
+                .any(|p| p.name == "agent-down" && !p.services.is_empty())
+        }),
+    )
+    .await
+    .expect("the down replica never showed up")
+    .unwrap();
+    assert_eq!(
+        round_trip(&laptop.node, "tag:agent", 5432).await.unwrap(),
+        b"ping"
+    );
+    let err = round_trip(&laptop.node, "tag:nope", 5432)
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("no device named tag:nope"),
+        "{err}"
+    );
 }
 
 #[tokio::test]
@@ -744,4 +788,39 @@ async fn unattended_join_reuses_state_and_respects_removal() {
         Some(401)
     );
     std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
+async fn device_without_tun_refuses_ip_traffic_at_once() {
+    let hub = TestHub::start().await;
+    let client = reqwest::Client::new();
+    let (tenant, user_key) = Box::pin(user_tenant(&hub, &client)).await;
+    let (_, agent_key) = post_json(
+        &client,
+        &hub.url(&format!("/v1/tenants/{}/mesh/auth-keys", tenant.id())),
+        json!({"tags": ["tag:agent"]}),
+        Some(OPERATOR_KEY),
+    )
+    .await;
+    let laptop = join(&hub, 1, &user_key, "laptop").await;
+    let agent = join(&hub, 2, agent_key["token"].as_str().unwrap(), "agent").await;
+    wait_for_peer(&laptop.node, "agent").await;
+    wait_for_peer(&agent.node, "laptop").await;
+
+    let (laptop_tx, mut laptop_rx) = laptop.node.packet_channel();
+    let probe = ipv4_udp("100.64.0.1", "100.64.0.2", 40000, 5432, 10);
+    let mut refusal = None;
+    // The first packets can race the connection coming up.
+    for _ in 0..5 {
+        laptop_tx.send(probe.clone()).await.unwrap();
+        refusal = recv_packet(&mut laptop_rx).await;
+        if refusal.is_some() {
+            break;
+        }
+    }
+    let refusal = refusal.expect("no refusal from a device without a TUN");
+    // ICMP port unreachable from the agent, quoting the probe.
+    assert_eq!((refusal[9], refusal[20], refusal[21]), (1, 3, 3));
+    assert_eq!(&refusal[12..16], &[100, 64, 0, 2]);
+    assert_eq!(&refusal[28..48], &probe[..20]);
 }

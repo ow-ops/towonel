@@ -91,6 +91,13 @@ impl MeshClient {
             .map(drop)
     }
 
+    pub async fn report_services(&self, ports: &[u16]) -> anyhow::Result<()> {
+        let body = serde_json::to_vec(&json!({"ports": ports}))?;
+        self.post_raw("/v1/mesh/services", "towonel/mesh-services/v1", body)
+            .await
+            .map(drop)
+    }
+
     pub async fn advertise_exit_node(&self, advertise: bool) -> anyhow::Result<()> {
         let body = serde_json::to_vec(&json!({"advertise": advertise}))?;
         self.post_raw("/v1/mesh/exit-node", "towonel/mesh-exit-node/v1", body)

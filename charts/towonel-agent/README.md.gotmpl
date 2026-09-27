@@ -21,6 +21,34 @@ The exposed services are structured values (`agent.services`,
 `agent.tcpServices`, `agent.udpServices`); the chart renders them into the
 JSON environment variables the agent expects.
 
+## Private network
+
+With `mesh.enabled`, every replica joins the tunnel's private network and
+serves `mesh.services` to its devices. Those services are never published on
+an edge.
+
+```sh
+towonel mesh auth-key --invite-token "$TOWONEL_INVITE_TOKEN" --tag tag:agent \
+  --k8s-secret towonel-mesh --namespace network | kubectl apply -f -
+helm upgrade towonel-agent oci://codeberg.org/towonel/charts/towonel-agent \
+  --namespace network --reuse-values \
+  --set mesh.enabled=true --set mesh.authKeySecret.name=towonel-mesh \
+  --set 'mesh.services[0].port=5432' \
+  --set 'mesh.services[0].origin=postgres.db.svc.cluster.local:5432'
+```
+
+Devices then reach it with `towonel mesh connect tag:agent:5432`, which picks
+any replica that is up. `towonel mesh status` lists each replica's ports.
+Replicas have no TUN, so tools that dial an overlay IP get "connection
+refused": use `mesh connect` or `mesh nc`.
+
+- Enabling the mesh turns the Deployment into a StatefulSet with a small
+  volume per replica for its device key. The upgrade replaces the pods.
+- Uninstalling keeps those volumes, and the devices stay in the mesh until you
+  remove them in the console.
+- With `monitoring.prometheusRule.enabled`, `TowonelAgentMeshDown` fires when
+  a replica is out of the mesh for 10 minutes; its logs say why.
+
 {{ template "chart.maintainersSection" . }}
 
 {{ template "chart.sourcesSection" . }}

@@ -39,6 +39,8 @@ const MAX_FLOWS: usize = 65_536;
 const MAX_RECONNECT_DELAY: Duration = Duration::from_mins(1);
 /// Coalesces bursts of address changes into one report.
 const ADDR_REPORT_SETTLE: Duration = Duration::from_secs(1);
+/// Per device when a tag matches several: a down replica shouldn't stall.
+const TAG_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Default)]
 pub struct NodeOptions {
@@ -164,6 +166,7 @@ impl MeshNode {
         tokio::spawn(node.clone().accept_loop());
         tokio::spawn(node.clone().follow_netmap());
         tokio::spawn(node.clone().report_addrs());
+        tokio::spawn(node.clone().report_services());
         tokio::spawn(node.clone().refresh_cred());
         Ok(node)
     }
@@ -443,11 +446,21 @@ impl MeshNode {
             return;
         };
         let own = read(&self.inner.hello).1.clone();
-        let reply = lock(&self.inner.flows)
-            .get(&Flow::reply_to(&info))
-            .is_some_and(|seen| seen.elapsed() < FLOW_IDLE);
         let from_exit =
             read(&self.inner.exit_peer).is_some_and(|exit| exit.as_bytes() == &peer_cred.device_id);
+        let reply = {
+            let flows = lock(&self.inner.flows);
+            let live = |flow| {
+                flows
+                    .get(&flow)
+                    .is_some_and(|seen| seen.elapsed() < FLOW_IDLE)
+            };
+            // An ICMP error answers the flow it quotes, but only from that
+            // flow's peer or our exit: otherwise any peer could kill our flows.
+            live(Flow::reply_to(&info))
+                || packet::icmp_error_quote(&packet)
+                    .is_some_and(|q| (q.dst == info.src || from_exit) && live(Flow::outbound(&q)))
+        };
         let trust = read(&self.inner.trust);
         let policy = trust.policy.as_ref();
         let direct = || relayed(conn) == Some(false);
@@ -455,9 +468,18 @@ impl MeshNode {
             || (from_exit && direct() && exit_reply_allowed(&info, &own, reply))
             || (self.serving_exit() && direct() && egress_allowed(&info, peer_cred, &own, policy));
         drop(trust);
-        if allowed {
-            self.deliver(packet);
+        if !allowed {
+            return;
         }
+        if read(&self.inner.to_host).is_none() {
+            // No TUN here (an agent): refuse now rather than let the sender
+            // time out.
+            if let Some(refusal) = packet::port_unreachable(&packet) {
+                self.send_packet(conn, Bytes::from(refusal));
+            }
+            return;
+        }
+        self.deliver(packet);
     }
 
     fn deliver(&self, packet: Bytes) {
@@ -478,16 +500,50 @@ impl MeshNode {
         }
     }
 
-    /// Open a TCP stream to `port` on `peer`'s loopback. `peer` is a device
-    /// name, overlay IP, or device id.
+    /// Open a TCP stream to `port` on `peer`: a device name, overlay IP,
+    /// device id, or `tag:<name>` to try that tag's devices in turn, those
+    /// serving `port` first.
     pub async fn open_tcp(
         &self,
         peer: &str,
         port: u16,
     ) -> anyhow::Result<(SendStream, RecvStream)> {
-        let device = find_peer(&self.inner.netmap.borrow(), peer)
-            .cloned()
-            .with_context(|| format!("no device named {peer} in the mesh"))?;
+        let netmap = self.inner.netmap.borrow().clone();
+        let mut candidates: Vec<&Device> = if peer.starts_with("tag:") {
+            netmap
+                .peers
+                .iter()
+                .filter(|d| d.tags.iter().any(|t| t == peer))
+                .collect()
+        } else {
+            find_peer(&netmap, peer).into_iter().collect()
+        };
+        candidates.sort_by_key(|d| {
+            (
+                !d.services.contains(&port),
+                std::cmp::Reverse(d.last_seen_at_ms),
+            )
+        });
+        let Some((last, rest)) = candidates.split_last() else {
+            bail!("no device named {peer} in the mesh");
+        };
+        for device in rest {
+            match tokio::time::timeout(TAG_ATTEMPT_TIMEOUT, self.open_tcp_to(device, port)).await {
+                Ok(Ok(stream)) => return Ok(stream),
+                Ok(Err(e)) => {
+                    debug!(error = %e, device = %device.name, "trying the next tagged device");
+                }
+                Err(_) => debug!(device = %device.name, "no answer; trying the next tagged device"),
+            }
+        }
+        self.open_tcp_to(last, port).await
+    }
+
+    async fn open_tcp_to(
+        &self,
+        device: &Device,
+        port: u16,
+    ) -> anyhow::Result<(SendStream, RecvStream)> {
         let id = EndpointId::from_bytes(&crate::peer::device_id_bytes(&device.device_id)?)?;
         let conn = self.connection(id).await?;
         let (mut send, mut recv) = conn.open_bi().await?;
@@ -701,6 +757,33 @@ impl MeshNode {
                 () = tokio::time::sleep(MAX_RECONNECT_DELAY), if reported.is_none() => {}
             }
             tokio::time::sleep(ADDR_REPORT_SETTLE).await;
+        }
+    }
+
+    /// Tell the hub which ports peers can reach here, retrying until it
+    /// hears; also clears ports left from a previous run.
+    async fn report_services(self) {
+        let mut ports: Vec<u16> = self
+            .inner
+            .services
+            .as_deref()
+            .map(|m| m.keys().copied().collect())
+            .unwrap_or_default();
+        ports.sort_unstable();
+        if self.inner.netmap.borrow().this_device.services == ports {
+            return;
+        }
+        let mut delay = Duration::from_secs(1);
+        loop {
+            match self.inner.client.report_services(&ports).await {
+                Ok(()) => return,
+                Err(e) => debug!(error = %e, "services report failed; will retry"),
+            }
+            tokio::select! {
+                () = self.inner.cancel.cancelled() => return,
+                () = tokio::time::sleep(delay) => {}
+            }
+            delay = (delay * 2).min(MAX_RECONNECT_DELAY);
         }
     }
 

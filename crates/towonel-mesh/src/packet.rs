@@ -86,6 +86,41 @@ fn ports(proto: u8, l4: &[u8]) -> (u16, u16) {
 /// its TCP lowers the segment size to fit `mtu`.
 #[must_use]
 pub fn icmpv4_frag_needed(original: &[u8], mtu: u16) -> Option<Vec<u8>> {
+    let [hi, lo] = mtu.to_be_bytes();
+    icmpv4_error(original, 4, [0, 0, hi, lo])
+}
+
+/// "Port unreachable" for `original`, so the sender's connect fails at once
+/// instead of timing out. `None` for ICMP, which never gets an error back.
+#[must_use]
+pub fn port_unreachable(original: &[u8]) -> Option<Vec<u8>> {
+    match parse(original)?.proto {
+        PROTO_ICMP | PROTO_ICMPV6 => None,
+        _ if original.first()? >> 4 == 4 => icmpv4_error(original, 3, [0; 4]),
+        _ => icmpv6_port_unreachable(original),
+    }
+}
+
+/// The packet an ICMP error quotes, so it can be matched to the flow it's
+/// about.
+#[must_use]
+pub fn icmp_error_quote(packet: &[u8]) -> Option<PacketInfo> {
+    let info = parse(packet)?;
+    let body = match (packet.first()? >> 4, info.proto) {
+        (4, PROTO_ICMP) => {
+            let header_len = usize::from(packet.first()? & 0x0f) * 4;
+            // Destination unreachable, time exceeded.
+            matches!(packet.get(header_len)?, 3 | 11).then_some(header_len + 8)?
+        }
+        (6, PROTO_ICMPV6) => matches!(packet.get(40)?, 1..=4).then_some(48)?,
+        _ => return None,
+    };
+    parse(packet.get(body..)?)
+}
+
+/// Destination-unreachable (type 3) with `code`, sent "from" the original
+/// destination back to its sender.
+fn icmpv4_error(original: &[u8], code: u8, rest: [u8; 4]) -> Option<Vec<u8>> {
     let info = parse(original)?;
     let (IpAddr::V4(src), IpAddr::V4(dst)) = (info.src, info.dst) else {
         return None;
@@ -93,14 +128,13 @@ pub fn icmpv4_frag_needed(original: &[u8], mtu: u16) -> Option<Vec<u8>> {
     let header_len = usize::from(original.first()? & 0x0f) * 4;
     let quoted = original.get(..(header_len + 8).min(original.len()))?;
 
-    let mut icmp = vec![3, 4, 0, 0, 0, 0];
-    icmp.extend_from_slice(&mtu.to_be_bytes());
+    let mut icmp = vec![3, code, 0, 0];
+    icmp.extend_from_slice(&rest);
     icmp.extend_from_slice(quoted);
     let sum = checksum(&icmp).to_be_bytes();
     icmp.get_mut(2..4)?.copy_from_slice(&sum);
 
     let total = u16::try_from(20 + icmp.len()).ok()?.to_be_bytes();
-    // Sent "from" the peer, towards the host that sent the packet.
     let mut ip = vec![
         0x45, 0, total[0], total[1], 0, 0, 0x40, 0, 64, PROTO_ICMP, 0, 0,
     ];
@@ -108,6 +142,34 @@ pub fn icmpv4_frag_needed(original: &[u8], mtu: u16) -> Option<Vec<u8>> {
     ip.extend_from_slice(&src.octets());
     let sum = checksum(&ip).to_be_bytes();
     ip.get_mut(10..12)?.copy_from_slice(&sum);
+    ip.extend_from_slice(&icmp);
+    Some(ip)
+}
+
+fn icmpv6_port_unreachable(original: &[u8]) -> Option<Vec<u8>> {
+    let info = parse(original)?;
+    let (IpAddr::V6(src), IpAddr::V6(dst)) = (info.src, info.dst) else {
+        return None;
+    };
+    // The reply must fit the IPv6 minimum MTU.
+    let quoted = original.get(..original.len().min(1280 - 40 - 8))?;
+    let mut icmp = vec![1, 4, 0, 0, 0, 0, 0, 0];
+    icmp.extend_from_slice(quoted);
+    let len = u32::try_from(icmp.len()).ok()?;
+
+    let mut pseudo = Vec::with_capacity(40 + icmp.len());
+    pseudo.extend_from_slice(&dst.octets());
+    pseudo.extend_from_slice(&src.octets());
+    pseudo.extend_from_slice(&len.to_be_bytes());
+    pseudo.extend_from_slice(&[0, 0, 0, PROTO_ICMPV6]);
+    pseudo.extend_from_slice(&icmp);
+    let sum = checksum(&pseudo).to_be_bytes();
+    icmp.get_mut(2..4)?.copy_from_slice(&sum);
+
+    let payload = u16::try_from(icmp.len()).ok()?.to_be_bytes();
+    let mut ip = vec![0x60, 0, 0, 0, payload[0], payload[1], PROTO_ICMPV6, 64];
+    ip.extend_from_slice(&dst.octets());
+    ip.extend_from_slice(&src.octets());
     ip.extend_from_slice(&icmp);
     Some(ip)
 }
@@ -132,6 +194,41 @@ pub(crate) fn checksum(data: &[u8]) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn port_unreachable_answers_tcp_and_udp_but_not_icmp() {
+        let syn = ipv4_tcp([100, 64, 0, 1], [100, 64, 0, 2], 40000, 5432, 0);
+        let icmp = port_unreachable(&syn).unwrap();
+        let info = parse(&icmp).unwrap();
+        assert_eq!(
+            (info.src, info.dst),
+            (IpAddr::from([100, 64, 0, 2]), IpAddr::from([100, 64, 0, 1]))
+        );
+        assert_eq!((icmp[9], icmp[20], icmp[21]), (PROTO_ICMP, 3, 3));
+        assert_eq!(checksum(&icmp[..20]), 0);
+        assert_eq!(checksum(&icmp[20..]), 0);
+        assert!(port_unreachable(&icmp).is_none(), "no error about an error");
+        let quoted = icmp_error_quote(&icmp).unwrap();
+        assert_eq!((quoted.src_port, quoted.dst_port), (40000, 5432));
+        assert!(icmp_error_quote(&syn).is_none());
+
+        let (a, b): (Ipv6Addr, Ipv6Addr) = ("fd00::1".parse().unwrap(), "fd00::2".parse().unwrap());
+        let reply = port_unreachable(&ipv6_udp(a, b, 40000, 53)).unwrap();
+        let info = parse(&reply).unwrap();
+        assert_eq!(
+            (info.src, info.dst, info.proto),
+            (b.into(), a.into(), PROTO_ICMPV6)
+        );
+        assert_eq!((reply[40], reply[41]), (1, 4));
+        assert_eq!(icmp_error_quote(&reply).unwrap().dst_port, 53);
+        let mut pseudo = Vec::new();
+        pseudo.extend_from_slice(&b.octets());
+        pseudo.extend_from_slice(&a.octets());
+        pseudo.extend_from_slice(&u32::try_from(reply.len() - 40).unwrap().to_be_bytes());
+        pseudo.extend_from_slice(&[0, 0, 0, PROTO_ICMPV6]);
+        pseudo.extend_from_slice(&reply[40..]);
+        assert_eq!(checksum(&pseudo), 0);
+    }
 
     fn ipv4_tcp(src: [u8; 4], dst: [u8; 4], sport: u16, dport: u16, payload: usize) -> Vec<u8> {
         let total = u16::try_from(40 + payload).unwrap().to_be_bytes();

@@ -18,6 +18,7 @@ pub struct Model {
     pub exit_node_advertised: bool,
     pub exit_node_approved: bool,
     pub exit_node_unadvertised_at_ms: Option<i64>,
+    pub services: Option<Json>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

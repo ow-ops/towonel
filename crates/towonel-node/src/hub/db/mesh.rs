@@ -93,6 +93,8 @@ pub struct MeshDeviceRow {
     pub exit_node_advertised: bool,
     pub exit_node_approved: bool,
     pub exit_node_unadvertised_at_ms: Option<i64>,
+    /// Ports the device forwards for peers, as last reported.
+    pub services: Vec<u16>,
 }
 
 /// An approved exit that stops advertising keeps its approval this long.
@@ -195,6 +197,11 @@ impl TryFrom<mesh_devices::Model> for MeshDeviceRow {
             exit_node_advertised: m.exit_node_advertised,
             exit_node_approved: m.exit_node_approved,
             exit_node_unadvertised_at_ms: m.exit_node_unadvertised_at_ms,
+            services: m
+                .services
+                .map(serde_json::from_value)
+                .transpose()?
+                .unwrap_or_default(),
         })
     }
 }
@@ -322,6 +329,7 @@ impl Db {
             exit_node_advertised: ActiveValue::Set(false),
             exit_node_approved: ActiveValue::Set(false),
             exit_node_unadvertised_at_ms: ActiveValue::Set(None),
+            services: ActiveValue::Set(None),
         };
         let inserted = mesh_devices::Entity::insert(model)
             .exec_with_returning(&txn)
@@ -510,6 +518,30 @@ impl Db {
             .col_expr(
                 mesh_devices::Column::Endpoint,
                 sea_orm::sea_query::Expr::value(endpoint.clone()),
+            )
+            .filter(mesh_devices::Column::DeviceId.eq(device_id.to_vec()))
+            .exec(&self.conn)
+            .await?;
+        Ok(true)
+    }
+
+    /// `Ok(true)` when the ports changed.
+    pub async fn set_mesh_device_services(
+        &self,
+        device_id: &DeviceId,
+        ports: &[u16],
+    ) -> anyhow::Result<bool> {
+        let unchanged = self
+            .get_mesh_device(device_id)
+            .await?
+            .is_some_and(|d| d.services == ports);
+        if unchanged {
+            return Ok(false);
+        }
+        mesh_devices::Entity::update_many()
+            .col_expr(
+                mesh_devices::Column::Services,
+                sea_orm::sea_query::Expr::value(serde_json::to_value(ports)?),
             )
             .filter(mesh_devices::Column::DeviceId.eq(device_id.to_vec()))
             .exec(&self.conn)

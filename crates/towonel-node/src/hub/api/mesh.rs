@@ -49,6 +49,7 @@ const NETMAP_AUTH_DOMAIN: &str = "towonel/mesh-netmap/v1";
 const NETMAP_STREAM_AUTH_DOMAIN: &str = "towonel/mesh-netmap-stream/v1";
 const ENDPOINT_AUTH_DOMAIN: &str = "towonel/mesh-endpoint/v1";
 const EXIT_NODE_AUTH_DOMAIN: &str = "towonel/mesh-exit-node/v1";
+const SERVICES_AUTH_DOMAIN: &str = "towonel/mesh-services/v1";
 const DEVICE_CODE_AUTH_DOMAIN: &str = "towonel/mesh-device-code/v1";
 const DEVICE_POLL_AUTH_DOMAIN: &str = "towonel/mesh-device-poll/v1";
 
@@ -74,6 +75,7 @@ const MAX_TAGS: usize = 16;
 const MAX_LABEL_LEN: usize = 63;
 const MAX_OS_LEN: usize = 32;
 const MAX_ENDPOINT_ADDRS: usize = 16;
+const MAX_SERVICES: usize = 64;
 const ENROLL_RETRIES: u32 = 4;
 
 /// Same message for unknown, expired and spent keys: no oracle.
@@ -148,6 +150,8 @@ struct DeviceView {
     /// Approval lapses then unless the device advertises again. Set only
     /// while approved but not advertising.
     exit_node_approval_expires_at_ms: Option<i64>,
+    /// Ports the device forwards for peers (`towonel mesh connect`).
+    services: Vec<u16>,
 }
 
 impl From<&MeshDeviceRow> for DeviceView {
@@ -169,6 +173,7 @@ impl From<&MeshDeviceRow> for DeviceView {
             exit_node_approval_expires_at_ms: d
                 .exit_approval_expires_at_ms()
                 .filter(|_| d.exit_approved(now_ms_i64())),
+            services: d.services.clone(),
         }
     }
 }
@@ -999,6 +1004,44 @@ fn exit_nodes_disabled() -> Response {
         "exit_nodes_disabled",
         "this hub does not allow exit nodes",
     )
+}
+
+#[derive(Debug, Deserialize)]
+struct ServicesReport {
+    ports: Vec<u16>,
+}
+
+pub(super) async fn post_services(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let device = match authenticated_device(&state, &headers, SERVICES_AUTH_DOMAIN, &body).await {
+        Ok(d) => d,
+        Err(resp) => return resp,
+    };
+    let mut ports = match serde_json::from_slice::<ServicesReport>(&body) {
+        Ok(r) => r.ports,
+        Err(e) => return invalid_request(format!("invalid body: {e}")),
+    };
+    ports.sort_unstable();
+    ports.dedup();
+    if ports.len() > MAX_SERVICES || ports.contains(&0) {
+        return invalid_request(format!("at most {MAX_SERVICES} ports, none of them 0"));
+    }
+    match state
+        .db
+        .set_mesh_device_services(&device.device_id, &ports)
+        .await
+    {
+        Ok(true) => notify_mesh_change(&state, device.tenant_id),
+        Ok(false) => {}
+        Err(e) => {
+            warn!(error = %e, "set_mesh_device_services failed");
+            return internal_error();
+        }
+    }
+    json_ok(serde_json::json!({"ok": true}))
 }
 
 #[derive(Debug, Deserialize)]

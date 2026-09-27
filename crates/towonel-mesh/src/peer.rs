@@ -350,6 +350,7 @@ mod tests {
                             endpoint: None,
                             exit_node_advertised: false,
                             exit_node_approved: false,
+                            services: vec![],
                         };
                         (*id, device)
                     })

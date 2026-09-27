@@ -86,6 +86,8 @@ pub struct Device {
     pub relayed: Option<bool>,
     /// Usable with [`Mesh::set_exit_node`].
     pub exit_node: bool,
+    /// Ports it forwards for peers.
+    pub services: Vec<u16>,
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
@@ -366,6 +368,7 @@ fn devices(node: &MeshNode) -> Vec<Device> {
 fn device(d: ApiDevice, connected: bool, relayed: Option<bool>) -> Device {
     Device {
         exit_node: d.is_exit_node(),
+        services: d.services.clone(),
         device_id: d.device_id,
         name: d.name,
         ipv4: d.ipv4,

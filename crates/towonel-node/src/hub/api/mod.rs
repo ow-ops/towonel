@@ -743,6 +743,7 @@ fn signed_public_routes() -> Router<Arc<AppState>> {
         .route("/v1/mesh/netmap/stream", get(mesh::get_netmap_stream))
         .route("/v1/mesh/endpoint", post(mesh::post_endpoint))
         .route("/v1/mesh/exit-node", post(mesh::post_exit_node))
+        .route("/v1/mesh/services", post(mesh::post_services))
 }
 
 #[derive(Debug, Clone)]

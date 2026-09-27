@@ -20,6 +20,9 @@ pub struct Device {
     pub exit_node_advertised: bool,
     #[serde(default)]
     pub exit_node_approved: bool,
+    /// Ports it forwards for peers.
+    #[serde(default)]
+    pub services: Vec<u16>,
 }
 
 impl Device {

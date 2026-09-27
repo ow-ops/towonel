@@ -289,7 +289,11 @@ pub async fn cmd_connect(
     let local = local.unwrap_or_else(|| format!("127.0.0.1:{port}"));
     let listener = tokio::net::TcpListener::bind(&local)
         .await
-        .with_context(|| format!("cannot listen on {local}"))?;
+        .with_context(|| {
+            format!(
+                "cannot listen on {local}; pick another local port with --local 127.0.0.1:<port>"
+            )
+        })?;
     // Fail now rather than on the first connection if the daemon is down.
     local::status(state.path()).await?;
     println!("Forwarding {local} to {peer}:{port}. Press Ctrl-C to stop.");
@@ -429,6 +433,8 @@ struct PeerRow {
     path: String,
     #[tabled(rename = "EXIT NODE")]
     exit: String,
+    #[tabled(rename = "SERVICES")]
+    services: String,
 }
 
 /// `paths` comes from the local daemon; `None` when it isn't running.
@@ -463,6 +469,15 @@ fn print_netmap(
             (false, _) => "-",
         }
         .to_string(),
+        services: if d.services.is_empty() {
+            "-".to_string()
+        } else {
+            d.services
+                .iter()
+                .map(u16::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        },
     };
     let mut rows = vec![row(
         &netmap.this_device,
