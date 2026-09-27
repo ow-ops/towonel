@@ -48,6 +48,7 @@ const CRED_AUTH_DOMAIN: &str = "towonel/mesh-cred/v1";
 const NETMAP_AUTH_DOMAIN: &str = "towonel/mesh-netmap/v1";
 const NETMAP_STREAM_AUTH_DOMAIN: &str = "towonel/mesh-netmap-stream/v1";
 const ENDPOINT_AUTH_DOMAIN: &str = "towonel/mesh-endpoint/v1";
+const EXIT_NODE_AUTH_DOMAIN: &str = "towonel/mesh-exit-node/v1";
 const DEVICE_CODE_AUTH_DOMAIN: &str = "towonel/mesh-device-code/v1";
 const DEVICE_POLL_AUTH_DOMAIN: &str = "towonel/mesh-device-poll/v1";
 
@@ -141,6 +142,12 @@ struct DeviceView {
     /// Serialized `iroh::EndpointAddr`: relay URL and direct addresses.
     #[schema(value_type = Option<Object>)]
     endpoint: Option<serde_json::Value>,
+    exit_node_advertised: bool,
+    /// By a tenant member; an exit needs both flags.
+    exit_node_approved: bool,
+    /// Approval lapses then unless the device advertises again. Set only
+    /// while approved but not advertising.
+    exit_node_approval_expires_at_ms: Option<i64>,
 }
 
 impl From<&MeshDeviceRow> for DeviceView {
@@ -157,13 +164,31 @@ impl From<&MeshDeviceRow> for DeviceView {
             created_at_ms: d.created_at_ms,
             last_seen_at_ms: d.last_seen_at_ms,
             endpoint: d.endpoint.clone(),
+            exit_node_advertised: d.exit_node_advertised,
+            exit_node_approved: d.exit_approved(now_ms_i64()),
+            exit_node_approval_expires_at_ms: d
+                .exit_approval_expires_at_ms()
+                .filter(|_| d.exit_approved(now_ms_i64())),
         }
+    }
+}
+
+impl DeviceView {
+    /// Exit state is hidden while the hub has exits off.
+    const fn for_hub(mut self, state: &AppState) -> Self {
+        if !state.mesh_exit_nodes_enabled {
+            self.exit_node_advertised = false;
+            self.exit_node_approved = false;
+            self.exit_node_approval_expires_at_ms = None;
+        }
+        self
     }
 }
 
 #[derive(Debug, Serialize, ToSchema)]
 struct ListDevicesResponse {
     devices: Vec<DeviceView>,
+    exit_nodes_enabled: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -459,7 +484,11 @@ pub(super) async fn list_devices(
     };
     match state.db.list_mesh_devices(&tenant_id).await {
         Ok(rows) => json_ok(ListDevicesResponse {
-            devices: rows.iter().map(DeviceView::from).collect(),
+            devices: rows
+                .iter()
+                .map(|d| DeviceView::from(d).for_hub(&state))
+                .collect(),
+            exit_nodes_enabled: state.mesh_exit_nodes_enabled,
         }),
         Err(e) => {
             warn!(error = %e, "list_mesh_devices failed");
@@ -512,6 +541,73 @@ pub(super) async fn delete_device(
         }
         Err(e) => {
             warn!(error = %e, "delete_mesh_device failed");
+            internal_error()
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub(super) struct ExitNodeApproval {
+    approved: bool,
+}
+
+#[utoipa::path(
+    put,
+    path = "/v1/tenants/{id}/mesh/devices/{device_id}/exit-node",
+    tag = "mesh",
+    params(
+        ("id" = String, Path, description = "Tenant id"),
+        ("device_id" = String, Path, description = "Hex device id"),
+    ),
+    request_body = ExitNodeApproval,
+    responses(
+        (status = 200, description = "Approval recorded; takes effect once the device advertises"),
+        (status = 403, description = "Not a member of this tenant, or exit nodes are disabled on this hub"),
+        (status = 404, description = "Device not found"),
+    ),
+    security(("session_cookie" = []), ("api_key" = []), ("operator_key" = [])),
+)]
+pub(super) async fn put_exit_node(
+    State(state): State<Arc<AppState>>,
+    principal: Principal,
+    Path((id, device_hex)): Path<(String, String)>,
+    axum::Json(body): axum::Json<ExitNodeApproval>,
+) -> Response {
+    let tenant_id = match tenant_for(&state, &principal, &id).await {
+        Ok(t) => t,
+        Err(resp) => return resp,
+    };
+    let Ok(device_id) = <DeviceId as hex::FromHex>::from_hex(&device_hex) else {
+        return invalid_request("device_id must be 32 hex bytes");
+    };
+    if body.approved && !state.mesh_exit_nodes_enabled {
+        return exit_nodes_disabled();
+    }
+    match state
+        .db
+        .set_mesh_device_exit_approved(&tenant_id, &device_id, body.approved, now_ms_i64())
+        .await
+    {
+        Ok(false) => not_found("device not found"),
+        Ok(true) => {
+            audit(
+                &state,
+                actor(&principal),
+                if body.approved {
+                    "mesh.device.exit_node.approve"
+                } else {
+                    "mesh.device.exit_node.unapprove"
+                },
+                "mesh_device",
+                &device_hex,
+                serde_json::json!({"tenant_id": tenant_id.to_string()}),
+            )
+            .await;
+            notify_mesh_change(&state, tenant_id);
+            json_ok(serde_json::json!({"ok": true}))
+        }
+        Err(e) => {
+            warn!(error = %e, "set_mesh_device_exit_approved failed");
             internal_error()
         }
     }
@@ -897,6 +993,91 @@ pub(super) async fn post_endpoint(
     json_ok(serde_json::json!({"ok": true}))
 }
 
+fn exit_nodes_disabled() -> Response {
+    error_response(
+        StatusCode::FORBIDDEN,
+        "exit_nodes_disabled",
+        "this hub does not allow exit nodes",
+    )
+}
+
+#[derive(Debug, Deserialize)]
+struct ExitNodeAdvert {
+    advertise: bool,
+}
+
+pub(super) async fn post_exit_node(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let device = match authenticated_device(&state, &headers, EXIT_NODE_AUTH_DOMAIN, &body).await {
+        Ok(d) => d,
+        Err(resp) => return resp,
+    };
+    let advert: ExitNodeAdvert = match serde_json::from_slice(&body) {
+        Ok(a) => a,
+        Err(e) => return invalid_request(format!("invalid body: {e}")),
+    };
+    if advert.advertise && !state.mesh_exit_nodes_enabled {
+        return exit_nodes_disabled();
+    }
+    let now = now_ms_i64();
+    if advert.advertise && device.exit_node_approved && !device.exit_approved(now) {
+        if let Err(e) = state
+            .db
+            .set_mesh_device_exit_approved(&device.tenant_id, &device.device_id, false, now)
+            .await
+        {
+            warn!(error = %e, "set_mesh_device_exit_approved failed");
+            return internal_error();
+        }
+        audit(
+            &state,
+            ("system", None),
+            "mesh.device.exit_node.approval_lapsed",
+            "mesh_device",
+            &hex::encode(device.device_id),
+            serde_json::json!({
+                "tenant_id": device.tenant_id.to_string(),
+                "name": device.name,
+            }),
+        )
+        .await;
+    }
+    match state
+        .db
+        .set_mesh_device_exit_advertised(&device.device_id, advert.advertise, now)
+        .await
+    {
+        Ok(true) => {
+            audit(
+                &state,
+                ("system", None),
+                if advert.advertise {
+                    "mesh.device.exit_node.advertise"
+                } else {
+                    "mesh.device.exit_node.unadvertise"
+                },
+                "mesh_device",
+                &hex::encode(device.device_id),
+                serde_json::json!({
+                    "tenant_id": device.tenant_id.to_string(),
+                    "name": device.name,
+                }),
+            )
+            .await;
+            notify_mesh_change(&state, device.tenant_id);
+        }
+        Ok(false) => {}
+        Err(e) => {
+            warn!(error = %e, "set_mesh_device_exit_advertised failed");
+            return internal_error();
+        }
+    }
+    json_ok(serde_json::json!({"ok": true}))
+}
+
 /// SSE: a `netmap` event on connect and after every change to the tenant's
 /// devices. Ends with `revoked` or `key_expired` when the device loses access.
 pub(super) async fn get_netmap_stream(
@@ -965,7 +1146,7 @@ async fn build_netmap(state: &AppState, device: &MeshDeviceRow) -> anyhow::Resul
     let peers = devices
         .iter()
         .filter(|d| d.device_id != device.device_id)
-        .map(DeviceView::from)
+        .map(|d| DeviceView::from(d).for_hub(state))
         .collect();
     let signer = state.signer.as_ref();
     let policy = state
@@ -975,7 +1156,7 @@ async fn build_netmap(state: &AppState, device: &MeshDeviceRow) -> anyhow::Resul
         .map(|(p, _)| p);
     Ok(NetmapResponse {
         tenant_id: device.tenant_id.to_string(),
-        this_device: DeviceView::from(device),
+        this_device: DeviceView::from(device).for_hub(state),
         peers,
         hub_keys: vec![HubKeyView {
             kid: signer.kid(),
@@ -1454,7 +1635,7 @@ fn enroll_response(state: &AppState, status: StatusCode, device: &MeshDeviceRow)
             status,
             EnrollResponse {
                 tenant_id: device.tenant_id.to_string(),
-                device: DeviceView::from(device),
+                device: DeviceView::from(device).for_hub(state),
                 cred,
             },
         ),

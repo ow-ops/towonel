@@ -29,6 +29,8 @@ pub enum MeshError {
     KeyExpired,
     #[error("this device was removed from the mesh")]
     Removed,
+    #[error("the mesh is not running")]
+    NotRunning,
     #[error("the sign-in code expired before it was approved")]
     CodeExpired,
     #[error("{message}")]
@@ -82,6 +84,8 @@ pub struct Device {
     pub connected: bool,
     /// `None` until a connection has picked a path.
     pub relayed: Option<bool>,
+    /// Usable with [`Mesh::set_exit_node`].
+    pub exit_node: bool,
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
@@ -276,6 +280,23 @@ impl Mesh {
             .map(|r| r.node.netmap().borrow().dns_domain.clone())
     }
 
+    /// `peer` is a device name, overlay IP or id; `None` stops. The app must
+    /// route `0.0.0.0/0` and `::/0` into the VPN and exclude itself
+    /// (Android: `addDisallowedApplication`).
+    pub fn set_exit_node(&self, peer: Option<String>) -> Result<(), MeshError> {
+        let running = lock(&self.running);
+        let running = running.as_ref().ok_or(MeshError::NotRunning)?;
+        Ok(running.node.set_exit_node(peer.as_deref())?)
+    }
+
+    /// Name of the exit node set with [`Mesh::set_exit_node`].
+    pub fn exit_node(&self) -> Option<String> {
+        lock(&self.running)
+            .as_ref()
+            .and_then(|r| r.node.exit_node())
+            .map(|d| d.name)
+    }
+
     pub fn peers(&self) -> Vec<Device> {
         lock(&self.running)
             .as_ref()
@@ -344,6 +365,7 @@ fn devices(node: &MeshNode) -> Vec<Device> {
 
 fn device(d: ApiDevice, connected: bool, relayed: Option<bool>) -> Device {
     Device {
+        exit_node: d.is_exit_node(),
         device_id: d.device_id,
         name: d.name,
         ipv4: d.ipv4,

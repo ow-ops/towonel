@@ -15,6 +15,9 @@ pub struct Model {
     pub created_at_ms: i64,
     pub last_seen_at_ms: Option<i64>,
     pub endpoint: Option<Json>,
+    pub exit_node_advertised: bool,
+    pub exit_node_approved: bool,
+    pub exit_node_unadvertised_at_ms: Option<i64>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

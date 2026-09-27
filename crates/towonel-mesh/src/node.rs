@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
@@ -23,8 +24,8 @@ use crate::client::{MeshClient, StreamEvent};
 use crate::dns;
 use crate::packet::{self, PacketInfo};
 use crate::peer::{
-    ForwardStatus, MAX_HELLO_LEN, MESH_ALPN, Trust, flow_allowed, forward_header, hello_frame,
-    inbound_allowed, parse_forward_header,
+    ForwardStatus, MAX_HELLO_LEN, MESH_ALPN, Trust, egress_allowed, exit_reply_allowed,
+    flow_allowed, forward_header, hello_frame, inbound_allowed, is_internet, parse_forward_header,
 };
 
 const KEEP_ALIVE: Duration = Duration::from_secs(15);
@@ -77,6 +78,12 @@ struct Inner {
     /// Flows this device started, so replies pass the inbound policy.
     flows: Mutex<HashMap<Flow, Instant>>,
     to_host: RwLock<Option<mpsc::Sender<Bytes>>>,
+    /// Picked exit's device id, kept while unusable so traffic resumes.
+    exit_choice: RwLock<Option<String>>,
+    /// The picked exit while the netmap lists it as one.
+    exit_peer: RwLock<Option<EndpointId>>,
+    /// Exit only reachable via the relay; internet traffic is held back.
+    exit_relayed: AtomicBool,
     /// Local ports of the iroh socket; its packets must never enter the TUN.
     transport_ports: Vec<u16>,
     stopped: RwLock<Option<Stopped>>,
@@ -141,6 +148,9 @@ impl MeshNode {
                 pending: Mutex::new(HashMap::new()),
                 flows: Mutex::new(HashMap::new()),
                 to_host: RwLock::new(None),
+                exit_choice: RwLock::new(None),
+                exit_peer: RwLock::new(None),
+                exit_relayed: AtomicBool::new(false),
                 transport_ports,
                 stopped: RwLock::new(None),
                 cancel: CancellationToken::new(),
@@ -191,6 +201,68 @@ impl MeshNode {
             .collect()
     }
 
+    /// `peer` is a device name, overlay IP or id; `None` stops.
+    pub fn set_exit_node(&self, peer: Option<&str>) -> anyhow::Result<()> {
+        let choice = match peer {
+            None => None,
+            Some(query) => {
+                let device = find_peer(&self.inner.netmap.borrow(), query)
+                    .cloned()
+                    .with_context(|| format!("no device named {query} in the mesh"))?;
+                if !device.is_exit_node() {
+                    bail!("{} is not an approved exit node", device.name);
+                }
+                Some(device.device_id)
+            }
+        };
+        *write(&self.inner.exit_choice) = choice;
+        self.resolve_exit(&self.inner.netmap.borrow());
+        Ok(())
+    }
+
+    /// The picked exit, even while unusable.
+    #[must_use]
+    pub fn exit_node(&self) -> Option<Device> {
+        let choice = read(&self.inner.exit_choice).clone()?;
+        let netmap = self.inner.netmap.borrow();
+        netmap.peers.iter().find(|d| d.device_id == choice).cloned()
+    }
+
+    /// Peers see it only once a tenant member approves this device.
+    pub async fn advertise_exit_node(&self, advertise: bool) -> anyhow::Result<()> {
+        self.inner.client.advertise_exit_node(advertise).await
+    }
+
+    /// Exit routing keeps these on the host's routes.
+    #[must_use]
+    pub fn transport_ports(&self) -> Vec<u16> {
+        self.inner.transport_ports.clone()
+    }
+
+    fn resolve_exit(&self, netmap: &Netmap) {
+        let choice = read(&self.inner.exit_choice).clone();
+        let peer = choice.as_ref().and_then(|choice| {
+            netmap
+                .peers
+                .iter()
+                .find(|d| &d.device_id == choice && d.is_exit_node())
+                .and_then(|d| crate::peer::device_id_bytes(&d.device_id).ok())
+                .and_then(|id| EndpointId::from_bytes(&id).ok())
+        });
+        let old = std::mem::replace(&mut *write(&self.inner.exit_peer), peer);
+        // Dial early so a direct path is ready.
+        if let Some(exit) = peer {
+            self.dial(exit, None);
+        }
+        if choice.is_some() && old.is_some() && peer.is_none() {
+            warn!("the exit node is gone or no longer approved; internet traffic is dropped");
+        }
+    }
+
+    fn serving_exit(&self) -> bool {
+        self.inner.netmap.borrow().this_device.is_exit_node()
+    }
+
     /// Route IP packets between the host and the mesh: packets sent on the
     /// returned sender go to peers, packets from peers arrive on the
     /// receiver. Attaching again replaces the previous channel.
@@ -221,6 +293,15 @@ impl MeshNode {
         };
         let own = read(&self.inner.hello).1.clone();
         if info.src != IpAddr::V4(own.ipv4) && info.src != IpAddr::V6(own.ipv6) {
+            // As an exit: NAT sends replies back to the peer's overlay IP.
+            if is_internet(info.src) && self.serving_exit() {
+                let peer = read(&self.inner.trust).by_ip.get(&info.dst).copied();
+                if let Some(id) = peer.and_then(|id| EndpointId::from_bytes(&id).ok())
+                    && let Path::Direct(conn) = self.path(id)
+                {
+                    self.send_packet(&conn, packet);
+                }
+            }
             return;
         }
         // Our own QUIC routed into the overlay would tunnel inside itself:
@@ -234,15 +315,51 @@ impl MeshNode {
             }
             return;
         }
-        let Some(id) = read(&self.inner.trust)
-            .by_ip
-            .get(&info.dst)
-            .and_then(|id| EndpointId::from_bytes(id).ok())
-        else {
+        let peer = read(&self.inner.trust).by_ip.get(&info.dst).copied();
+        if let Some(id) = peer.and_then(|id| EndpointId::from_bytes(&id).ok()) {
+            self.track(Flow::outbound(&info));
+            self.send_to(id, packet);
             return;
-        };
-        self.track(Flow::outbound(&info));
+        }
+        let exit = *read(&self.inner.exit_peer);
+        if let Some(exit) = exit.filter(|_| is_internet(info.dst)) {
+            match self.path(exit) {
+                Path::Direct(conn) => {
+                    self.note_exit_relayed(false);
+                    self.track(Flow::outbound(&info));
+                    self.send_packet(&conn, packet);
+                }
+                Path::Relayed => self.note_exit_relayed(true),
+                Path::Down => self.dial(exit, None),
+            }
+        }
+    }
 
+    /// Internet traffic never crosses the relay: its host may forbid VPNs.
+    fn path(&self, id: EndpointId) -> Path {
+        let live = lock(&self.inner.conns)
+            .get(&id)
+            .filter(|c| c.close_reason().is_none())
+            .cloned();
+        match live {
+            Some(conn) if relayed(&conn) == Some(false) => Path::Direct(conn),
+            Some(_) => Path::Relayed,
+            None => Path::Down,
+        }
+    }
+
+    fn note_exit_relayed(&self, relayed: bool) {
+        if self.inner.exit_relayed.swap(relayed, Ordering::Relaxed) == relayed {
+            return;
+        }
+        if relayed {
+            warn!("the exit node is only reachable through the relay; internet traffic is blocked");
+        } else {
+            info!("direct path to the exit node; internet traffic flows again");
+        }
+    }
+
+    fn send_to(&self, id: EndpointId, packet: Bytes) {
         let live = lock(&self.inner.conns)
             .get(&id)
             .filter(|c| c.close_reason().is_none())
@@ -251,13 +368,20 @@ impl MeshNode {
             self.send_packet(&conn, packet);
             return;
         }
+        self.dial(id, Some(packet));
+    }
+
+    /// Connect to `id` in the background, then send what queued up.
+    fn dial(&self, id: EndpointId, packet: Option<Bytes>) {
         let first = {
             let mut pending = lock(&self.inner.pending);
+            let first = !pending.contains_key(&id);
             let queue = pending.entry(id).or_default();
-            if queue.len() < MAX_PENDING {
+            if let Some(packet) = packet
+                && queue.len() < MAX_PENDING
+            {
                 queue.push(packet);
             }
-            let first = queue.len() == 1;
             drop(pending);
             first
         };
@@ -309,7 +433,7 @@ impl MeshNode {
         })
     }
 
-    fn route_in(&self, packet: Bytes, peer_cred: &MeshCred) {
+    fn route_in(&self, packet: Bytes, peer_cred: &MeshCred, conn: &Connection) {
         let Some(info) = packet::parse(&packet) else {
             return;
         };
@@ -317,8 +441,16 @@ impl MeshNode {
         let reply = lock(&self.inner.flows)
             .get(&Flow::reply_to(&info))
             .is_some_and(|seen| seen.elapsed() < FLOW_IDLE);
+        let from_exit =
+            read(&self.inner.exit_peer).is_some_and(|exit| exit.as_bytes() == &peer_cred.device_id);
         let trust = read(&self.inner.trust);
-        if inbound_allowed(&info, peer_cred, &own, reply, trust.policy.as_ref()) {
+        let policy = trust.policy.as_ref();
+        let direct = || relayed(conn) == Some(false);
+        let allowed = inbound_allowed(&info, peer_cred, &own, reply, policy)
+            || (from_exit && direct() && exit_reply_allowed(&info, &own, reply))
+            || (self.serving_exit() && direct() && egress_allowed(&info, peer_cred, &own, policy));
+        drop(trust);
+        if allowed {
             self.deliver(packet);
         }
     }
@@ -448,7 +580,7 @@ impl MeshNode {
                 () = self.inner.cancel.cancelled() => return,
                 datagram = conn.read_datagram() => match datagram {
                     Ok(packet) => {
-                        self.route_in(packet, &peer_cred);
+                        self.route_in(packet, &peer_cred, &conn);
                         continue;
                     }
                     Err(_) => break,
@@ -536,6 +668,7 @@ impl MeshNode {
             keep
         });
         *write(&self.inner.trust) = trust;
+        self.resolve_exit(&netmap);
         self.inner.netmap.send_replace(netmap);
     }
 
@@ -617,6 +750,12 @@ async fn forward(
     up?;
     down?;
     Ok(())
+}
+
+enum Path {
+    Direct(Connection),
+    Relayed,
+    Down,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

@@ -240,6 +240,10 @@ pub struct HubIdentity {
 }
 
 /// Everything the hub needs to start, grouped to keep the constructor lean.
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "operator switches from HubConfig, one per TOWONEL_HUB_* flag"
+)]
 pub struct HubParams {
     pub listen_addr: String,
     pub health_listen_addr: String,
@@ -257,6 +261,7 @@ pub struct HubParams {
     pub web_enabled: bool,
     pub console_url: Option<String>,
     pub mesh_dns_domain: String,
+    pub mesh_exit_nodes_enabled: bool,
     pub ports_require_reservation: bool,
     pub user_port_quota: i64,
     pub max_udp_port_range: u16,
@@ -427,6 +432,7 @@ impl Hub {
             web_enabled: self.p.web_enabled,
             console_url: self.p.console_url.clone(),
             mesh_dns_domain: self.p.mesh_dns_domain.clone(),
+            mesh_exit_nodes_enabled: self.p.mesh_exit_nodes_enabled,
             mailer: self.p.mailer.clone(),
             ports_require_reservation: self.p.ports_require_reservation,
             user_port_quota: self.p.user_port_quota,

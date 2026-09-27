@@ -19,19 +19,27 @@ use towonel_mesh::{
 const OS: &str = std::env::consts::OS;
 const MAX_RECONNECT_DELAY: Duration = Duration::from_mins(1);
 
+/// Exit-node role for `mesh up`.
+pub struct Exit {
+    pub advertise: bool,
+    /// Peer to send internet traffic through.
+    pub via: Option<String>,
+}
+
 pub async fn cmd_up(
     hub_url: Option<String>,
     auth_key: Option<String>,
     name: Option<String>,
     state_dir: Option<PathBuf>,
+    exit: Exit,
 ) -> anyhow::Result<()> {
     let state = open_state(state_dir)?;
     let hub_url = enroll_if_needed(&state, hub_url, auth_key, name).await?;
-    run(&state, &hub_url).await
+    Box::pin(run(&state, &hub_url, exit)).await
 }
 
 /// Runs until Ctrl-C / SIGTERM, or until the hub removes this device.
-async fn run(state: &StateDir, hub_url: &str) -> anyhow::Result<()> {
+async fn run(state: &StateDir, hub_url: &str, exit: Exit) -> anyhow::Result<()> {
     let key = state.device_key()?;
     let node = MeshNode::start(
         MeshClient::new(hub_url, key.clone())?,
@@ -63,6 +71,14 @@ async fn run(state: &StateDir, hub_url: &str) -> anyhow::Result<()> {
             None
         }
     };
+    let exit_setup = match setup_exit(&node, hub_url, &exit, tun.is_some()).await {
+        Ok(guard) => guard,
+        Err(e) => {
+            cancel.cancel();
+            node.shutdown().await;
+            return Err(e);
+        }
+    };
     println!("Mesh is up. Keep this running; press Ctrl-C to stop.");
 
     let result = tokio::select! {
@@ -75,6 +91,7 @@ async fn run(state: &StateDir, hub_url: &str) -> anyhow::Result<()> {
             None => Ok(()),
         },
     };
+    drop(exit_setup);
     cancel.cancel();
     node.shutdown().await;
     if let Some(tun) = tun {
@@ -86,6 +103,84 @@ async fn run(state: &StateDir, hub_url: &str) -> anyhow::Result<()> {
         Ok(Ok(())) => {}
     }
     result
+}
+
+#[cfg(target_os = "linux")]
+type ExitGuard = Option<Box<dyn Send>>;
+#[cfg(not(target_os = "linux"))]
+type ExitGuard = ();
+
+/// Returns what undoes the host changes on drop.
+#[cfg(target_os = "linux")]
+async fn setup_exit(
+    node: &MeshNode,
+    hub_url: &str,
+    exit: &Exit,
+    routed: bool,
+) -> anyhow::Result<ExitGuard> {
+    use towonel_mesh::exit::{ExitNat, ExitRoutes};
+
+    let this = node.netmap().borrow().this_device.clone();
+    if !exit.advertise
+        && this.exit_node_advertised
+        && let Err(e) = node.advertise_exit_node(false).await
+    {
+        eprintln!("could not stop offering this device as an exit node: {e:#}");
+    }
+    if (exit.advertise || exit.via.is_some()) && !routed {
+        bail!("exit nodes need the TUN device: run as root or with CAP_NET_ADMIN");
+    }
+    if exit.advertise {
+        let nat = ExitNat::install()?;
+        node.advertise_exit_node(true).await?;
+        if this.exit_node_approved {
+            println!("Peers can send their internet traffic through this device.");
+        } else {
+            println!(
+                "Offering to route internet traffic; a tenant member must approve {} as an exit node.",
+                this.name
+            );
+        }
+        return Ok(Some(Box::new(nat)));
+    }
+    let Some(via) = &exit.via else {
+        return Ok(None);
+    };
+    node.set_exit_node(Some(via))?;
+    let relay_url = node.netmap().borrow().relay_url.clone();
+    let mut bypass = Vec::new();
+    for url in std::iter::once(hub_url).chain(relay_url.as_deref()) {
+        bypass.extend(resolve_url(url).await?);
+    }
+    let exit_routes = ExitRoutes::install(&node.transport_ports(), &bypass)?;
+    println!("Internet traffic goes through {via}.");
+    Ok(Some(Box::new(exit_routes)))
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn setup_exit(
+    _node: &MeshNode,
+    _hub_url: &str,
+    exit: &Exit,
+    _routed: bool,
+) -> anyhow::Result<ExitGuard> {
+    if exit.advertise || exit.via.is_some() {
+        bail!("exit nodes are only supported on Linux");
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+async fn resolve_url(url: &str) -> anyhow::Result<Vec<std::net::IpAddr>> {
+    let parsed = url::Url::parse(url).with_context(|| format!("invalid URL {url}"))?;
+    let host = parsed
+        .host_str()
+        .with_context(|| format!("{url} has no host"))?;
+    let port = parsed.port_or_known_default().unwrap_or(443);
+    let addrs = tokio::net::lookup_host((host.trim_matches(['[', ']']), port))
+        .await
+        .with_context(|| format!("cannot resolve {host}"))?;
+    Ok(addrs.map(|a| a.ip()).collect())
 }
 
 /// Split DNS for the mesh domain through systemd-resolved; the settings go
@@ -332,6 +427,8 @@ struct PeerRow {
     last_seen: String,
     #[tabled(rename = "PATH")]
     path: String,
+    #[tabled(rename = "EXIT NODE")]
+    exit: String,
 }
 
 /// `paths` comes from the local daemon; `None` when it isn't running.
@@ -360,6 +457,12 @@ fn print_netmap(
                 (false, _) => "idle",
             })
             .to_string(),
+        exit: match (d.exit_node_advertised, d.exit_node_approved) {
+            (true, true) => "yes",
+            (true, false) => "awaiting approval",
+            (false, _) => "-",
+        }
+        .to_string(),
     };
     let mut rows = vec![row(
         &netmap.this_device,

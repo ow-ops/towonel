@@ -40,7 +40,7 @@ pub struct Rule {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PolicyTest {
-    /// Device names.
+    /// Device names; `to` may also be `internet`.
     pub from: String,
     pub to: String,
     #[serde(default = "tcp")]
@@ -70,6 +70,15 @@ enum Selector<'a> {
     Tenant,
     /// Only in `to`: devices owned by the sender's user.
     SameOwner,
+    /// Only in `to`: public addresses reached through an exit node.
+    Internet,
+}
+
+/// A device, or the internet via an exit node.
+#[derive(Clone, Copy)]
+enum Target<'a> {
+    Device(&'a MeshCred),
+    Internet,
 }
 
 fn selector(s: &str) -> anyhow::Result<Selector<'_>> {
@@ -77,10 +86,13 @@ fn selector(s: &str) -> anyhow::Result<Selector<'_>> {
         "*" => Selector::Any,
         "tenant" => Selector::Tenant,
         "self" => Selector::SameOwner,
+        "internet" => Selector::Internet,
         _ if s.starts_with("tag:") && s.len() > 4 => Selector::Tag(s),
         _ => match s.strip_prefix("user:") {
             Some(id) if !id.is_empty() => Selector::User(id),
-            _ => bail!("unknown selector {s:?}: expected *, tag:<name>, user:<id>, tenant or self"),
+            _ => bail!(
+                "unknown selector {s:?}: expected *, tag:<name>, user:<id>, tenant, self or internet"
+            ),
         },
     })
 }
@@ -92,6 +104,7 @@ fn matches(sel: &Selector<'_>, device: &MeshCred, sender: &MeshCred) -> bool {
         Selector::User(u) => device.owner.as_deref() == Some(*u),
         Selector::Tenant => device.owner.is_none() && device.tags.is_empty(),
         Selector::SameOwner => device.owner.is_some() && device.owner == sender.owner,
+        Selector::Internet => false,
     }
 }
 
@@ -117,7 +130,7 @@ fn parse_ports(s: &str) -> anyhow::Result<(u16, u16)> {
 }
 
 impl Rule {
-    fn allows(&self, src: &MeshCred, dst: &MeshCred, proto: u8, port: u16) -> bool {
+    fn allows(&self, src: &MeshCred, dst: Target<'_>, proto: u8, port: u16) -> bool {
         let proto_ok = match parse_proto(&self.proto) {
             Ok(None) => true,
             Ok(Some(PROTO_ICMP)) => proto == PROTO_ICMP || proto == PROTO_ICMPV6,
@@ -140,7 +153,10 @@ impl Rule {
             .to
             .iter()
             .filter_map(|s| selector(s).ok())
-            .any(|s| matches(&s, dst, src));
+            .any(|s| match dst {
+                Target::Device(d) => matches(&s, d, src),
+                Target::Internet => matches!(s, Selector::Internet),
+            });
         proto_ok && port_ok && from_ok && to_ok
     }
 }
@@ -148,7 +164,16 @@ impl Rule {
 impl Policy {
     #[must_use]
     pub fn allows(&self, src: &MeshCred, dst: &MeshCred, proto: u8, port: u16) -> bool {
-        self.rules.iter().any(|r| r.allows(src, dst, proto, port))
+        self.rules
+            .iter()
+            .any(|r| r.allows(src, Target::Device(dst), proto, port))
+    }
+
+    #[must_use]
+    pub fn allows_internet(&self, src: &MeshCred, proto: u8, port: u16) -> bool {
+        self.rules
+            .iter()
+            .any(|r| r.allows(src, Target::Internet, proto, port))
     }
 
     /// Syntax only; [`Policy::run_tests`] checks behaviour.
@@ -163,8 +188,11 @@ impl Policy {
                 at()
             );
             for s in &rule.from {
-                if matches!(selector(s).with_context(at)?, Selector::SameOwner) {
-                    bail!("{}: \"self\" only makes sense in `to`", at());
+                match selector(s).with_context(at)? {
+                    Selector::SameOwner | Selector::Internet => {
+                        bail!("{}: {s:?} only makes sense in `to`", at());
+                    }
+                    _ => {}
                 }
             }
             for s in &rule.to {
@@ -188,10 +216,14 @@ impl Policy {
             let name = format!("{} -> {}:{}/{}", t.from, t.to, t.port, t.proto);
             let src =
                 lookup(&t.from).with_context(|| format!("test {name}: no device {:?}", t.from))?;
-            let dst =
-                lookup(&t.to).with_context(|| format!("test {name}: no device {:?}", t.to))?;
             let proto = parse_proto(&t.proto)?.unwrap_or(PROTO_TCP);
-            let got = self.allows(&src, &dst, proto, t.port);
+            let got = if t.to == "internet" {
+                self.allows_internet(&src, proto, t.port)
+            } else {
+                let dst =
+                    lookup(&t.to).with_context(|| format!("test {name}: no device {:?}", t.to))?;
+                self.allows(&src, &dst, proto, t.port)
+            };
             ensure!(
                 got == t.allow,
                 "test {name}: expected {}, the policy {}",
@@ -271,6 +303,25 @@ mod tests {
     }
 
     #[test]
+    fn internet_is_only_matched_by_its_selector() {
+        let p = policy(
+            r#"{"rules": [
+                {"from": ["*"], "to": ["*"]},
+                {"from": ["user:alice"], "to": ["internet"], "ports": ["443"], "proto": "tcp"}
+            ]}"#,
+        );
+        let alice = device(Some("alice"), &[]);
+        let bob = device(Some("bob"), &[]);
+        assert!(p.allows_internet(&alice, PROTO_TCP, 443));
+        assert!(!p.allows_internet(&alice, PROTO_TCP, 80));
+        assert!(
+            !p.allows_internet(&bob, PROTO_TCP, 443),
+            "`*` is devices only"
+        );
+        assert!(p.allows(&bob, &alice, PROTO_TCP, 443));
+    }
+
+    #[test]
     fn empty_policy_denies_everything() {
         let a = device(Some("a"), &[]);
         assert!(!Policy::default().allows(&a, &a, PROTO_TCP, 22));
@@ -285,6 +336,10 @@ mod tests {
             ),
             (
                 r#"{"rules": [{"from": ["self"], "to": ["*"]}]}"#,
+                "only makes sense",
+            ),
+            (
+                r#"{"rules": [{"from": ["internet"], "to": ["*"]}]}"#,
                 "only makes sense",
             ),
             (
@@ -314,6 +369,7 @@ mod tests {
             r#"{"rules": [{"from": ["*"], "to": ["tag:nas"], "ports": ["22"]}],
                 "tests": [
                     {"from": "laptop", "to": "nas", "port": 22, "allow": true},
+                    {"from": "laptop", "to": "internet", "port": 443, "allow": false},
                     {"from": "laptop", "to": "nas", "port": 80, "allow": true}
                 ]}"#,
         );

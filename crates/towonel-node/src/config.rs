@@ -233,6 +233,9 @@ pub struct HubConfig {
     pub console_url: Option<String>,
     /// Suffix for mesh device names, e.g. `nas.towonel.internal`.
     pub mesh_dns_domain: String,
+    /// Off by default: hosting terms may forbid VPN services.
+    /// `TOWONEL_HUB_MESH_EXIT_NODES_ENABLED`.
+    pub mesh_exit_nodes_enabled: bool,
     pub mail: Option<MailConfig>,
     pub webauthn_rp_id: Option<String>,
 }
@@ -457,6 +460,7 @@ struct RawEnv {
     hub_oidc_codeberg_trust_email_verified: Option<bool>,
     hub_console_url: Option<String>,
     hub_mesh_dns_domain: Option<String>,
+    hub_mesh_exit_nodes_enabled: Option<bool>,
 
     mail_mailjet_api_key: Option<String>,
     mail_mailjet_api_secret: Option<String>,
@@ -545,6 +549,7 @@ impl NodeConfig {
             hub_oidc_codeberg_trust_email_verified,
             hub_console_url,
             hub_mesh_dns_domain,
+            hub_mesh_exit_nodes_enabled,
             mail_mailjet_api_key,
             mail_mailjet_api_secret,
             mail_from_email,
@@ -653,6 +658,7 @@ impl NodeConfig {
             oidc,
             console_url,
             mesh_dns_domain: parse_mesh_dns_domain(hub_mesh_dns_domain.as_deref())?,
+            mesh_exit_nodes_enabled: hub_mesh_exit_nodes_enabled.unwrap_or(false),
             mail,
             webauthn_rp_id: hub_webauthn_rp_id,
             data_dir: data_dir.as_deref(),
@@ -785,6 +791,7 @@ struct HubInputs<'a> {
     oidc: OidcConfig,
     console_url: Option<String>,
     mesh_dns_domain: String,
+    mesh_exit_nodes_enabled: bool,
     mail: Option<MailConfig>,
     webauthn_rp_id: Option<String>,
     data_dir: Option<&'a Path>,
@@ -825,6 +832,7 @@ fn build_hub_config(inputs: HubInputs<'_>) -> anyhow::Result<HubConfig> {
         oidc,
         console_url,
         mesh_dns_domain,
+        mesh_exit_nodes_enabled,
         mail,
         webauthn_rp_id,
         data_dir,
@@ -940,6 +948,7 @@ fn build_hub_config(inputs: HubInputs<'_>) -> anyhow::Result<HubConfig> {
         oidc,
         console_url,
         mesh_dns_domain,
+        mesh_exit_nodes_enabled,
         mail,
         webauthn_rp_id,
     })

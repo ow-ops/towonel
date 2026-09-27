@@ -16,6 +16,17 @@ pub struct Device {
     pub last_seen_at_ms: Option<i64>,
     #[serde(default)]
     pub endpoint: Option<iroh::EndpointAddr>,
+    #[serde(default)]
+    pub exit_node_advertised: bool,
+    #[serde(default)]
+    pub exit_node_approved: bool,
+}
+
+impl Device {
+    #[must_use]
+    pub const fn is_exit_node(&self) -> bool {
+        self.exit_node_advertised && self.exit_node_approved
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

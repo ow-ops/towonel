@@ -919,3 +919,204 @@ async fn policy_is_validated_tested_versioned_and_pushed() {
     let (_, map) = netmap(&hub, &client, &nas).await;
     assert!(map.get("policy").is_none_or(Value::is_null));
 }
+
+async fn advertise_exit(hub: &TestHub, client: &reqwest::Client, device: &Device, on: bool) {
+    let body = serde_json::to_vec(&json!({"advertise": on})).unwrap();
+    let auth = device.sign("towonel/mesh-exit-node/v1", &body);
+    let (s, resp) = signed_post(hub, client, "/v1/mesh/exit-node", auth, body).await;
+    assert_eq!(s, 200, "{resp}");
+}
+
+async fn approve_exit(
+    hub: &TestHub,
+    client: &reqwest::Client,
+    tenant: &TenantKeypair,
+    device_hex: &str,
+    approved: bool,
+) -> u16 {
+    client
+        .put(hub.url(&format!(
+            "/v1/tenants/{}/mesh/devices/{device_hex}/exit-node",
+            tenant.id()
+        )))
+        .bearer_auth(OPERATOR_KEY)
+        .json(&json!({"approved": approved}))
+        .send()
+        .await
+        .unwrap()
+        .status()
+        .as_u16()
+}
+
+#[tokio::test]
+async fn exit_node_needs_advert_and_approval() {
+    let hub = TestHub::start().await;
+    let client = reqwest::Client::new();
+    let tenant = new_tenant(&hub, &client, "mesh-exit").await;
+    let key = mint_key(&hub, &client, &tenant, json!({"reusable": true})).await;
+    let exit = Device::new(1);
+    let laptop = Device::new(2);
+    enroll(&hub, &client, &exit, &key, "exit").await;
+    enroll(&hub, &client, &laptop, &key, "laptop").await;
+    let flags = || async {
+        let (s, map) = netmap(&hub, &client, &laptop).await;
+        assert_eq!(s, 200, "{map}");
+        let peer = &map["peers"][0];
+        (
+            peer["exit_node_advertised"].as_bool().unwrap(),
+            peer["exit_node_approved"].as_bool().unwrap(),
+        )
+    };
+
+    assert_eq!(flags().await, (false, false));
+    advertise_exit(&hub, &client, &exit, true).await;
+    assert_eq!(flags().await, (true, false));
+    assert_eq!(
+        approve_exit(&hub, &client, &tenant, &exit.id_hex(), true).await,
+        200
+    );
+    assert_eq!(flags().await, (true, true));
+    // Approval outlives the advert, so a restart doesn't need a new one.
+    advertise_exit(&hub, &client, &exit, false).await;
+    assert_eq!(flags().await, (false, true));
+    assert_eq!(
+        approve_exit(&hub, &client, &tenant, &exit.id_hex(), false).await,
+        200
+    );
+    assert_eq!(flags().await, (false, false));
+
+    assert_eq!(
+        approve_exit(&hub, &client, &tenant, &"00".repeat(32), true).await,
+        404
+    );
+    let other = new_tenant(&hub, &client, "mesh-exit-other").await;
+    assert_eq!(
+        approve_exit(&hub, &client, &other, &exit.id_hex(), true).await,
+        404,
+        "a device is approved only through its own tenant"
+    );
+}
+
+#[tokio::test]
+async fn non_member_cannot_approve_exit_nodes() {
+    let hub = TestHub::start().await;
+    let client = reqwest::Client::new();
+    let cookie =
+        signup_and_login_user(&hub, &client, "exit-stranger@example.test", "hunter22!").await;
+    let tenant = new_tenant(&hub, &client, "mesh-exit-f").await;
+    let key = mint_key(&hub, &client, &tenant, json!({})).await;
+    let exit = Device::new(1);
+    enroll(&hub, &client, &exit, &key, "exit").await;
+
+    let resp = client
+        .put(hub.url(&format!(
+            "/v1/tenants/{}/mesh/devices/{}/exit-node",
+            tenant.id(),
+            exit.id_hex()
+        )))
+        .header(reqwest::header::COOKIE, &cookie)
+        .json(&json!({"approved": true}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403);
+}
+
+#[tokio::test]
+async fn exit_nodes_are_refused_and_hidden_when_disabled() {
+    let hub = TestHub::start_without_exit_nodes().await;
+    let client = reqwest::Client::new();
+    let tenant = new_tenant(&hub, &client, "mesh-noexit").await;
+    let key = mint_key(&hub, &client, &tenant, json!({"reusable": true})).await;
+    let exit = Device::new(1);
+    let laptop = Device::new(2);
+    enroll(&hub, &client, &exit, &key, "exit").await;
+    enroll(&hub, &client, &laptop, &key, "laptop").await;
+
+    let body = serde_json::to_vec(&json!({"advertise": true})).unwrap();
+    let auth = exit.sign("towonel/mesh-exit-node/v1", &body);
+    let (s, resp) = signed_post(&hub, &client, "/v1/mesh/exit-node", auth, body).await;
+    assert_eq!(
+        (s, resp["error"]["code"].as_str()),
+        (403, Some("exit_nodes_disabled")),
+        "{resp}"
+    );
+    assert_eq!(
+        approve_exit(&hub, &client, &tenant, &exit.id_hex(), true).await,
+        403
+    );
+    // Turning exits off is always allowed, so a hub can be cleaned up.
+    advertise_exit(&hub, &client, &exit, false).await;
+    assert_eq!(
+        approve_exit(&hub, &client, &tenant, &exit.id_hex(), false).await,
+        200
+    );
+
+    // State left from when exits were on stays hidden.
+    exec_sql(
+        &hub,
+        "UPDATE mesh_devices SET exit_node_advertised = TRUE, exit_node_approved = TRUE",
+    )
+    .await;
+    let (_, map) = netmap(&hub, &client, &laptop).await;
+    assert_eq!(map["peers"][0]["exit_node_approved"], false);
+    let (s, devices) = get_json(
+        &client,
+        &hub.url(&format!("/v1/tenants/{}/mesh/devices", tenant.id())),
+        Some(OPERATOR_KEY),
+    )
+    .await;
+    assert_eq!(s, 200);
+    assert_eq!(devices["exit_nodes_enabled"], false);
+    assert_eq!(devices["devices"][0]["exit_node_advertised"], false);
+}
+
+#[tokio::test]
+async fn exit_approval_lapses_after_a_week_without_advertising() {
+    let hub = TestHub::start().await;
+    let client = reqwest::Client::new();
+    let tenant = new_tenant(&hub, &client, "mesh-lapse").await;
+    let key = mint_key(&hub, &client, &tenant, json!({})).await;
+    let exit = Device::new(1);
+    enroll(&hub, &client, &exit, &key, "exit").await;
+    let view = || async {
+        let (_, devices) = get_json(
+            &client,
+            &hub.url(&format!("/v1/tenants/{}/mesh/devices", tenant.id())),
+            Some(OPERATOR_KEY),
+        )
+        .await;
+        devices["devices"][0].clone()
+    };
+
+    advertise_exit(&hub, &client, &exit, true).await;
+    approve_exit(&hub, &client, &tenant, &exit.id_hex(), true).await;
+    assert!(view().await["exit_node_approval_expires_at_ms"].is_null());
+
+    advertise_exit(&hub, &client, &exit, false).await;
+    let d = view().await;
+    assert_eq!(d["exit_node_approved"], true);
+    let expires = d["exit_node_approval_expires_at_ms"].as_i64().unwrap();
+    let week = 7 * 24 * 60 * 60 * 1000;
+    assert!((expires - i64::try_from(now_ms()).unwrap() - week).abs() < 60_000);
+
+    exec_sql(
+        &hub,
+        &format!(
+            "UPDATE mesh_devices SET exit_node_unadvertised_at_ms = {}",
+            i64::try_from(now_ms()).unwrap() - week - 1
+        ),
+    )
+    .await;
+    let d = view().await;
+    assert_eq!(d["exit_node_approved"], false);
+    assert!(d["exit_node_approval_expires_at_ms"].is_null());
+
+    // Re-advertising after the lapse needs a new approval.
+    advertise_exit(&hub, &client, &exit, true).await;
+    let d = view().await;
+    assert_eq!(
+        (&d["exit_node_advertised"], &d["exit_node_approved"]),
+        (&json!(true), &json!(false))
+    );
+}

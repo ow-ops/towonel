@@ -3,6 +3,8 @@
 pub mod api;
 pub mod client;
 pub mod dns;
+#[cfg(all(feature = "tun", target_os = "linux"))]
+pub mod exit;
 #[cfg(unix)]
 pub mod local;
 pub mod node;

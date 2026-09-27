@@ -88,13 +88,23 @@ impl TestHub {
     }
 
     pub(super) async fn start_with(ports_require_reservation: bool) -> Self {
-        Self::start_full(ports_require_reservation, 0, vec!["127.0.0.1".to_string()]).await
+        Self::start_full(
+            ports_require_reservation,
+            0,
+            vec!["127.0.0.1".to_string()],
+            true,
+        )
+        .await
+    }
+
+    pub(super) async fn start_without_exit_nodes() -> Self {
+        Self::start_full(false, 0, vec!["127.0.0.1".to_string()], false).await
     }
 
     /// Start a hub whose edge advertises no public IPs, for exercising the
     /// "nothing to assign" path in port reservation.
     pub(super) async fn start_without_edge_ips() -> Self {
-        Self::start_full(false, 0, Vec::new()).await
+        Self::start_full(false, 0, Vec::new(), true).await
     }
 
     pub(super) async fn start_with_quota(
@@ -105,6 +115,7 @@ impl TestHub {
             ports_require_reservation,
             user_port_quota,
             vec!["127.0.0.1".to_string()],
+            true,
         )
         .await
     }
@@ -117,6 +128,7 @@ impl TestHub {
         ports_require_reservation: bool,
         user_port_quota: i64,
         edge_public_ips: Vec<String>,
+        mesh_exit_nodes_enabled: bool,
     ) -> Self {
         // Init once so test failures show the hub's `warn!`/`error!` lines.
         // Safe to call repeatedly; only the first wins.
@@ -187,6 +199,7 @@ impl TestHub {
             web_enabled: true,
             console_url: Some("https://console.test.example".to_string()),
             mesh_dns_domain: "towonel.internal".to_string(),
+            mesh_exit_nodes_enabled,
             mailer: Some(Arc::clone(&mailer) as super::mail::SharedMailer),
             ports_require_reservation,
             user_port_quota,

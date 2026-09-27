@@ -90,6 +90,30 @@ pub struct MeshDeviceRow {
     pub last_seen_at_ms: Option<i64>,
     /// Serialized `iroh::EndpointAddr` last reported by the device.
     pub endpoint: Option<serde_json::Value>,
+    pub exit_node_advertised: bool,
+    pub exit_node_approved: bool,
+    pub exit_node_unadvertised_at_ms: Option<i64>,
+}
+
+/// An approved exit that stops advertising keeps its approval this long.
+pub const EXIT_APPROVAL_IDLE_MS: i64 = 7 * 24 * 60 * 60 * 1000;
+
+impl MeshDeviceRow {
+    /// Only while approved but not advertising.
+    pub fn exit_approval_expires_at_ms(&self) -> Option<i64> {
+        if !self.exit_node_approved || self.exit_node_advertised {
+            return None;
+        }
+        self.exit_node_unadvertised_at_ms
+            .map(|t| t + EXIT_APPROVAL_IDLE_MS)
+    }
+
+    pub fn exit_approved(&self, now_ms: i64) -> bool {
+        self.exit_node_approved
+            && self
+                .exit_approval_expires_at_ms()
+                .is_none_or(|t| t > now_ms)
+    }
 }
 
 fn tenant_from_bytes(bytes: &[u8]) -> anyhow::Result<TenantId> {
@@ -168,6 +192,9 @@ impl TryFrom<mesh_devices::Model> for MeshDeviceRow {
             created_at_ms: m.created_at_ms,
             last_seen_at_ms: m.last_seen_at_ms,
             endpoint: m.endpoint,
+            exit_node_advertised: m.exit_node_advertised,
+            exit_node_approved: m.exit_node_approved,
+            exit_node_unadvertised_at_ms: m.exit_node_unadvertised_at_ms,
         })
     }
 }
@@ -292,6 +319,9 @@ impl Db {
             created_at_ms: ActiveValue::Set(d.now_ms),
             last_seen_at_ms: ActiveValue::Set(Some(d.now_ms)),
             endpoint: ActiveValue::Set(None),
+            exit_node_advertised: ActiveValue::Set(false),
+            exit_node_approved: ActiveValue::Set(false),
+            exit_node_unadvertised_at_ms: ActiveValue::Set(None),
         };
         let inserted = mesh_devices::Entity::insert(model)
             .exec_with_returning(&txn)
@@ -485,6 +515,63 @@ impl Db {
             .exec(&self.conn)
             .await?;
         Ok(true)
+    }
+
+    /// `Ok(true)` when the flag changed.
+    pub async fn set_mesh_device_exit_advertised(
+        &self,
+        device_id: &DeviceId,
+        advertised: bool,
+        now_ms: i64,
+    ) -> anyhow::Result<bool> {
+        let res = mesh_devices::Entity::update_many()
+            .col_expr(
+                mesh_devices::Column::ExitNodeAdvertised,
+                sea_orm::sea_query::Expr::value(advertised),
+            )
+            .col_expr(
+                mesh_devices::Column::ExitNodeUnadvertisedAtMs,
+                sea_orm::sea_query::Expr::value((!advertised).then_some(now_ms)),
+            )
+            .filter(mesh_devices::Column::DeviceId.eq(device_id.to_vec()))
+            .filter(mesh_devices::Column::ExitNodeAdvertised.ne(advertised))
+            .exec(&self.conn)
+            .await?;
+        Ok(res.rows_affected == 1)
+    }
+
+    /// `Ok(false)` when the tenant has no such device. Approving a device
+    /// that isn't advertising starts its [`EXIT_APPROVAL_IDLE_MS`] window.
+    pub async fn set_mesh_device_exit_approved(
+        &self,
+        tenant_id: &TenantId,
+        device_id: &DeviceId,
+        approved: bool,
+        now_ms: i64,
+    ) -> anyhow::Result<bool> {
+        let device = || {
+            mesh_devices::Entity::update_many()
+                .filter(mesh_devices::Column::TenantId.eq(tenant_id.as_bytes().to_vec()))
+                .filter(mesh_devices::Column::DeviceId.eq(device_id.to_vec()))
+        };
+        let res = device()
+            .col_expr(
+                mesh_devices::Column::ExitNodeApproved,
+                sea_orm::sea_query::Expr::value(approved),
+            )
+            .exec(&self.conn)
+            .await?;
+        if approved {
+            device()
+                .col_expr(
+                    mesh_devices::Column::ExitNodeUnadvertisedAtMs,
+                    sea_orm::sea_query::Expr::value(now_ms),
+                )
+                .filter(mesh_devices::Column::ExitNodeAdvertised.eq(false))
+                .exec(&self.conn)
+                .await?;
+        }
+        Ok(res.rows_affected == 1)
     }
 
     /// The stored policy and its version, `None` for the default policy.

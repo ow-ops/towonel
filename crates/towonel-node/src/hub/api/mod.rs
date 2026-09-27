@@ -28,7 +28,7 @@ use axum::extract::State;
 use axum::http::{StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{delete, get, post};
+use axum::routing::{delete, get, post, put};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
 use serde::{Deserialize, Serialize};
@@ -154,6 +154,10 @@ pub fn new_login_limiter() -> LoginLimiter {
 }
 
 /// Shared application state for all axum handlers.
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "operator switches from HubConfig, one per TOWONEL_HUB_* flag"
+)]
 pub struct AppState {
     pub db: Db,
     pub route_tx: broadcast::Sender<RouteTable>,
@@ -227,6 +231,7 @@ pub struct AppState {
     /// Web console base URL for user-facing links; falls back to `public_url`.
     pub console_url: Option<String>,
     pub mesh_dns_domain: String,
+    pub mesh_exit_nodes_enabled: bool,
     pub mailer: Option<super::mail::SharedMailer>,
     pub ports_require_reservation: bool,
     /// Per-user port reservation quota. `0` means unlimited.
@@ -608,6 +613,10 @@ fn tenant_member_routes() -> Router<Arc<AppState>> {
             "/v1/tenants/{id}/mesh/devices/{device_id}",
             delete(mesh::delete_device),
         )
+        .route(
+            "/v1/tenants/{id}/mesh/devices/{device_id}/exit-node",
+            put(mesh::put_exit_node),
+        )
 }
 
 fn invites_routes() -> Router<Arc<AppState>> {
@@ -733,6 +742,7 @@ fn signed_public_routes() -> Router<Arc<AppState>> {
         .route("/v1/mesh/netmap", get(mesh::get_netmap))
         .route("/v1/mesh/netmap/stream", get(mesh::get_netmap_stream))
         .route("/v1/mesh/endpoint", post(mesh::post_endpoint))
+        .route("/v1/mesh/exit-node", post(mesh::post_exit_node))
 }
 
 #[derive(Debug, Clone)]

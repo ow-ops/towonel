@@ -539,3 +539,106 @@ async fn own_transport_never_enters_the_tunnel() {
     phone_tx.send(ok.clone()).await.unwrap();
     assert_eq!(recv_packet(&mut laptop_rx).await, Some(ok));
 }
+
+async fn wait_for_exit(node: &MeshNode, name: &str, usable: bool) {
+    let mut netmap = node.netmap();
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        netmap.wait_for(|m| {
+            m.peers
+                .iter()
+                .any(|p| p.name == name && p.is_exit_node() == usable)
+        }),
+    )
+    .await
+    .expect("exit node state never reached the peer")
+    .unwrap();
+}
+
+#[tokio::test]
+async fn exit_node_carries_internet_traffic() {
+    let hub = TestHub::start().await;
+    let client = reqwest::Client::new();
+    let (tenant, user_key) = Box::pin(user_tenant(&hub, &client)).await;
+    let (_, exit_key) = post_json(
+        &client,
+        &hub.url(&format!("/v1/tenants/{}/mesh/auth-keys", tenant.id())),
+        json!({"tags": ["tag:exit"]}),
+        Some(OPERATOR_KEY),
+    )
+    .await;
+    let laptop = join(&hub, 1, &user_key, "laptop").await;
+    let exit = join(&hub, 2, exit_key["token"].as_str().unwrap(), "exit").await;
+    wait_for_peer(&laptop.node, "exit").await;
+    wait_for_peer(&exit.node, "laptop").await;
+    let laptop_ip = "100.64.0.1";
+    let approve = |approved: bool| {
+        client
+            .put(hub.url(&format!(
+                "/v1/tenants/{}/mesh/devices/{}/exit-node",
+                tenant.id(),
+                exit.id
+            )))
+            .bearer_auth(OPERATOR_KEY)
+            .json(&json!({"approved": approved}))
+            .send()
+    };
+
+    exit.node.advertise_exit_node(true).await.unwrap();
+    wait_for_peer(&laptop.node, "exit").await;
+    assert!(
+        laptop.node.set_exit_node(Some("exit")).is_err(),
+        "advertised but not approved"
+    );
+    assert_eq!(approve(true).await.unwrap().status(), 200);
+    wait_for_exit(&laptop.node, "exit", true).await;
+    let mut exit_netmap = exit.node.netmap();
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        exit_netmap.wait_for(|m| m.this_device.is_exit_node()),
+    )
+    .await
+    .expect("the exit never saw its approval")
+    .unwrap();
+    laptop.node.set_exit_node(Some("exit")).unwrap();
+
+    let (laptop_tx, mut laptop_rx) = laptop.node.packet_channel();
+    let (exit_tx, mut exit_rx) = exit.node.packet_channel();
+
+    // Dropped until the path is direct; resend like TCP.
+    let request = ipv4_udp(laptop_ip, "1.1.1.1", 40000, 53, 10);
+    let mut got = None;
+    for _ in 0..10 {
+        laptop_tx.send(request.clone()).await.unwrap();
+        got = recv_packet(&mut exit_rx).await;
+        if got.is_some() {
+            break;
+        }
+    }
+    assert_eq!(got, Some(request));
+    let reply = ipv4_udp("1.1.1.1", laptop_ip, 53, 40000, 10);
+    exit_tx.send(reply.clone()).await.unwrap();
+    assert_eq!(recv_packet(&mut laptop_rx).await, Some(reply));
+
+    // Only replies come back through the exit.
+    exit_tx
+        .send(ipv4_udp("1.1.1.1", laptop_ip, 53, 40001, 10))
+        .await
+        .unwrap();
+    assert_eq!(recv_packet(&mut laptop_rx).await, None);
+
+    // The exit's LAN is not the internet.
+    laptop_tx
+        .send(ipv4_udp(laptop_ip, "192.168.1.1", 40000, 80, 10))
+        .await
+        .unwrap();
+    assert_eq!(recv_packet(&mut exit_rx).await, None);
+
+    assert_eq!(approve(false).await.unwrap().status(), 200);
+    wait_for_exit(&laptop.node, "exit", false).await;
+    laptop_tx
+        .send(ipv4_udp(laptop_ip, "1.1.1.1", 40002, 53, 10))
+        .await
+        .unwrap();
+    assert_eq!(recv_packet(&mut exit_rx).await, None);
+}

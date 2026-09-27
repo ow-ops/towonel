@@ -35,6 +35,8 @@ mod m20260926_000000_mesh;
 mod m20260926_000001_mesh_device_codes;
 mod m20260926_000002_mesh_device_endpoint;
 mod m20260926_000003_mesh_policies;
+mod m20260927_000000_mesh_exit_node;
+mod m20260927_000001_mesh_exit_node_unadvertised_at;
 
 pub struct Migrator;
 
@@ -80,6 +82,8 @@ impl MigratorTrait for Migrator {
             Box::new(m20260926_000001_mesh_device_codes::Migration),
             Box::new(m20260926_000002_mesh_device_endpoint::Migration),
             Box::new(m20260926_000003_mesh_policies::Migration),
+            Box::new(m20260927_000000_mesh_exit_node::Migration),
+            Box::new(m20260927_000001_mesh_exit_node_unadvertised_at::Migration),
         ]
     }
 }

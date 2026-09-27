@@ -195,6 +195,63 @@ pub fn inbound_allowed(
     from_peer && to_us && (is_reply || flow_allowed(policy, peer, own, info.proto, info.dst_port))
 }
 
+/// Without a policy, whoever may reach `exit` may use it.
+#[must_use]
+pub fn internet_allowed(
+    policy: Option<&Policy>,
+    src: &MeshCred,
+    exit: &MeshCred,
+    proto: u8,
+    port: u16,
+) -> bool {
+    policy.map_or_else(
+        || default_allows(src, exit),
+        |p| p.allows_internet(src, proto, port),
+    )
+}
+
+#[must_use]
+pub fn egress_allowed(
+    info: &PacketInfo,
+    peer: &MeshCred,
+    own: &MeshCred,
+    policy: Option<&Policy>,
+) -> bool {
+    let from_peer = info.src == IpAddr::V4(peer.ipv4) || info.src == IpAddr::V6(peer.ipv6);
+    from_peer
+        && is_internet(info.dst)
+        && internet_allowed(policy, peer, own, info.proto, info.dst_port)
+}
+
+/// Only replies to flows we started.
+#[must_use]
+pub fn exit_reply_allowed(info: &PacketInfo, own: &MeshCred, is_reply: bool) -> bool {
+    let to_us = info.dst == IpAddr::V4(own.ipv4) || info.dst == IpAddr::V6(own.ipv6);
+    is_reply && to_us && is_internet(info.src)
+}
+
+/// Public unicast only, so an exit never bridges into its LAN or the overlay.
+#[must_use]
+pub const fn is_internet(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            let [a, b, ..] = v4.octets();
+            let shared = a == 100 && (b & 0xc0) == 64;
+            !(v4.is_private()
+                || v4.is_loopback()
+                || v4.is_link_local()
+                || v4.is_multicast()
+                || v4.is_broadcast()
+                || v4.is_unspecified()
+                || v4.is_documentation()
+                || shared
+                || a == 0
+                || a >= 240)
+        }
+        IpAddr::V6(v6) => (v6.segments()[0] & 0xe000) == 0x2000,
+    }
+}
+
 pub fn hello_frame(cred: &Cred) -> anyhow::Result<(AuthFrame, MeshCred)> {
     let cred_cbor = B64.decode(&cred.cred_b64).context("cred base64")?;
     let sig: [u8; PQ_SIGNATURE_LEN] = B64
@@ -291,6 +348,8 @@ mod tests {
                             created_at_ms: 0,
                             last_seen_at_ms: None,
                             endpoint: None,
+                            exit_node_advertised: false,
+                            exit_node_approved: false,
                         };
                         (*id, device)
                     })
@@ -477,6 +536,83 @@ mod tests {
             &laptop,
             true,
             None
+        ));
+    }
+
+    #[test]
+    fn exit_traffic_filters() {
+        let laptop = cred(Some("alice"), &[]);
+        let exit = MeshCred {
+            ipv4: "100.64.0.3".parse().unwrap(),
+            ..cred(None, &["tag:exit"])
+        };
+        let packet = |src: &str, dst: &str| PacketInfo {
+            src: src.parse().unwrap(),
+            dst: dst.parse().unwrap(),
+            proto: crate::packet::PROTO_TCP,
+            src_port: 40000,
+            dst_port: 443,
+        };
+
+        assert!(egress_allowed(
+            &packet("100.64.0.1", "1.1.1.1"),
+            &laptop,
+            &exit,
+            None
+        ));
+        assert!(egress_allowed(
+            &packet("fd00::1", "2606:4700::1111"),
+            &laptop,
+            &exit,
+            None
+        ));
+        // Tagged devices initiate nothing by default.
+        assert!(!egress_allowed(
+            &packet("100.64.0.3", "1.1.1.1"),
+            &exit,
+            &laptop,
+            None
+        ));
+        assert!(!egress_allowed(
+            &packet("100.64.0.9", "1.1.1.1"),
+            &laptop,
+            &exit,
+            None
+        ));
+        for lan in [
+            "192.168.1.1",
+            "10.0.0.1",
+            "100.64.0.2",
+            "169.254.1.1",
+            "fd00::2",
+        ] {
+            assert!(
+                !egress_allowed(&packet("100.64.0.1", lan), &laptop, &exit, None),
+                "{lan}"
+            );
+        }
+        let deny_all = crate::policy::Policy::default();
+        assert!(!egress_allowed(
+            &packet("100.64.0.1", "1.1.1.1"),
+            &laptop,
+            &exit,
+            Some(&deny_all)
+        ));
+
+        assert!(exit_reply_allowed(
+            &packet("1.1.1.1", "100.64.0.1"),
+            &laptop,
+            true
+        ));
+        assert!(!exit_reply_allowed(
+            &packet("1.1.1.1", "100.64.0.1"),
+            &laptop,
+            false
+        ));
+        assert!(!exit_reply_allowed(
+            &packet("192.168.1.1", "100.64.0.1"),
+            &laptop,
+            true
         ));
     }
 

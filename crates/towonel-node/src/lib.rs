@@ -116,6 +116,17 @@ enum MeshAction {
         name: Option<String>,
         #[arg(long, env = "TOWONEL_MESH_STATE_DIR")]
         state_dir: Option<PathBuf>,
+        /// Route peers' internet traffic once approved in the hub. Linux
+        /// only; sets up forwarding and NAT.
+        #[arg(
+            long,
+            env = "TOWONEL_MESH_ADVERTISE_EXIT_NODE",
+            conflicts_with = "exit_node"
+        )]
+        advertise_exit_node: bool,
+        /// Send internet traffic through this approved exit node. Linux only.
+        #[arg(long, env = "TOWONEL_MESH_EXIT_NODE")]
+        exit_node: Option<String>,
     },
     /// Pipe stdin/stdout to a TCP port on a peer, e.g.
     /// `ssh -o ProxyCommand="towonel mesh nc %h %p" nas`.
@@ -630,7 +641,15 @@ pub async fn run() -> anyhow::Result<()> {
                 auth_key,
                 name,
                 state_dir,
-            } => mesh_cli::cmd_up(hub_url, auth_key, name, state_dir).await,
+                advertise_exit_node,
+                exit_node,
+            } => {
+                let exit = mesh_cli::Exit {
+                    advertise: advertise_exit_node,
+                    via: exit_node,
+                };
+                mesh_cli::cmd_up(hub_url, auth_key, name, state_dir, exit).await
+            }
             MeshAction::Nc {
                 peer,
                 port,
@@ -916,6 +935,7 @@ async fn build_hub_params(
         web_enabled: config.hub.web_enabled,
         console_url: config.hub.console_url.clone(),
         mesh_dns_domain: config.hub.mesh_dns_domain.clone(),
+        mesh_exit_nodes_enabled: config.hub.mesh_exit_nodes_enabled,
         ports_require_reservation: config.hub.ports_require_reservation,
         user_port_quota: config.hub.user_port_quota,
         max_udp_port_range: config.hub.max_udp_port_range,
