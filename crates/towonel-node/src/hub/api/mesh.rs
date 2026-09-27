@@ -1166,6 +1166,54 @@ pub(super) async fn post_approve_device_code(
     json_ok(serde_json::json!({"ok": true}))
 }
 
+#[utoipa::path(
+    post,
+    path = "/v1/mesh/device-code/{code}/deny",
+    tag = "mesh",
+    params(("code" = String, Path, description = "User code, with or without the dash")),
+    responses(
+        (status = 200, description = "Denied; the device's next poll fails"),
+        (status = 403, description = "Only user accounts deny devices"),
+        (status = 404, description = "Unknown, expired, or already approved code"),
+    ),
+    security(("session_cookie" = []), ("api_key" = [])),
+)]
+pub(super) async fn post_deny_device_code(
+    State(state): State<Arc<AppState>>,
+    principal: Principal,
+    Path(code): Path<String>,
+) -> Response {
+    if !matches!(principal, Principal::User(_)) {
+        return user_required("devices are denied by a user account");
+    }
+    let row = match live_device_code(&state, &code).await {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+    match state
+        .db
+        .delete_pending_mesh_device_code(&row.user_code)
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => return not_found("device code is invalid, expired, or already approved"),
+        Err(e) => {
+            warn!(error = %e, "delete_pending_mesh_device_code failed");
+            return internal_error();
+        }
+    }
+    audit(
+        &state,
+        actor(&principal),
+        "mesh.device_code.deny",
+        "mesh_device",
+        &hex::encode(row.device_id),
+        serde_json::json!({"name": row.name, "requester_ip": row.requester_ip}),
+    )
+    .await;
+    json_ok(serde_json::json!({"ok": true}))
+}
+
 pub(super) async fn post_device_poll(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -1178,7 +1226,7 @@ pub(super) async fn post_device_poll(
         };
     let row = match state.db.find_mesh_device_code_for_device(&device_id).await {
         Ok(Some(r)) => r,
-        Ok(None) => return not_found("no pending device code for this device"),
+        Ok(None) => return not_found("no pending device code: it was denied or has expired"),
         Err(e) => {
             warn!(error = %e, "find_mesh_device_code_for_device failed");
             return internal_error();

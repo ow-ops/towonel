@@ -290,6 +290,9 @@ async fn sign_in(client: &MeshClient, name: &str) -> anyhow::Result<Enrolled> {
             Err(e) if hub_code(&e) == Some("gone") => {
                 bail!("the code expired before it was approved; run `towonel mesh up` again")
             }
+            Err(e) if hub_code(&e) == Some("not_found") => {
+                bail!("the request was denied or has expired; run `towonel mesh up` again")
+            }
             Err(e) if is_transient(&e) && tokio::time::Instant::now() < deadline => {
                 eprintln!("cannot reach the hub ({e}); still waiting for approval");
             }

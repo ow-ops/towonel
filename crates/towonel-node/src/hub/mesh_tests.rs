@@ -558,6 +558,37 @@ async fn device_code_flow_enrolls_user_device() {
 }
 
 #[tokio::test]
+async fn denied_device_code_cannot_be_approved() {
+    let hub = TestHub::start().await;
+    let client = reqwest::Client::new();
+    let (cookie, _, tenant) = Box::pin(owner_with_tenant(
+        &hub,
+        &client,
+        "deny@example.test",
+        "mesh-d",
+    ))
+    .await;
+    let phone = Device::new(1);
+    let code = request_code(&hub, &client, &phone).await;
+    let user_code = code["user_code"].as_str().unwrap();
+    let deny = || {
+        client
+            .post(hub.url(&format!("/v1/mesh/device-code/{user_code}/deny")))
+            .header(reqwest::header::COOKIE, &cookie)
+            .send()
+    };
+
+    assert_eq!(deny().await.unwrap().status(), 200);
+    assert_eq!(deny().await.unwrap().status(), 404);
+    assert_eq!(
+        approve(&hub, &client, &cookie, user_code, &tenant).await,
+        404
+    );
+    let (s, body) = poll(&hub, &client, &phone).await;
+    assert_eq!(s, 404, "{body}");
+}
+
+#[tokio::test]
 async fn device_code_approval_requires_tenant_membership() {
     let hub = TestHub::start().await;
     let client = reqwest::Client::new();

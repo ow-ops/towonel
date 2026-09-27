@@ -700,6 +700,10 @@ fn rate_limited_routes(web_enabled: bool) -> Router<Arc<AppState>> {
             .route(
                 "/v1/mesh/device-code/{code}/approve",
                 post(mesh::post_approve_device_code),
+            )
+            .route(
+                "/v1/mesh/device-code/{code}/deny",
+                post(mesh::post_deny_device_code),
             );
     }
     r

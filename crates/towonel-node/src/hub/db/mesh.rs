@@ -410,6 +410,16 @@ impl Db {
         Ok(res.rows_affected == 1)
     }
 
+    /// `Ok(false)` when the code is unknown or already approved.
+    pub async fn delete_pending_mesh_device_code(&self, user_code: &str) -> anyhow::Result<bool> {
+        let res = mesh_device_codes::Entity::delete_many()
+            .filter(mesh_device_codes::Column::UserCode.eq(user_code))
+            .filter(mesh_device_codes::Column::ApprovedAtMs.is_null())
+            .exec(&self.conn)
+            .await?;
+        Ok(res.rows_affected == 1)
+    }
+
     pub async fn get_mesh_device(
         &self,
         device_id: &DeviceId,

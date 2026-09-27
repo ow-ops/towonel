@@ -109,6 +109,7 @@ impl Modify for OperatorSecurity {
         super::mesh::delete_policy,
         super::mesh::get_device_code,
         super::mesh::post_approve_device_code,
+        super::mesh::post_deny_device_code,
     ),
 )]
 pub struct UserApiDoc;
