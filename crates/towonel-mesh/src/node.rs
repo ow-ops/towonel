@@ -44,6 +44,9 @@ const ADDR_REPORT_SETTLE: Duration = Duration::from_secs(1);
 pub struct NodeOptions {
     /// Bind the iroh socket here instead of all interfaces.
     pub bind: Option<SocketAddr>,
+    /// Peers' streams go to these `host:port` origins by port, and nowhere
+    /// else. `None`: this device's loopback.
+    pub services: Option<Arc<HashMap<u16, String>>>,
 }
 
 /// Why a node stopped on its own.
@@ -86,6 +89,7 @@ struct Inner {
     exit_relayed: AtomicBool,
     /// Local ports of the iroh socket; its packets must never enter the TUN.
     transport_ports: Vec<u16>,
+    services: Option<Arc<HashMap<u16, String>>>,
     stopped: RwLock<Option<Stopped>>,
     cancel: CancellationToken,
 }
@@ -152,6 +156,7 @@ impl MeshNode {
                 exit_peer: RwLock::new(None),
                 exit_relayed: AtomicBool::new(false),
                 transport_ports,
+                services: opts.services,
                 stopped: RwLock::new(None),
                 cancel: CancellationToken::new(),
             }),
@@ -603,8 +608,9 @@ impl MeshNode {
                     port,
                 )
             };
+            let services = self.inner.services.clone();
             tokio::spawn(async move {
-                if let Err(e) = forward(send, recv, allowed).await {
+                if let Err(e) = forward(send, recv, allowed, services.as_deref()).await {
                     debug!(error = %e, "mesh forward ended");
                 }
             });
@@ -716,12 +722,13 @@ impl MeshNode {
     }
 }
 
-/// Splice an accepted stream to `127.0.0.1:port`. Only loopback: a peer can
-/// reach this device's services, not its LAN.
+/// Splice an accepted stream to `127.0.0.1:port`, or to the origin `services`
+/// maps the port to. Nothing else: a peer can't wander into the LAN.
 async fn forward(
     mut send: SendStream,
     mut recv: RecvStream,
     allowed: impl FnOnce(u16) -> bool,
+    services: Option<&HashMap<u16, String>>,
 ) -> anyhow::Result<()> {
     let mut header = [0u8; 4];
     recv.read_exact(&mut header).await?;
@@ -730,7 +737,14 @@ async fn forward(
         send.write_all(&[ForwardStatus::Denied as u8]).await?;
         return Ok(());
     }
-    let Ok(tcp) = tokio::net::TcpStream::connect((Ipv4Addr::LOCALHOST, port)).await else {
+    let tcp = match services {
+        None => tokio::net::TcpStream::connect((Ipv4Addr::LOCALHOST, port)).await,
+        Some(map) => match map.get(&port) {
+            Some(origin) => tokio::net::TcpStream::connect(origin.as_str()).await,
+            None => Err(std::io::ErrorKind::NotFound.into()),
+        },
+    };
+    let Ok(tcp) = tcp else {
         send.write_all(&[ForwardStatus::Unreachable as u8]).await?;
         return Ok(());
     };

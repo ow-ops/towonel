@@ -2,6 +2,7 @@ mod config;
 mod edge_session;
 mod hub_client;
 mod k8s_autodiscover;
+mod mesh;
 mod metrics;
 mod publish_tls;
 mod retry;
@@ -92,6 +93,7 @@ pub async fn run(cli: AgentArgs) -> anyhow::Result<()> {
 
     let token = stateless::token_from_env()?;
     let agent_config = config::AgentConfig::load()?;
+    let mesh_services = mesh::load_services()?;
 
     // Derived from static env config, not the hub: built once for the process.
     let service_map = Arc::new(
@@ -130,6 +132,21 @@ pub async fn run(cli: AgentArgs) -> anyhow::Result<()> {
             shutdown.cancel();
         }
     });
+
+    let mesh_handle = if mesh_services.is_empty() {
+        None
+    } else {
+        let hub_url = towonel_common::invite::InviteToken::decode(&token)
+            .context("invalid TOWONEL_INVITE_TOKEN")?
+            .hub_url
+            .clone();
+        Some(tokio::spawn(mesh::run(
+            hub_url,
+            mesh_services,
+            metrics.mesh_up.clone(),
+            shutdown.clone(),
+        )))
+    };
 
     // The whole lifecycle — bring up a fresh endpoint, serve, tear down — is one
     // supervised activity: serve returning (wedged endpoint) or bring-up failing
@@ -172,6 +189,9 @@ pub async fn run(cli: AgentArgs) -> anyhow::Result<()> {
         warn!("endpoint close timed out during shutdown");
     }
 
+    if let Some(mesh) = mesh_handle {
+        drop(mesh.await);
+    }
     health_handle.abort();
     info!("towonel-agent stopped");
     Ok(())

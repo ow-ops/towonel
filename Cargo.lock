@@ -7496,6 +7496,7 @@ dependencies = [
  "tokio-stream",
  "tokio-util",
  "towonel-common",
+ "towonel-mesh",
  "tracing",
  "webpki-roots 1.0.9",
 ]

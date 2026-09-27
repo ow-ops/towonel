@@ -67,6 +67,58 @@ impl StateDir {
     }
 }
 
+/// For unattended devices: reuse the enrollment in `state`, or enroll with
+/// `auth_key` the first time. A device removed from the mesh stays removed.
+pub async fn join_unattended(
+    state: &StateDir,
+    hub_url: &str,
+    auth_key: Option<&str>,
+    name: &str,
+) -> anyhow::Result<Enrollment> {
+    let client = crate::MeshClient::new(hub_url, state.device_key()?)?;
+    let device = if state.load_enrollment()?.is_some() {
+        let netmap = client.netmap().await.map_err(|e| {
+            let hint = match hub_code(&e) {
+                Some("unauthorized") => format!(
+                    "this device was removed from the mesh; delete {} to add it again",
+                    state.path().display()
+                ),
+                Some("key_expired") => "this device's key expired; enroll with a tagged auth \
+                                        key, whose devices never expire"
+                    .to_string(),
+                _ => return e,
+            };
+            e.context(hint)
+        })?;
+        Enrollment {
+            hub_url: hub_url.to_string(),
+            tenant_id: netmap.tenant_id,
+            device_id: netmap.this_device.device_id,
+            name: netmap.this_device.name,
+            ipv4: netmap.this_device.ipv4,
+            ipv6: netmap.this_device.ipv6,
+        }
+    } else {
+        let auth_key = auth_key.context("TOWONEL_MESH_AUTH_KEY is required to join the mesh")?;
+        let enrolled = client.enroll(auth_key, name, std::env::consts::OS).await?;
+        Enrollment {
+            hub_url: hub_url.to_string(),
+            tenant_id: enrolled.tenant_id,
+            device_id: enrolled.device.device_id,
+            name: enrolled.device.name,
+            ipv4: enrolled.device.ipv4,
+            ipv6: enrolled.device.ipv6,
+        }
+    };
+    state.save_enrollment(&device)?;
+    Ok(device)
+}
+
+fn hub_code(e: &anyhow::Error) -> Option<&str> {
+    e.downcast_ref::<towonel_common::hub_error::HubApiError>()
+        .map(|h| h.code.as_str())
+}
+
 fn create_private_dir(path: &Path) -> std::io::Result<()> {
     let mut builder = std::fs::DirBuilder::new();
     builder.recursive(true);

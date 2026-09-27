@@ -61,4 +61,20 @@ spec:
             {{- with .Values.monitoring.prometheusRule.additionalRuleLabels }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
+        {{- if .Values.mesh.enabled }}
+
+        - alert: TowonelAgentMeshDown
+          expr: |-
+            towonel_agent_mesh_up{job="{{ $job }}"} == 0
+          for: 10m
+          annotations:
+            summary: >-
+              Towonel agent {{ `{{ $labels.pod }}` }} is not in the mesh, so its mesh
+              services are unreachable; its logs say why (key, removal, or hub)
+          labels:
+            severity: warning
+            {{- with .Values.monitoring.prometheusRule.additionalRuleLabels }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+        {{- end }}
 {{- end }}

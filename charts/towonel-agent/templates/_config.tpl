@@ -56,6 +56,20 @@ into common's native values, mutating .Values before the common loader renders.
         "service-reader" (dict "type" "RoleBinding" "roleRef" (dict "identifier" "service-reader") "subjects" (list (dict "identifier" "main"))))) -}}
 {{- end -}}
 
+{{- /* Mesh device per replica, keyed by a per-pod volume. */ -}}
+{{- if $v.mesh.enabled -}}
+  {{- if not $v.mesh.services -}}{{- fail "mesh.enabled needs mesh.services" -}}{{- end -}}
+  {{- if not $v.mesh.authKeySecret.name -}}{{- fail "mesh.enabled needs mesh.authKeySecret.name" -}}{{- end -}}
+  {{- $_ := set $env "TOWONEL_AGENT_MESH_SERVICES" (toJson $v.mesh.services) -}}
+  {{- $_ := set $env "TOWONEL_MESH_AUTH_KEY" (dict "valueFrom" (dict "secretKeyRef" (dict "name" $v.mesh.authKeySecret.name "key" $v.mesh.authKeySecret.key))) -}}
+  {{- $_ := set $env "TOWONEL_MESH_STATE_DIR" "/var/lib/towonel/mesh" -}}
+  {{- $_ := set $env "TOWONEL_MESH_NAME" (dict "valueFrom" (dict "fieldRef" (dict "fieldPath" "metadata.name"))) -}}
+  {{- $claim := dict "name" "mesh-state" "accessMode" "ReadWriteOnce" "size" $v.mesh.storageSize "globalMounts" (list (dict "path" "/var/lib/towonel/mesh")) -}}
+  {{- with $v.mesh.storageClass }}{{- $_ := set $claim "storageClass" . -}}{{- end }}
+  {{- $_ := set $v.controllers.main "type" "statefulset" -}}
+  {{- $_ := set $v.controllers.main "statefulset" (dict "volumeClaimTemplates" (list $claim)) -}}
+{{- end -}}
+
 {{- $_ := set $container "env" $env -}}
 {{- $_ := set $container "ports" $ports -}}
 {{- end -}}

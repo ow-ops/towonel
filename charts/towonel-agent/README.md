@@ -97,6 +97,12 @@ Kubernetes: `>=1.31.0-0`
 | global.fullnameOverride | string | `""` | Override the full release name. |
 | global.nameOverride | string | `""` | Override the chart name used in resource names. |
 | hostNetwork | bool | `false` | Run the agent on the host network (workaround for pod datapaths that break QUIC UDP sends). dnsPolicy switches to ClusterFirstWithHostNet. |
+| mesh.authKeySecret.key | string | `"TOWONEL_MESH_AUTH_KEY"` | Key inside the Secret. |
+| mesh.authKeySecret.name | string | `""` | k8s-secret <name> | kubectl apply -f -`. Tagged keys' devices never expire; `--reusable` lets every replica join. |
+| mesh.enabled | bool | `false` | Join the mesh (needs `services` and `authKeySecret`). |
+| mesh.services | list | `[]` | Services peers reach through this agent (TOWONEL_AGENT_MESH_SERVICES). |
+| mesh.storageClass | string | `""` | StorageClass for the state volumes; empty uses the cluster default. |
+| mesh.storageSize | string | `"64Mi"` | Size of each replica's state volume (device key and enrollment). |
 | monitoring.dashboards.annotations | object | `{}` | Annotations added to the dashboard ConfigMap. |
 | monitoring.dashboards.enabled | bool | `false` | Render the Grafana dashboard ConfigMap (for grafana-operator or the kube-prometheus-stack sidecar). |
 | monitoring.dashboards.grafanaOperator.allowCrossNamespaceImport | bool | `true` | If true allows for a Grafana in any namespace to access this GrafanaDashboard. |

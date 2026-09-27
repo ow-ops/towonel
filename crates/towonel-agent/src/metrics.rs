@@ -35,6 +35,7 @@ pub struct AgentMetrics {
     pub streams_active: IntGauge,
     pub bytes_total: IntCounterVec,
     pub info: IntGaugeVec,
+    pub mesh_up: IntGauge,
     registry: Arc<Registry>,
 }
 
@@ -66,6 +67,11 @@ impl AgentMetrics {
                 "towonel_agent_edge_path",
                 "1 for the network path currently selected to the edge (direct|relay|custom), 0 otherwise",
                 &["edge", "path"],
+            ),
+            mesh_up: register_gauge(
+                &r,
+                "towonel_agent_mesh_up",
+                "1 while the agent serves its mesh services, 0 otherwise",
             ),
             streams_accepted: register_counter(
                 &r,

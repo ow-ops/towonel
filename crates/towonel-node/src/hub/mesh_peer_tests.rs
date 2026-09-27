@@ -23,6 +23,7 @@ async fn join(hub: &TestHub, seed: u8, auth_key: &str, name: &str) -> Peer {
         key.clone(),
         NodeOptions {
             bind: Some("127.0.0.1:0".parse().unwrap()),
+            ..Default::default()
         },
     )
     .await
@@ -641,4 +642,106 @@ async fn exit_node_carries_internet_traffic() {
         .await
         .unwrap();
     assert_eq!(recv_packet(&mut exit_rx).await, None);
+}
+
+#[tokio::test]
+async fn service_map_forwards_only_listed_ports() {
+    let hub = TestHub::start().await;
+    let client = reqwest::Client::new();
+    let (tenant, user_key) = Box::pin(user_tenant(&hub, &client)).await;
+    let (_, agent_key) = post_json(
+        &client,
+        &hub.url(&format!("/v1/tenants/{}/mesh/auth-keys", tenant.id())),
+        json!({"tags": ["tag:agent"]}),
+        Some(OPERATOR_KEY),
+    )
+    .await;
+    let origin = echo_server().await;
+    let on_loopback = echo_server().await;
+
+    let key = iroh::SecretKey::from([7; 32]);
+    MeshClient::new(&hub.base_url, key.clone())
+        .unwrap()
+        .enroll(agent_key["token"].as_str().unwrap(), "agent", "linux")
+        .await
+        .unwrap();
+    let agent = MeshNode::start(
+        MeshClient::new(&hub.base_url, key.clone()).unwrap(),
+        key,
+        NodeOptions {
+            bind: Some("127.0.0.1:0".parse().unwrap()),
+            services: Some(std::sync::Arc::new(
+                [(5432, format!("127.0.0.1:{origin}"))].into(),
+            )),
+        },
+    )
+    .await
+    .unwrap();
+    let laptop = join(&hub, 1, &user_key, "laptop").await;
+    wait_for_peer(&laptop.node, "agent").await;
+    wait_for_peer(&agent, "laptop").await;
+
+    assert_eq!(
+        round_trip(&laptop.node, "agent", 5432).await.unwrap(),
+        b"ping"
+    );
+    // The agent's own loopback is off limits, even where something listens.
+    let err = round_trip(&laptop.node, "agent", on_loopback)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("nothing is listening"), "{err}");
+}
+
+#[tokio::test]
+async fn unattended_join_reuses_state_and_respects_removal() {
+    let hub = TestHub::start().await;
+    let client = reqwest::Client::new();
+    let tenant = tenant_from_token(&create_invite(&hub, &client, "mesh-u", &["u.mesh.test"]).await);
+    let (_, key) = post_json(
+        &client,
+        &hub.url(&format!("/v1/tenants/{}/mesh/auth-keys", tenant.id())),
+        json!({"tags": ["tag:agent"], "reusable": true}),
+        Some(OPERATOR_KEY),
+    )
+    .await;
+    let key = key["token"].as_str().unwrap();
+    let dir = std::env::temp_dir().join(format!("towonel-unattended-{}", std::process::id()));
+    let state = towonel_mesh::StateDir::open(dir.clone()).unwrap();
+
+    let first = towonel_mesh::join_unattended(&state, &hub.base_url, Some(key), "agent")
+        .await
+        .unwrap();
+    let again = towonel_mesh::join_unattended(&state, &hub.base_url, None, "other")
+        .await
+        .unwrap();
+    assert_eq!(
+        first, again,
+        "an enrolled device needs no key and keeps its name"
+    );
+
+    let resp = client
+        .delete(hub.url(&format!(
+            "/v1/tenants/{}/mesh/devices/{}",
+            tenant.id(),
+            first.device_id
+        )))
+        .bearer_auth(OPERATOR_KEY)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    // A reusable key must not quietly undo the removal.
+    let err = towonel_mesh::join_unattended(&state, &hub.base_url, Some(key), "agent")
+        .await
+        .unwrap_err();
+    assert!(
+        format!("{err:#}").contains("removed from the mesh"),
+        "{err:#}"
+    );
+    assert_eq!(
+        err.downcast_ref::<towonel_common::hub_error::HubApiError>()
+            .map(|h| h.status),
+        Some(401)
+    );
+    std::fs::remove_dir_all(dir).unwrap();
 }

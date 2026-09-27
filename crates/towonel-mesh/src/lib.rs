@@ -17,4 +17,4 @@ pub mod tun;
 
 pub use client::{MeshClient, NetmapStream, Poll, StreamEvent};
 pub use node::{MeshNode, NodeOptions, PeerStatus, Stopped};
-pub use state::{Enrollment, StateDir};
+pub use state::{Enrollment, StateDir, join_unattended};

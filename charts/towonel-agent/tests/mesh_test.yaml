@@ -1,0 +1,63 @@
+suite: agent mesh
+templates:
+  - common.yaml.tpl
+tests:
+  - it: stays a Deployment without mesh
+    asserts:
+      - isKind:
+          of: Deployment
+        documentSelector:
+          path: kind
+          value: Deployment
+
+  - it: runs a StatefulSet with a state volume per replica
+    set:
+      mesh.enabled: true
+      mesh.authKeySecret.name: mesh-key
+      mesh.services:
+        - port: 5432
+          origin: postgres.db.svc.cluster.local:5432
+    documentSelector:
+      path: kind
+      value: StatefulSet
+    asserts:
+      - isKind:
+          of: StatefulSet
+      - equal:
+          path: spec.volumeClaimTemplates[0].metadata.name
+          value: mesh-state
+      - equal:
+          path: spec.volumeClaimTemplates[0].spec.resources.requests.storage
+          value: 64Mi
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: mesh-state
+            mountPath: /var/lib/towonel/mesh
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: TOWONEL_AGENT_MESH_SERVICES
+            value: '[{"origin":"postgres.db.svc.cluster.local:5432","port":5432}]'
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: TOWONEL_MESH_AUTH_KEY
+            valueFrom:
+              secretKeyRef:
+                name: mesh-key
+                key: TOWONEL_MESH_AUTH_KEY
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: TOWONEL_MESH_NAME
+            valueFrom:
+              fieldRef:
+                fieldPath: metadata.name
+
+  - it: needs services and an auth key
+    set:
+      mesh.enabled: true
+    asserts:
+      - failedTemplate:
+          errorPattern: mesh.enabled needs mesh.services

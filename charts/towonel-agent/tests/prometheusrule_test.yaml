@@ -19,3 +19,23 @@ tests:
       - equal:
           path: spec.groups[0].rules[0].alert
           value: TowonelAgentEdgeLinkDown
+
+  - it: alerts on the mesh only when it is enabled
+    set:
+      monitoring.prometheusRule.enabled: true
+      mesh.enabled: true
+      mesh.authKeySecret.name: mesh-key
+      mesh.services:
+        - port: 5432
+          origin: pg:5432
+    asserts:
+      - equal:
+          path: spec.groups[0].rules[3].alert
+          value: TowonelAgentMeshDown
+
+  - it: has no mesh alert without the mesh
+    set:
+      monitoring.prometheusRule.enabled: true
+    asserts:
+      - notExists:
+          path: spec.groups[0].rules[3]

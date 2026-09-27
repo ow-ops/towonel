@@ -70,6 +70,29 @@ directConnect:
   # -- Annotations for the direct (NodePort) Service.
   annotations: {}
 
+# Private network: each replica joins the tunnel's mesh as a device, and mesh
+# peers reach `mesh.services`, which are never published on an edge. Switches
+# the controller to a StatefulSet so every replica keeps its device key.
+mesh:
+  # -- Join the mesh (needs `services` and `authKeySecret`).
+  enabled: false
+  # -- Services peers reach through this agent (TOWONEL_AGENT_MESH_SERVICES).
+  services: []
+  # - port: 5432
+  #   origin: postgres.db.svc.cluster.local:5432
+  authKeySecret:
+    # -- Secret holding a mesh auth key (TOWONEL_MESH_AUTH_KEY). Create it with
+    # `towonel mesh auth-key --tenant-id <id> --tag tag:agent --reusable
+    # --k8s-secret <name> | kubectl apply -f -`. Tagged keys' devices never
+    # expire; `--reusable` lets every replica join.
+    name: ""
+    # -- Key inside the Secret.
+    key: TOWONEL_MESH_AUTH_KEY
+  # -- Size of each replica's state volume (device key and enrollment).
+  storageSize: 64Mi
+  # -- StorageClass for the state volumes; empty uses the cluster default.
+  storageClass: ""
+
 # -- Pod-wide defaults applied to every controller.
 defaultPodOptions:
   enableServiceLinks: false
