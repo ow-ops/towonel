@@ -433,12 +433,17 @@ towonel mesh auth-key --tenant-id <id> --tag tag:server
 towonel mesh up --hub-url https://hub.example.eu --auth-key tmk_…
 
 towonel mesh status                 # devices this one sees
+towonel mesh devices --tenant-id <id>   # all devices, with the operator key
 ssh nas.towonel.internal            # with root or CAP_NET_ADMIN (towonel0)
 towonel mesh connect nas:5432       # without: forward a local port
 ```
 
+Browser sign-in needs the web console (`TOWONEL_HUB_WEB_ENABLED`). Without
+it, add every device with an auth key; tag them, since untagged keys
+expire after 180 days and renewing one needs the console.
+
 Access is a per-tunnel policy, set in the console or with
-`PUT /v1/tenants/{id}/mesh/policy`. By default a user's devices reach each
+`towonel mesh policy set <file>`. By default a user's devices reach each
 other and tagged devices; tagged devices only answer.
 
 ### Exit nodes

@@ -491,7 +491,7 @@ fn print_netmap(
     Ok(())
 }
 
-fn ago(now_ms: u64, then_ms: i64) -> String {
+pub fn ago(now_ms: u64, then_ms: i64) -> String {
     let secs = u64::try_from(then_ms).map_or(0, |t| now_ms.saturating_sub(t) / 1000);
     match secs {
         0..60 => "just now".to_string(),
