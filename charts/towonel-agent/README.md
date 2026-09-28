@@ -82,7 +82,7 @@ Kubernetes: `>=1.31.0-0`
 | controllers.main.annotations | object | `{}` |  |
 | controllers.main.containers.main.image.digest | string | `""` | Pin the image by digest (sha256:...); the release pipeline fills it. |
 | controllers.main.containers.main.image.pullPolicy | string | `"IfNotPresent"` | Image pull policy. |
-| controllers.main.containers.main.image.repository | string | `"codeberg.org/towonel/towonel-agent"` | Image repository. |
+| controllers.main.containers.main.image.repository | string | `"git.ow-ops.eu/towonel/towonel-agent"` | Image repository. |
 | controllers.main.containers.main.image.tag | string | `"{{ .Chart.AppVersion }}"` | Image tag; defaults to the chart appVersion. |
 | controllers.main.containers.main.probes.liveness.enabled | bool | `true` |  |
 | controllers.main.containers.main.probes.liveness.path | string | `"/healthz"` |  |

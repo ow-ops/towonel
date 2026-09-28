@@ -129,7 +129,7 @@
                           "type": "string"
                         },
                         "repository": {
-                          "default": "codeberg.org/towonel/towonel-agent",
+                          "default": "git.ow-ops.eu/towonel/towonel-agent",
                           "description": "Image repository.",
                           "title": "repository",
                           "type": "string"

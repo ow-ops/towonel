@@ -63,7 +63,7 @@ Kubernetes: `>=1.31.0-0`
 | controllers.main.containers.main.envFrom | list | `[]` |  |
 | controllers.main.containers.main.image.digest | string | `""` | Pin the image by digest (sha256:...); the release pipeline fills it. |
 | controllers.main.containers.main.image.pullPolicy | string | `"IfNotPresent"` | Image pull policy. |
-| controllers.main.containers.main.image.repository | string | `"codeberg.org/towonel/towonel-node"` | Image repository. |
+| controllers.main.containers.main.image.repository | string | `"git.ow-ops.eu/towonel/towonel-node"` | Image repository. |
 | controllers.main.containers.main.image.tag | string | `"{{ .Chart.AppVersion }}"` | Image tag; defaults to the chart appVersion. |
 | controllers.main.containers.main.securityContext | object | `{"allowPrivilegeEscalation":false,"capabilities":{"add":["NET_BIND_SERVICE"],"drop":["ALL"]},"readOnlyRootFilesystem":true}` | Container securityContext (read-only root filesystem, drops ALL capabilities, keeps NET_BIND_SERVICE for privileged listeners). allowPrivilegeEscalation is dropped automatically when the edge is enabled — NoNewPrivs would block the file-cap bind of 443/80. |
 | controllers.main.replicas | int | `1` | Replicas (Deployment only; only one hub replica is the active leader). |
