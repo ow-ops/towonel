@@ -23,6 +23,9 @@ Two processes, one persistent QUIC tunnel between them:
   CGNAT). It dials the edge over QUIC, holds the connection open, and
   forwards traffic to the origin.
 
+Each tunnel also gets a [private network](#private-network) for its
+devices.
+
 Identity is post-quantum (ML-DSA-65) at the tenant level, Ed25519 at the
 iroh transport layer. Agents authenticate to the hub with an invite
 token; clients authenticate to the edge with the regular TLS handshake.
@@ -412,6 +415,56 @@ every edge so the agent is never stranded.
 Anything left unset resolves to `EU`, so existing single-region
 deployments keep working unchanged.
 
+## Private network
+
+Devices in a tunnel's private network reach each other on overlay IPs
+(`100.64.0.0/10` and a per-tunnel IPv6 `/48`) and by name
+(`<device>.towonel.internal`). Traffic goes device to device over QUIC,
+through the relay only when neither side can reach the other. Networks of
+different tunnels never see each other. Full guide:
+[towonel.dev/docs/mesh](https://towonel.dev/docs/mesh/).
+
+```bash
+# Laptop or phone: opens a browser sign-in
+towonel mesh up --hub-url https://hub.example.eu
+
+# Server: joins with an auth key
+towonel mesh auth-key --tenant-id <id> --tag tag:server
+towonel mesh up --hub-url https://hub.example.eu --auth-key tmk_…
+
+towonel mesh status                 # devices this one sees
+ssh nas.towonel.internal            # with root or CAP_NET_ADMIN (towonel0)
+towonel mesh connect nas:5432       # without: forward a local port
+```
+
+Access is a per-tunnel policy, set in the console or with
+`PUT /v1/tenants/{id}/mesh/policy`. By default a user's devices reach each
+other and tagged devices; tagged devices only answer.
+
+### Exit nodes
+
+A Linux device offers itself with `mesh up --advertise-exit-node`. Once a
+tunnel member approves it, other devices send their internet traffic
+through it with `mesh up --exit-node <device>`. Exit traffic never goes
+through the relay, and exits only forward to public addresses. Hubs refuse
+exit nodes unless `TOWONEL_HUB_MESH_EXIT_NODES_ENABLED=true`.
+
+### Agents on the network
+
+An agent can serve services to the private network without publishing
+them on an edge: set `TOWONEL_AGENT_MESH_SERVICES` and a mesh auth key, or
+`mesh.enabled` in the Helm chart
+([chart README](charts/towonel-agent/README.md#private-network)):
+
+```bash
+towonel mesh auth-key --invite-token "$TOWONEL_INVITE_TOKEN" --tag tag:agent \
+  --k8s-secret towonel-mesh | kubectl apply -f -
+```
+
+Devices reach it with `towonel mesh connect tag:agent:5432`, which tries
+each replica with that tag. Agents have no TUN, so connections to their
+overlay IP are refused; use `mesh connect` or `mesh nc`.
+
 ## Deployment
 
 ### Docker Compose
@@ -481,6 +534,9 @@ identity at startup.
 | `TOWONEL_HUB_KEK_PATH`               | `${DATA_DIR}/hub_kek.key`                    | Where the hub reads/generates the KEK                                        |
 | `TOWONEL_HUB_LINK_LISTEN_ADDR`       |                                              | Bind address for the optional hub↔edge control link (see [Hub↔edge control link](#hubedge-control-link)) |
 | `TOWONEL_HUB_LINK_PSK`               |                                              | 32-byte hex PSK authenticating remote edges. Must match `TOWONEL_EDGE_HUB_LINK_PSK` on every edge |
+| `TOWONEL_HUB_RELAY_URL`              |                                              | Relay devices and agents fall back to when no direct path works              |
+| `TOWONEL_HUB_MESH_DNS_DOMAIN`        | `towonel.internal`                           | Domain mesh device names resolve under                                       |
+| `TOWONEL_HUB_MESH_EXIT_NODES_ENABLED` | `false`                                     | Let mesh devices act as [exit nodes](#exit-nodes)                            |
 
 ### Edge
 
@@ -510,6 +566,10 @@ identity at startup.
 | `TOWONEL_AGENT_TCP_SERVICES`  | JSON array of raw TCP services (see above)                                        |
 | `TOWONEL_AGENT_UDP_SERVICES`  | JSON array of raw UDP services (see above)                                        |
 | `TOWONEL_AGENT_TRUSTED_EDGES` | Optional override for trusted edge IDs                                            |
+| `TOWONEL_AGENT_MESH_SERVICES` | JSON array of `{"port", "origin"}` served to the [private network](#agents-on-the-network) only. Set to join it |
+| `TOWONEL_MESH_AUTH_KEY`       | Mesh auth key (`tmk_…`). **Required** with `AGENT_MESH_SERVICES` until enrolled   |
+| `TOWONEL_MESH_STATE_DIR`      | Device key and enrollment. Keep it across restarts                                |
+| `TOWONEL_MESH_NAME`           | Device name. Defaults to the hostname                                             |
 
 Service shape:
 
@@ -534,12 +594,17 @@ Raw TCP service entries also accept `proxy_protocol`; it defaults to `none`.
 | ---------------------- | ----------------------------------------- |
 | `TOWONEL_HUB_URL`      | Default `--hub-url`                       |
 | `TOWONEL_OPERATOR_KEY` | Default `--api-key` for operator commands |
+| `TOWONEL_API_KEY`      | Personal API key (`twk_…`) for tenant commands (`port`, `mesh auth-key`); falls back to the operator key |
+| `TOWONEL_MESH_STATE_DIR` | State directory for `towonel mesh` commands |
 
 ## Install from source
 
 ```bash
 cargo build --release -p towonel-node -p towonel-agent
 ```
+
+The `towonel` binary also runs the agent (`towonel agent`); the separate
+`towonel-agent` binary and image stay for existing deployments.
 
 ## Contributing
 
