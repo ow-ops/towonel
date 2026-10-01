@@ -12,6 +12,7 @@ fips204 = { workspace = true }
 sha2 = { workspace = true }
 blake3 = { workspace = true }
 iroh = { workspace = true }
+noq-proto = { workspace = true }
 ciborium = { workspace = true }
 serde = { workspace = true }
 serde_bytes = { workspace = true }
