@@ -57,6 +57,10 @@ pub enum EdgeToHub {
         /// Region this edge serves. `None` from a pre-v5 edge.
         #[serde(default)]
         region: Option<String>,
+        /// `host:port` of the edge's TLS-over-TCP tunnel listener. Empty from
+        /// an edge without one, and ignored by a hub that predates it.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        tls_endpoints: Vec<String>,
     },
     SessionAdded {
         agent_id: AgentId,
@@ -313,6 +317,7 @@ mod tests {
             capabilities: EdgeCapabilities::default(),
             public_ips: vec!["1.2.3.4".into(), "2001:db8::1".into()],
             region: Some("EU".into()),
+            tls_endpoints: vec!["edge.example:51821".into()],
         };
         let mut buf = Vec::new();
         write_edge_to_hub(&mut buf, &msg).await.unwrap();
@@ -332,12 +337,101 @@ mod tests {
             capabilities: EdgeCapabilities::default(),
             public_ips: vec![],
             region: None,
+            tls_endpoints: vec![],
         };
         let mut buf = Vec::new();
         write_edge_to_hub(&mut buf, &msg).await.unwrap();
         let mut cur = Cursor::new(buf);
         let got = read_edge_to_hub(&mut cur).await.unwrap();
         assert_eq!(got, msg);
+    }
+
+    /// What a hub or edge built before `tls_endpoints` sends and expects.
+    #[derive(Serialize, Deserialize)]
+    enum OldEdgeToHub {
+        Hello {
+            edge_id: [u8; 32],
+            iroh_endpoints: Vec<String>,
+            software_version: String,
+            psk: [u8; 32],
+            capabilities: EdgeCapabilities,
+            #[serde(default)]
+            public_ips: Vec<String>,
+            #[serde(default)]
+            region: Option<String>,
+        },
+    }
+
+    #[test]
+    fn a_hello_without_tls_endpoints_still_decodes() {
+        let old = OldEdgeToHub::Hello {
+            edge_id: [3u8; 32],
+            iroh_endpoints: vec!["edge.example:51820".into()],
+            software_version: "1.11.1".into(),
+            psk: [5u8; 32],
+            capabilities: EdgeCapabilities::default(),
+            public_ips: vec!["1.2.3.4".into()],
+            region: Some("EU".into()),
+        };
+        let mut bytes = Vec::new();
+        ciborium::into_writer(&old, &mut bytes).unwrap();
+        let got: EdgeToHub = ciborium::from_reader(bytes.as_slice()).unwrap();
+        let EdgeToHub::Hello {
+            tls_endpoints,
+            region,
+            ..
+        } = got
+        else {
+            panic!("not a Hello");
+        };
+        assert!(tls_endpoints.is_empty());
+        assert_eq!(region.as_deref(), Some("EU"));
+    }
+
+    #[test]
+    fn a_hello_without_a_tls_listener_is_byte_identical_to_the_old_one() {
+        let old = OldEdgeToHub::Hello {
+            edge_id: [3u8; 32],
+            iroh_endpoints: vec!["edge.example:51820".into()],
+            software_version: "1.11.1".into(),
+            psk: [5u8; 32],
+            capabilities: EdgeCapabilities::default(),
+            public_ips: vec!["1.2.3.4".into()],
+            region: Some("EU".into()),
+        };
+        let new = EdgeToHub::Hello {
+            edge_id: [3u8; 32],
+            iroh_endpoints: vec!["edge.example:51820".into()],
+            software_version: "1.11.1".into(),
+            psk: [5u8; 32],
+            capabilities: EdgeCapabilities::default(),
+            public_ips: vec!["1.2.3.4".into()],
+            region: Some("EU".into()),
+            tls_endpoints: vec![],
+        };
+        let (mut old_bytes, mut new_bytes) = (Vec::new(), Vec::new());
+        ciborium::into_writer(&old, &mut old_bytes).unwrap();
+        ciborium::into_writer(&new, &mut new_bytes).unwrap();
+        assert_eq!(old_bytes, new_bytes);
+    }
+
+    #[test]
+    fn an_old_reader_ignores_tls_endpoints() {
+        let new = EdgeToHub::Hello {
+            edge_id: [3u8; 32],
+            iroh_endpoints: vec!["edge.example:51820".into()],
+            software_version: "1.12.0".into(),
+            psk: [5u8; 32],
+            capabilities: EdgeCapabilities::default(),
+            public_ips: vec![],
+            region: None,
+            tls_endpoints: vec!["edge.example:51821".into()],
+        };
+        let mut bytes = Vec::new();
+        ciborium::into_writer(&new, &mut bytes).unwrap();
+        let OldEdgeToHub::Hello { iroh_endpoints, .. } =
+            ciborium::from_reader(bytes.as_slice()).unwrap();
+        assert_eq!(iroh_endpoints, ["edge.example:51820"]);
     }
 
     #[tokio::test]

@@ -166,6 +166,7 @@ impl TestHub {
                 node_id: fake_endpoint_id(),
                 edge_addresses: vec!["127.0.0.1:4443".to_string()],
                 edge_iroh_addresses: vec!["127.0.0.1:51820".to_string()],
+                edge_tls_addresses: Vec::new(),
                 edge_public_ips,
                 edge_node_id: Some(fake_endpoint_id()),
                 edge_region: Some(towonel_common::DEFAULT_REGION.to_string()),

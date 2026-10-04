@@ -40,6 +40,8 @@ pub const TRUSTED_EDGES_ENV: &str = "TOWONEL_AGENT_TRUSTED_EDGES";
 pub struct EdgeContact {
     pub id: EndpointId,
     pub addrs: Vec<String>,
+    /// `host:port` of the edge's TLS tunnel listener, tried when QUIC fails.
+    pub tls_addrs: Vec<String>,
 }
 
 /// Held under `ArcSwap` so the refresh task can replace it atomically
@@ -742,6 +744,8 @@ struct IrohEndpoint {
     node_id: EndpointId,
     #[serde(default)]
     addresses: Vec<String>,
+    #[serde(default)]
+    tls_addresses: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -804,14 +808,15 @@ fn resolve_edge_contacts(
     // advertised endpoint gets empty addrs (the supervisor skips it).
     let edge_contacts: Vec<EdgeContact> = trusted_edges
         .iter()
-        .map(|id| EdgeContact {
-            id: *id,
-            addrs: resp
-                .iroh_endpoints
-                .iter()
-                .find(|e| e.node_id == *id)
-                .map(|e| e.addresses.clone())
-                .unwrap_or_default(),
+        .map(|id| {
+            let endpoint = resp.iroh_endpoints.iter().find(|e| e.node_id == *id);
+            EdgeContact {
+                id: *id,
+                addrs: endpoint.map(|e| e.addresses.clone()).unwrap_or_default(),
+                tls_addrs: endpoint
+                    .map(|e| e.tls_addresses.clone())
+                    .unwrap_or_default(),
+            }
         })
         .collect();
     Ok((trusted_edges, edge_contacts))
@@ -912,6 +917,49 @@ mod tests {
             msg.contains("127.0.0.1:1") || msg.contains("/v1/bootstrap"),
             "error should mention the failing URL, got: {msg}"
         );
+    }
+
+    fn response_with_endpoint(
+        endpoint: &serde_json::Value,
+        edge: &EndpointId,
+    ) -> BootstrapResponse {
+        serde_json::from_value(serde_json::json!({
+            "tenant_id": "t",
+            "trusted_edges": [edge.to_string()],
+            "edge_node_id": edge.to_string(),
+            "iroh_endpoints": [endpoint],
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn contacts_carry_the_edges_tls_addresses() {
+        let edge = iroh::SecretKey::generate().public();
+        let resp = response_with_endpoint(
+            &serde_json::json!({
+                "node_id": edge.to_string(),
+                "addresses": ["1.2.3.4:51820"],
+                "tls_addresses": ["1.2.3.4:51821"],
+            }),
+            &edge,
+        );
+        let (_, contacts) = resolve_edge_contacts(&resp).unwrap();
+        assert_eq!(contacts[0].addrs, ["1.2.3.4:51820"]);
+        assert_eq!(contacts[0].tls_addrs, ["1.2.3.4:51821"]);
+    }
+
+    #[test]
+    fn a_response_from_a_hub_without_tls_has_no_tls_addresses() {
+        let edge = iroh::SecretKey::generate().public();
+        let resp = response_with_endpoint(
+            &serde_json::json!({
+                "node_id": edge.to_string(),
+                "addresses": ["1.2.3.4:51820"],
+            }),
+            &edge,
+        );
+        let (_, contacts) = resolve_edge_contacts(&resp).unwrap();
+        assert!(contacts[0].tls_addrs.is_empty());
     }
 
     #[test]

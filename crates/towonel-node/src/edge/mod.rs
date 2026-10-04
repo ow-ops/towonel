@@ -22,6 +22,7 @@ use towonel_common::http_host::extract_host_header;
 use towonel_common::metrics::GaugeGuard;
 use towonel_common::sni::extract_sni;
 use towonel_common::tls_policy::TlsMode;
+use towonel_common::transport::tls::TlsListener;
 use towonel_common::transport::{TunnelConn, TunnelRecv, TunnelSend};
 use towonel_common::tunnel::{
     CONTROL_STATUS_INTERNAL_ERROR, CONTROL_STATUS_INVALID, CONTROL_STATUS_NOT_IMPLEMENTED,
@@ -181,6 +182,8 @@ pub struct Edge {
     sessions: Arc<SessionRegistry>,
     listen_addr: String,
     http_listen_addr: Option<String>,
+    /// TLS-over-TCP tunnel listener for agents that cannot use QUIC.
+    tunnel_tls: Option<(TlsListener, String)>,
     health_listen_addr: String,
     listen_workers: usize,
     proxy_protocol: Arc<ProxyProtocolConfig>,
@@ -209,6 +212,7 @@ impl Edge {
             sessions,
             listen_addr,
             http_listen_addr: None,
+            tunnel_tls: None,
             health_listen_addr,
             listen_workers: 1,
             proxy_protocol: Arc::default(),
@@ -245,6 +249,12 @@ impl Edge {
     #[must_use]
     pub fn with_http_listen_addr(mut self, addr: Option<String>) -> Self {
         self.http_listen_addr = addr;
+        self
+    }
+
+    #[must_use]
+    pub fn with_tunnel_tls(mut self, listener: Option<(TlsListener, String)>) -> Self {
+        self.tunnel_tls = listener;
         self
     }
 
@@ -289,11 +299,11 @@ impl Edge {
             hub_client: self.hub_client.clone(),
             connection_permits: Arc::new(tokio::sync::Semaphore::new(max_inflight)),
         });
-        // Long-lived agent (iroh) connections get their own pool: if they drew
+        // Long-lived agent connections get their own pool: if they drew
         // from the client `connection_permits`, the shutdown drain (which
         // acquires that whole pool) would block the full timeout while any
         // agent stays connected. Agent connections are closed by
-        // `endpoint.close()` after `run()` returns.
+        // `endpoint.close()` after `run()` returns; TLS ones by `close_tls`.
         let agent_permits = Arc::new(tokio::sync::Semaphore::new(max_inflight));
 
         let listeners = bind_listeners(&self.listen_addr, self.listen_workers).await?;
@@ -362,6 +372,21 @@ impl Edge {
             )));
         }
 
+        if let Some((tls, addr)) = self.tunnel_tls.as_ref() {
+            let socket = TcpListener::bind(addr).await?;
+            info!(listen = %addr, "edge TLS tunnel listening");
+            tasks.push(tokio::spawn(tls_accept_loop(
+                socket,
+                tls.clone(),
+                Arc::clone(&self.sessions),
+                Arc::clone(&self.router),
+                self.metrics.clone(),
+                self.hub_client.clone(),
+                Arc::clone(&agent_permits),
+                shutdown.clone(),
+            )));
+        }
+
         if let Some(hub_client) = self.hub_client.as_ref() {
             let stream = hub_client.subscribe_routes();
             let router = Arc::clone(&self.router);
@@ -384,7 +409,7 @@ impl Edge {
         }
 
         // Each in-flight client task holds a permit; acquiring the whole pool
-        // blocks until they finish, bounded by the drain timeout. Agent (iroh)
+        // blocks until they finish, bounded by the drain timeout. Agent
         // connections use a separate pool and UDP sessions are not
         // permit-tracked, so neither blocks this drain.
         let max = u32::try_from(max_inflight).unwrap_or(u32::MAX);
@@ -402,6 +427,7 @@ impl Edge {
                 "edge: drain timed out; closing remaining connections"
             ),
         }
+        self.sessions.close_tls(0, b"edge shutting down");
         Ok(())
     }
 }
@@ -472,6 +498,142 @@ async fn iroh_accept_loop(
     }
 }
 
+/// Pending TLS handshakes at once. A bare TCP connect costs a peer nothing and
+/// holds a slot until the handshake times out, so these stay out of the agent
+/// pool where they could lock every agent out.
+const TLS_HANDSHAKES_IN_FLIGHT: usize = 256;
+
+/// Handshakes one source may have in flight; a lone peer holding the whole pool
+/// would otherwise lock out every agent.
+const TLS_HANDSHAKES_PER_SOURCE: usize = 16;
+
+/// In-flight TLS handshakes per source address, IPv6 grouped by /64.
+#[derive(Default)]
+struct HandshakesBySource(std::sync::Mutex<std::collections::HashMap<std::net::IpAddr, usize>>);
+
+struct SourceSlot {
+    by_source: Arc<HandshakesBySource>,
+    source: std::net::IpAddr,
+}
+
+impl HandshakesBySource {
+    fn enter(self: &Arc<Self>, peer: std::net::IpAddr) -> Option<SourceSlot> {
+        let source = match peer {
+            std::net::IpAddr::V6(v6) => {
+                std::net::IpAddr::V6((u128::from(v6) & (!0u128 << 64)).into())
+            }
+            v4 @ std::net::IpAddr::V4(_) => v4,
+        };
+        let mut pending = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let count = pending.entry(source).or_insert(0);
+        if *count >= TLS_HANDSHAKES_PER_SOURCE {
+            return None;
+        }
+        *count = count.saturating_add(1);
+        drop(pending);
+        Some(SourceSlot {
+            by_source: Arc::clone(self),
+            source,
+        })
+    }
+}
+
+impl Drop for SourceSlot {
+    fn drop(&mut self) {
+        let mut pending = self
+            .by_source
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(count) = pending.get_mut(&self.source) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                pending.remove(&self.source);
+            }
+        }
+    }
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "accept-loop state threaded through; a context struct would only rename the list"
+)]
+async fn tls_accept_loop(
+    socket: TcpListener,
+    tls: TlsListener,
+    sessions: Arc<SessionRegistry>,
+    router: Arc<Router>,
+    metrics: EdgeMetrics,
+    hub_client: Option<Arc<dyn HubClient>>,
+    agent_permits: Arc<tokio::sync::Semaphore>,
+    shutdown: CancellationToken,
+) {
+    let handshakes = Arc::new(tokio::sync::Semaphore::new(TLS_HANDSHAKES_IN_FLIGHT));
+    let by_source = Arc::new(HandshakesBySource::default());
+    loop {
+        let (tcp, peer_addr) = tokio::select! {
+            biased;
+            () = shutdown.cancelled() => return,
+            res = socket.accept() => match res {
+                Ok(conn) => conn,
+                Err(e) => {
+                    warn!("TLS tunnel accept error: {e}");
+                    backoff_after_accept_error(&e).await;
+                    continue;
+                }
+            },
+        };
+        let Ok(handshake_permit) = Arc::clone(&handshakes).try_acquire_owned() else {
+            metrics.connections_rejected_overload.tls_agent.inc();
+            drop(tcp);
+            continue;
+        };
+        let Some(source_slot) = by_source.enter(peer_addr.ip()) else {
+            metrics.connections_rejected_overload.tls_agent.inc();
+            drop(tcp);
+            continue;
+        };
+        let tls = tls.clone();
+        let sessions = Arc::clone(&sessions);
+        let router = Arc::clone(&router);
+        let metrics = metrics.clone();
+        let hub_client = hub_client.clone();
+        let agent_permits = Arc::clone(&agent_permits);
+        let shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            let conn = match tls.accept(tcp).await {
+                Ok(conn) => TunnelConn::Tls(conn),
+                Err(e) => {
+                    metrics
+                        .sessions_rejected_total
+                        .with_label_values(&[session_reject_reason::HANDSHAKE_ERROR])
+                        .inc();
+                    debug!(%peer_addr, error = %e, "TLS tunnel handshake failed");
+                    return;
+                }
+            };
+            drop(handshake_permit);
+            drop(source_slot);
+            // `close_tls` has already run for a session that registers after it.
+            if shutdown.is_cancelled() {
+                conn.close(0, b"edge shutting down");
+                return;
+            }
+            let Ok(_permit) = agent_permits.try_acquire_owned() else {
+                metrics.connections_rejected_overload.tls_agent.inc();
+                conn.close(503, b"edge at its agent connection limit");
+                return;
+            };
+            if let Err(e) = serve_agent_conn(conn, sessions, router, metrics, hub_client).await {
+                debug!(%peer_addr, error = %e, "inbound agent connection ended with error");
+            }
+        });
+    }
+}
+
 async fn handle_inbound_agent(
     incoming: iroh::endpoint::Incoming,
     sessions: Arc<SessionRegistry>,
@@ -489,6 +651,18 @@ async fn handle_inbound_agent(
             return Err(anyhow::anyhow!("iroh handshake failed: {e}"));
         }
     };
+    serve_agent_conn(conn, sessions, router, metrics, hub_client).await
+}
+
+/// Admits and serves an agent connection whose transport handshake is done.
+/// Both transports accept any well-formed key, so `is_known_agent` is the gate.
+async fn serve_agent_conn(
+    conn: TunnelConn,
+    sessions: Arc<SessionRegistry>,
+    router: Arc<Router>,
+    metrics: EdgeMetrics,
+    hub_client: Option<Arc<dyn HubClient>>,
+) -> anyhow::Result<()> {
     let agent_id = conn.remote_id();
     if !router.is_known_agent(&agent_id) {
         metrics
@@ -497,7 +671,7 @@ async fn handle_inbound_agent(
             .inc();
         warn!(
             agent = %agent_id.fmt_short(),
-            "rejecting inbound iroh connection from unknown agent"
+            "rejecting inbound connection from unknown agent"
         );
         conn.close(403, b"unknown agent");
         return Ok(());
@@ -834,14 +1008,36 @@ const PICK_AGENT_BACKOFF: Duration = Duration::from_millis(200);
 /// `open_bi` blocks while the agent is at its concurrent-stream cap.
 const AGENT_STREAM_OPEN_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// What a stream will carry. Over TCP one lost segment stalls every stream on
+/// the session, so UDP stays off TLS sessions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Payload {
+    Stream,
+    Datagrams,
+}
+
+/// Dropped up front, not on `open`, so the retry loop isn't spent on sessions
+/// that can never work and a healthy TLS session is never removed.
+fn retain_carriers(ctx: &ConnCtx, payload: Payload, candidates: &mut self::router::Candidates) {
+    if payload == Payload::Datagrams {
+        candidates.retain(|agent| ctx.sessions.get(&agent.id).is_none_or(|s| !s.is_tls()));
+    }
+}
+
 /// Shuffle `candidates` for fair spread, then try each agent's session.
 /// `refresh` is called between attempts to pick up route-table updates that
 /// landed during the supersede window. Returns the first stream that opens.
 async fn pick_agent_and_open_stream(
     ctx: &ConnCtx,
+    payload: Payload,
     mut candidates: self::router::Candidates,
     mut refresh: impl FnMut() -> Option<self::router::Candidates>,
 ) -> anyhow::Result<(EndpointAddr, TunnelSend, TunnelRecv)> {
+    retain_carriers(ctx, payload, &mut candidates);
+    anyhow::ensure!(
+        !candidates.is_empty(),
+        "no agent session can carry {payload:?}"
+    );
     fastrand::shuffle(&mut candidates);
 
     let mut last_err: Option<anyhow::Error> = None;
@@ -868,6 +1064,7 @@ async fn pick_agent_and_open_stream(
         if attempt + 1 < PICK_AGENT_ATTEMPTS {
             tokio::time::sleep(PICK_AGENT_BACKOFF.saturating_mul(1u32 << attempt)).await;
             if let Some(mut next) = refresh() {
+                retain_carriers(ctx, payload, &mut next);
                 fastrand::shuffle(&mut next);
                 candidates = next;
             }
@@ -1077,7 +1274,7 @@ async fn prepare_connection(tcp_stream: &TcpStream, ctx: &ConnCtx) -> anyhow::Re
     );
 
     let (agent_addr, send_stream, recv_stream) =
-        pick_agent_and_open_stream(ctx, candidates, || {
+        pick_agent_and_open_stream(ctx, Payload::Stream, candidates, || {
             ctx.router.route(&hostname).map(|(c, _)| c)
         })
         .await?;
@@ -1146,7 +1343,7 @@ async fn handle_http_connection_inner(
         debug!(%hostname, candidates = candidates.len(), "http route matched");
 
         let (agent_addr, send_stream, recv_stream) =
-            pick_agent_and_open_stream(ctx, candidates, || {
+            pick_agent_and_open_stream(ctx, Payload::Stream, candidates, || {
                 ctx.router.route(&hostname).map(|(c, _)| c)
             })
             .await?;
@@ -1497,7 +1694,7 @@ async fn handle_tcp_connection(
         );
 
         let (agent_addr, send_stream, recv_stream) =
-            pick_agent_and_open_stream(ctx, candidates, || {
+            pick_agent_and_open_stream(ctx, Payload::Stream, candidates, || {
                 ctx.router
                     .route_tcp_service(&binding.tenant, &binding.service)
             })
@@ -1839,7 +2036,7 @@ async fn udp_session_pump(
         };
 
         let (agent_addr, mut send_stream, mut recv_stream) =
-            match pick_agent_and_open_stream(&ctx, candidates, || {
+            match pick_agent_and_open_stream(&ctx, Payload::Datagrams, candidates, || {
                 ctx.router
                     .route_udp_service(&binding.tenant, &binding.service)
             })
@@ -1933,6 +2130,256 @@ async fn udp_session_pump(
 mod tests {
     use super::*;
     use tokio::io::AsyncWriteExt;
+    use towonel_common::transport::tls::{TlsConn, TlsDialer, TlsIdentity};
+
+    const TLS_TEST_WAIT: Duration = Duration::from_secs(10);
+
+    /// A connected agent/edge pair over loopback TLS; the edge side is what
+    /// `serve_agent_conn` receives.
+    async fn tls_pair(agent_key: &iroh::SecretKey) -> (TlsConn, TlsConn) {
+        let edge = TlsIdentity::new(&iroh::SecretKey::generate()).unwrap();
+        let agent = TlsIdentity::new(agent_key).unwrap();
+        let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = socket.local_addr().unwrap();
+        let listener = TlsListener::new(&edge).unwrap();
+        let accepted = tokio::spawn(async move {
+            let (tcp, _) = socket.accept().await.unwrap();
+            listener.accept(tcp).await.unwrap()
+        });
+        let tcp = TcpStream::connect(addr).await.unwrap();
+        let dialed = TlsDialer::new(agent).connect(tcp, edge.id()).await.unwrap();
+        (dialed, accepted.await.unwrap())
+    }
+
+    fn router_knowing(agent: &iroh::EndpointId) -> Arc<Router> {
+        let tenant = crate::config::TenantEntry {
+            id: hex::encode([1u8; 32]),
+            pq_public_key: String::new(),
+            name: "t".to_string(),
+            hostnames: vec!["a.test".to_string()],
+            agent_node_ids: vec![hex::encode(agent.as_bytes())],
+            direct_addresses: Vec::new(),
+        };
+        Arc::new(Router::load_from_config(&[tenant]).unwrap())
+    }
+
+    async fn wait_until(mut done: impl FnMut() -> bool) {
+        tokio::time::timeout(TLS_TEST_WAIT, async {
+            while !done() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_unknown_agent_over_tls_is_rejected_and_counted() {
+        let key = iroh::SecretKey::generate();
+        let (agent, edge) = tls_pair(&key).await;
+        let sessions = Arc::new(SessionRegistry::new(EdgeMetrics::new(), 10));
+        let metrics = EdgeMetrics::new();
+        let router = Arc::new(Router::load_from_config(&[]).unwrap());
+
+        serve_agent_conn(
+            TunnelConn::Tls(edge),
+            Arc::clone(&sessions),
+            router,
+            metrics.clone(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(sessions.get(&key.public()).is_none());
+        assert_eq!(
+            metrics
+                .sessions_rejected_total
+                .with_label_values(&[session_reject_reason::UNKNOWN_AGENT])
+                .get(),
+            1
+        );
+        tokio::time::timeout(TLS_TEST_WAIT, agent.closed())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_known_agent_over_tls_registers_and_leaves_when_it_closes() {
+        let key = iroh::SecretKey::generate();
+        let id = key.public();
+        let (agent, edge) = tls_pair(&key).await;
+        let sessions = Arc::new(SessionRegistry::new(EdgeMetrics::new(), 10));
+        let served = tokio::spawn(serve_agent_conn(
+            TunnelConn::Tls(edge),
+            Arc::clone(&sessions),
+            router_knowing(&id),
+            EdgeMetrics::new(),
+            None,
+        ));
+
+        wait_until(|| sessions.get(&id).is_some()).await;
+        assert!(sessions.get(&id).unwrap().is_tls());
+
+        agent.close(0, b"bye");
+        wait_until(|| sessions.get(&id).is_none()).await;
+        tokio::time::timeout(TLS_TEST_WAIT, served)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn one_source_cannot_exhaust_the_tls_handshakes() {
+        use tokio::io::AsyncReadExt;
+
+        let key = iroh::SecretKey::generate();
+        let id = key.public();
+        let edge = TlsIdentity::new(&iroh::SecretKey::generate()).unwrap();
+        let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = socket.local_addr().unwrap();
+        let sessions = Arc::new(SessionRegistry::new(EdgeMetrics::new(), 10));
+        let shutdown = CancellationToken::new();
+        let accept_loop = tokio::spawn(tls_accept_loop(
+            socket,
+            TlsListener::new(&edge).unwrap(),
+            Arc::clone(&sessions),
+            router_knowing(&id),
+            EdgeMetrics::new(),
+            None,
+            Arc::new(tokio::sync::Semaphore::new(8)),
+            shutdown.clone(),
+        ));
+
+        let mut stalled = Vec::new();
+        for _ in 0..TLS_HANDSHAKES_PER_SOURCE {
+            stalled.push(TcpStream::connect(addr).await.unwrap());
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // One past the cap is dropped at once instead of waiting out the handshake.
+        let mut extra = TcpStream::connect(addr).await.unwrap();
+        let mut byte = [0u8; 1];
+        drop(
+            tokio::time::timeout(TLS_TEST_WAIT, extra.read(&mut byte))
+                .await
+                .unwrap(),
+        );
+
+        // Once the stalled ones go, the same source can handshake again.
+        drop(stalled);
+        let agent = loop {
+            let tcp = TcpStream::connect(addr).await.unwrap();
+            if let Ok(conn) = TlsDialer::new(TlsIdentity::new(&key).unwrap())
+                .connect(tcp, edge.id())
+                .await
+            {
+                break conn;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        wait_until(|| sessions.get(&id).is_some()).await;
+
+        shutdown.cancel();
+        tokio::time::timeout(TLS_TEST_WAIT, accept_loop)
+            .await
+            .unwrap()
+            .unwrap();
+        drop(agent);
+    }
+
+    #[tokio::test]
+    async fn a_stalled_tls_handshake_holds_no_agent_permit() {
+        let key = iroh::SecretKey::generate();
+        let id = key.public();
+        let edge = TlsIdentity::new(&iroh::SecretKey::generate()).unwrap();
+        let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = socket.local_addr().unwrap();
+        let sessions = Arc::new(SessionRegistry::new(EdgeMetrics::new(), 10));
+        let agent_permits = Arc::new(tokio::sync::Semaphore::new(1));
+        let shutdown = CancellationToken::new();
+        let accept_loop = tokio::spawn(tls_accept_loop(
+            socket,
+            TlsListener::new(&edge).unwrap(),
+            Arc::clone(&sessions),
+            router_knowing(&id),
+            EdgeMetrics::new(),
+            None,
+            Arc::clone(&agent_permits),
+            shutdown.clone(),
+        ));
+
+        // Connects and never speaks TLS.
+        let _stalled = TcpStream::connect(addr).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(agent_permits.available_permits(), 1);
+
+        let tcp = TcpStream::connect(addr).await.unwrap();
+        let agent = TlsDialer::new(TlsIdentity::new(&key).unwrap())
+            .connect(tcp, edge.id())
+            .await
+            .unwrap();
+        wait_until(|| sessions.get(&id).is_some()).await;
+        assert_eq!(agent_permits.available_permits(), 0);
+
+        shutdown.cancel();
+        tokio::time::timeout(TLS_TEST_WAIT, accept_loop)
+            .await
+            .unwrap()
+            .unwrap();
+        drop(agent);
+    }
+
+    #[tokio::test]
+    async fn shutdown_closes_tls_sessions() {
+        let key = iroh::SecretKey::generate();
+        let id = key.public();
+        let (agent, edge) = tls_pair(&key).await;
+        let sessions = Arc::new(SessionRegistry::new(EdgeMetrics::new(), 10));
+        sessions.register(&Arc::new(AgentSession::new(id, TunnelConn::Tls(edge))));
+
+        sessions.close_tls(0, b"edge shutting down");
+
+        let reason = tokio::time::timeout(TLS_TEST_WAIT, agent.closed())
+            .await
+            .unwrap();
+        assert!(reason.to_string().contains("closed by peer"));
+    }
+
+    #[tokio::test]
+    async fn udp_is_never_routed_over_a_tls_session() {
+        let key = iroh::SecretKey::generate();
+        let id = key.public();
+        let (_agent, edge) = tls_pair(&key).await;
+        let sessions = Arc::new(SessionRegistry::new(EdgeMetrics::new(), 10));
+        sessions.register(&Arc::new(AgentSession::new(id, TunnelConn::Tls(edge))));
+        let ctx = ConnCtx {
+            router: router_knowing(&id),
+            sessions,
+            metrics: EdgeMetrics::new(),
+            proxy_protocol: Arc::default(),
+            hub_client: None,
+            connection_permits: Arc::new(tokio::sync::Semaphore::new(1)),
+        };
+
+        let mut for_udp: self::router::Candidates = smallvec::smallvec![EndpointAddr::new(id)];
+        retain_carriers(&ctx, Payload::Datagrams, &mut for_udp);
+        assert!(for_udp.is_empty());
+
+        let mut for_tcp: self::router::Candidates = smallvec::smallvec![EndpointAddr::new(id)];
+        retain_carriers(&ctx, Payload::Stream, &mut for_tcp);
+        assert_eq!(for_tcp.len(), 1);
+
+        let mut unconnected: self::router::Candidates =
+            smallvec::smallvec![EndpointAddr::new(iroh::SecretKey::generate().public())];
+        retain_carriers(&ctx, Payload::Datagrams, &mut unconnected);
+        assert_eq!(
+            unconnected.len(),
+            1,
+            "an agent with no session is left to the open path"
+        );
+    }
 
     #[test]
     fn clamp_to_fd_limit_leaves_headroom_under_a_low_rlimit() {

@@ -126,6 +126,10 @@ impl EdgeLinkServer {
     clippy::too_many_arguments,
     reason = "private per-connection entry point; bundling these into a struct would obscure ownership of the half-streams"
 )]
+#[expect(
+    clippy::too_many_lines,
+    reason = "linear handshake: Hello, PSK check, Welcome, then the read loop"
+)]
 async fn handle_connection(
     stream: TcpStream,
     peer: SocketAddr,
@@ -146,8 +150,15 @@ async fn handle_connection(
         Err(_) => anyhow::bail!("hello timed out"),
     };
 
-    let (edge_id, iroh_endpoints, software_version, capabilities, public_ips, region) = match hello
-    {
+    let (
+        edge_id,
+        iroh_endpoints,
+        software_version,
+        capabilities,
+        public_ips,
+        region,
+        tls_endpoints,
+    ) = match hello {
         EdgeToHub::Hello {
             edge_id,
             iroh_endpoints,
@@ -156,6 +167,7 @@ async fn handle_connection(
             capabilities,
             public_ips,
             region,
+            tls_endpoints,
         } => {
             if expected_psk.ct_eq(&psk).into() {
                 (
@@ -165,6 +177,7 @@ async fn handle_connection(
                     capabilities,
                     public_ips,
                     region,
+                    tls_endpoints,
                 )
             } else {
                 anyhow::bail!("Hello PSK mismatch");
@@ -206,6 +219,7 @@ async fn handle_connection(
         capabilities,
         public_ips,
         region,
+        tls_endpoints,
         now_ms(),
     );
     let source = SourceKey::Remote(edge_id, generation);
@@ -510,6 +524,7 @@ mod tests {
                 capabilities: EdgeCapabilities::default(),
                 public_ips: vec!["127.0.0.1".into()],
                 region: None,
+                tls_endpoints: vec![],
             },
         )
         .await

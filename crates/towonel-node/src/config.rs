@@ -293,6 +293,9 @@ pub struct EdgeConfig {
     /// Optional plain-HTTP listener (Host-header routing, ACME HTTP-01).
     /// Unset means no HTTP listener.
     pub http_listen_addr: Option<String>,
+    /// Optional TLS-over-TCP tunnel listener, the fallback for agents that
+    /// cannot reach the QUIC port. Unset means agents can only use QUIC.
+    pub tls_listen_addr: Option<String>,
     pub health_listen_addr: String,
     pub hub_link_addr: Option<String>,
     pub hub_link_psk: Option<std::sync::Arc<[u8; 32]>>,
@@ -471,6 +474,7 @@ struct RawEnv {
     edge_enabled: Option<bool>,
     edge_listen_addr: Option<String>,
     edge_http_listen_addr: Option<String>,
+    edge_tls_listen_addr: Option<String>,
     edge_health_listen_addr: Option<String>,
     edge_hub_link_addr: Option<String>,
     edge_hub_link_psk: Option<String>,
@@ -558,6 +562,7 @@ impl NodeConfig {
             edge_enabled,
             edge_listen_addr,
             edge_http_listen_addr,
+            edge_tls_listen_addr,
             edge_health_listen_addr,
             edge_hub_link_addr,
             edge_hub_link_psk,
@@ -695,6 +700,9 @@ impl NodeConfig {
         if let Some(addr) = edge_http_listen_addr.as_deref() {
             validate_socket_addr("TOWONEL_EDGE_HTTP_LISTEN_ADDR", addr)?;
         }
+        if let Some(addr) = edge_tls_listen_addr.as_deref() {
+            validate_socket_addr("TOWONEL_EDGE_TLS_LISTEN_ADDR", addr)?;
+        }
         validate_socket_addr("TOWONEL_EDGE_HEALTH_LISTEN_ADDR", &edge_health_listen_addr)?;
         let max_connections_per_tenant = edge_max_connections_per_tenant.unwrap_or(1_000);
         if max_connections_per_tenant == 0 {
@@ -706,6 +714,7 @@ impl NodeConfig {
             enabled: edge_enabled.unwrap_or(true),
             listen_addr: edge_listen_addr,
             http_listen_addr: edge_http_listen_addr,
+            tls_listen_addr: edge_tls_listen_addr,
             health_listen_addr: edge_health_listen_addr,
             hub_link_addr: edge_hub_link_addr,
             hub_link_psk: edge_hub_link_psk,
@@ -1571,6 +1580,41 @@ mod tests {
         })
         .unwrap();
         assert_eq!(cfg.edge.http_listen_addr.as_deref(), Some("[::]:80"));
+    }
+
+    #[test]
+    fn edge_tls_listen_addr_defaults_to_disabled() {
+        let cfg = NodeConfig::from_raw(RawEnv {
+            identity_key_path: Some(PathBuf::from("/legacy/node.key")),
+            ..base_raw_env(&"66".repeat(32))
+        })
+        .unwrap();
+        assert_eq!(cfg.edge.tls_listen_addr, None);
+    }
+
+    #[test]
+    fn edge_tls_listen_addr_accepts_valid_socket_addr() {
+        let cfg = NodeConfig::from_raw(RawEnv {
+            identity_key_path: Some(PathBuf::from("/legacy/node.key")),
+            edge_tls_listen_addr: Some("[::]:51821".into()),
+            ..base_raw_env(&"66".repeat(32))
+        })
+        .unwrap();
+        assert_eq!(cfg.edge.tls_listen_addr.as_deref(), Some("[::]:51821"));
+    }
+
+    #[test]
+    fn edge_tls_listen_addr_rejects_invalid_value() {
+        let err = NodeConfig::from_raw(RawEnv {
+            identity_key_path: Some(PathBuf::from("/legacy/node.key")),
+            edge_tls_listen_addr: Some("not-an-addr".into()),
+            ..base_raw_env(&"66".repeat(32))
+        })
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("TOWONEL_EDGE_TLS_LISTEN_ADDR"),
+            "got: {err}"
+        );
     }
 
     #[test]

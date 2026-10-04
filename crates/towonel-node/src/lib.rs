@@ -839,12 +839,15 @@ async fn run_node() -> anyhow::Result<()> {
 
             let (public_addresses, edge_iroh_addresses, edge_public_ips) =
                 edge_advertised_addresses(&config.edge, &bound_socket_strings, iroh_port);
+            let edge_tls_addresses =
+                edge_tls_endpoints(config.edge.tls_listen_addr.as_deref(), &public_addresses);
 
             let identity = HubIdentity {
                 node_id,
                 edge_node_id: Some(edge_node_id),
                 edge_addresses: public_addresses.clone(),
                 edge_iroh_addresses,
+                edge_tls_addresses,
                 edge_public_ips,
                 edge_region: Some(config.edge.region.clone()),
                 relay_url: std::env::var("TOWONEL_HUB_RELAY_URL")
@@ -888,6 +891,7 @@ async fn run_node() -> anyhow::Result<()> {
                 edge_node_id: None,
                 edge_addresses: Vec::new(),
                 edge_iroh_addresses: Vec::new(),
+                edge_tls_addresses: Vec::new(),
                 edge_public_ips: Vec::new(),
                 edge_region: None,
                 relay_url: std::env::var("TOWONEL_HUB_RELAY_URL")
@@ -924,8 +928,10 @@ async fn run_node() -> anyhow::Result<()> {
                 );
             };
             let handle = edge::hub_link::HubLinkHandle::new(64).with_sessions(edge.sessions());
-            let (_public_addresses, iroh_endpoints, public_ips) =
+            let (public_addresses, iroh_endpoints, public_ips) =
                 edge_advertised_addresses(&config.edge, &bound_socket_strings, iroh_port);
+            let tls_endpoints =
+                edge_tls_endpoints(config.edge.tls_listen_addr.as_deref(), &public_addresses);
             let cfg = edge::hub_link::HubLinkConfig {
                 addr: link_addr,
                 psk: link_psk,
@@ -938,6 +944,7 @@ async fn run_node() -> anyhow::Result<()> {
                 },
                 public_ips,
                 region: config.edge.region.clone(),
+                tls_endpoints,
             };
             let hub_client: Arc<dyn edge::hub_client::HubClient> =
                 Arc::new(edge::hub_client::RemoteHubClient::new(handle.clone()));
@@ -1125,6 +1132,14 @@ async fn build_edge(
     edge_config: &config::EdgeConfig,
 ) -> anyhow::Result<BuiltEdge> {
     let port = edge_config.iroh_port;
+    let tunnel_tls = match edge_config.tls_listen_addr.clone() {
+        Some(addr) => {
+            let identity = towonel_common::transport::tls::TlsIdentity::new(&secret_key)?;
+            let listener = towonel_common::transport::tls::TlsListener::new(&identity)?;
+            Some((listener, addr))
+        }
+        None => None,
+    };
     // clear_ip_transports drops the default unspecified binds so we
     // don't end up with three sockets after our two explicit binds.
     let ep = Endpoint::builder(Minimal)
@@ -1166,6 +1181,7 @@ async fn build_edge(
     )
     .with_listen_workers(edge_config.listen_workers)
     .with_http_listen_addr(edge_config.http_listen_addr.clone())
+    .with_tunnel_tls(tunnel_tls)
     .with_proxy_protocol(edge_config.proxy_protocol.clone())
     .with_tcp_services(edge_config.tcp_services)
     .with_udp_services(edge_config.udp_services);
@@ -1195,8 +1211,7 @@ fn edge_advertised_addresses(
     } else {
         edge_cfg.public_addresses.clone()
     };
-    let iroh_addresses =
-        derive_edge_iroh_addresses(&public_addresses, iroh_port, bound_socket_strings);
+    let iroh_addresses = derive_edge_addresses(&public_addresses, iroh_port, bound_socket_strings);
     let public_ips = if edge_cfg.public_ips.is_empty() {
         extract_hosts_from_addresses(&public_addresses)
     } else {
@@ -1205,10 +1220,30 @@ fn edge_advertised_addresses(
     (public_addresses, iroh_addresses, public_ips)
 }
 
+/// `host:port` entries agents can dial for the TLS tunnel listener: the
+/// advertised hosts with the listener's port. Empty when no listener is set.
+fn edge_tls_endpoints(tls_listen_addr: Option<&str>, public_addresses: &[String]) -> Vec<String> {
+    let Some(listen) = tls_listen_addr else {
+        return Vec::new();
+    };
+    let Ok(addr) = listen.parse::<std::net::SocketAddr>() else {
+        return Vec::new();
+    };
+    let endpoints = derive_edge_addresses(public_addresses, addr.port(), &[listen.to_string()]);
+    if endpoints.is_empty() {
+        warn!(
+            listen = %listen,
+            "TOWONEL_EDGE_TLS_LISTEN_ADDR is a wildcard and no public address is set; \
+             agents cannot discover the TLS listener. Set TOWONEL_EDGE_ADVERTISED_ADDRESSES."
+        );
+    }
+    endpoints
+}
+
 /// hostnames are advertised.
-fn derive_edge_iroh_addresses(
+fn derive_edge_addresses(
     public_addresses: &[String],
-    iroh_port: u16,
+    port: u16,
     bound_socket_strings: &[String],
 ) -> Vec<String> {
     let derived: Vec<String> = public_addresses
@@ -1220,9 +1255,9 @@ fn derive_edge_iroh_addresses(
             }
             // A bare IPv6 literal must be bracketed before appending a port.
             if !host.starts_with('[') && host.parse::<std::net::Ipv6Addr>().is_ok() {
-                Some(format!("[{host}]:{iroh_port}"))
+                Some(format!("[{host}]:{port}"))
             } else {
-                Some(format!("{host}:{iroh_port}"))
+                Some(format!("{host}:{port}"))
             }
         })
         .collect();
@@ -1271,17 +1306,43 @@ fn split_host(entry: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
-    use super::{derive_edge_iroh_addresses, extract_hosts_from_addresses};
+    use super::{derive_edge_addresses, edge_tls_endpoints, extract_hosts_from_addresses};
+
+    #[test]
+    fn tls_endpoints_swap_in_the_listener_port() {
+        let got = edge_tls_endpoints(
+            Some("0.0.0.0:51821"),
+            &[
+                "edge.example:443".to_string(),
+                "[2001:db8::1]:443".to_string(),
+            ],
+        );
+        assert_eq!(got, ["edge.example:51821", "[2001:db8::1]:51821"]);
+    }
+
+    #[test]
+    fn no_tls_listener_advertises_nothing() {
+        assert!(edge_tls_endpoints(None, &["edge.example:443".to_string()]).is_empty());
+    }
+
+    #[test]
+    fn tls_listener_alone_is_advertised_only_when_routable() {
+        assert_eq!(
+            edge_tls_endpoints(Some("203.0.113.5:51821"), &[]),
+            ["203.0.113.5:51821"]
+        );
+        assert!(edge_tls_endpoints(Some("0.0.0.0:51821"), &[]).is_empty());
+    }
 
     #[test]
     fn bracketed_ipv6_keeps_host_and_swaps_port() {
-        let got = derive_edge_iroh_addresses(&["[2001:db8::1]:443".to_string()], 51820, &[]);
+        let got = derive_edge_addresses(&["[2001:db8::1]:443".to_string()], 51820, &[]);
         assert_eq!(got, vec!["[2001:db8::1]:51820"]);
     }
 
     #[test]
     fn bare_ipv6_is_not_mangled_and_gets_bracketed() {
-        let got = derive_edge_iroh_addresses(&["2001:db8::1".to_string()], 51820, &[]);
+        let got = derive_edge_addresses(&["2001:db8::1".to_string()], 51820, &[]);
         assert_eq!(got, vec!["[2001:db8::1]:51820"]);
 
         let hosts = extract_hosts_from_addresses(&[
@@ -1294,7 +1355,7 @@ mod tests {
 
     #[test]
     fn derives_from_advertised_hostnames() {
-        let got = derive_edge_iroh_addresses(
+        let got = derive_edge_addresses(
             &["tunnel.example.com:443".to_string()],
             51820,
             &["0.0.0.0:51820".to_string()],
@@ -1304,7 +1365,7 @@ mod tests {
 
     #[test]
     fn derives_per_advertised_entry() {
-        let got = derive_edge_iroh_addresses(
+        let got = derive_edge_addresses(
             &[
                 "a.example.com:443".to_string(),
                 "b.example.com:443".to_string(),
@@ -1317,7 +1378,7 @@ mod tests {
 
     #[test]
     fn falls_back_to_routable_bound_sockets() {
-        let got = derive_edge_iroh_addresses(
+        let got = derive_edge_addresses(
             &[],
             51820,
             &[
@@ -1331,7 +1392,7 @@ mod tests {
 
     #[test]
     fn empty_when_no_routable_addresses() {
-        let got = derive_edge_iroh_addresses(
+        let got = derive_edge_addresses(
             &[],
             51820,
             &["0.0.0.0:51820".to_string(), "127.0.0.1:51820".to_string()],

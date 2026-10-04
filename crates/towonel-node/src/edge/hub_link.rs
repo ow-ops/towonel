@@ -54,6 +54,7 @@ pub struct HubLinkConfig {
     pub capabilities: EdgeCapabilities,
     pub public_ips: Vec<String>,
     pub region: String,
+    pub tls_endpoints: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -332,6 +333,7 @@ where
         capabilities: cfg.capabilities.clone(),
         public_ips: cfg.public_ips.clone(),
         region: Some(cfg.region.clone()),
+        tls_endpoints: cfg.tls_endpoints.clone(),
     };
     write_edge_to_hub(writer, &hello)
         .await

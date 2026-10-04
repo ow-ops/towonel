@@ -43,6 +43,7 @@ struct ActiveSupervisor {
     /// Addresses this supervisor was spawned with; a change for the same edge
     /// triggers a respawn.
     addrs: Vec<String>,
+    tls_addrs: Vec<String>,
 }
 
 /// Per-edge supervisors reconciled against the hub's trusted-edge set. Each owns
@@ -88,10 +89,8 @@ impl SupervisorPool {
         // so the `tasks` set doesn't accumulate finished handles.
         while self.tasks.try_join_next().is_some() {}
 
-        let desired: std::collections::HashMap<iroh::EndpointId, &[String]> = contacts
-            .iter()
-            .map(|c| (c.id, c.addrs.as_slice()))
-            .collect();
+        let desired: std::collections::HashMap<iroh::EndpointId, &EdgeContact> =
+            contacts.iter().map(|c| (c.id, c)).collect();
 
         // Stop supervisors whose edge left the set, or whose advertised
         // addresses changed — the spawn loop below then redials the new ones.
@@ -102,8 +101,11 @@ impl SupervisorPool {
                 // Set comparison: hub snapshots aren't canonically ordered, so
                 // a reordered-but-equal address list must not respawn a healthy
                 // supervisor.
-                let keep =
-                    matches!(desired.get(id), Some(addrs) if same_addr_set(addrs, &sup.addrs));
+                let keep = matches!(
+                    desired.get(id),
+                    Some(c) if same_addr_set(&c.addrs, &sup.addrs)
+                        && same_addr_set(&c.tls_addrs, &sup.tls_addrs)
+                );
                 (!keep).then_some(*id)
             })
             .collect();
@@ -118,7 +120,10 @@ impl SupervisorPool {
             if self.active.contains_key(&contact.id) {
                 continue;
             }
-            if contact.addrs.is_empty() && self.relay_urls.is_empty() {
+            if contact.addrs.is_empty()
+                && contact.tls_addrs.is_empty()
+                && self.relay_urls.is_empty()
+            {
                 warn!(
                     edge = %contact.id.fmt_short(),
                     "skipping edge with no advertised socket addresses and no relay configured"
@@ -142,6 +147,7 @@ impl SupervisorPool {
                 ActiveSupervisor {
                     token,
                     addrs: contact.addrs.clone(),
+                    tls_addrs: contact.tls_addrs.clone(),
                 },
             );
         }
@@ -523,6 +529,7 @@ mod tests {
                 .iter()
                 .map(ToString::to_string)
                 .collect(),
+            tls_addrs: Vec::new(),
         }]);
         (edge, agent, origin, metrics, pool)
     }

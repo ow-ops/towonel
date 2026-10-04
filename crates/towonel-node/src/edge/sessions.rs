@@ -28,6 +28,10 @@ impl AgentSession {
         self.conn.close(code, reason);
     }
 
+    pub const fn is_tls(&self) -> bool {
+        matches!(self.conn, TunnelConn::Tls(_))
+    }
+
     pub fn conn_stable_id(&self) -> usize {
         self.conn.stable_id()
     }
@@ -213,6 +217,16 @@ impl SessionRegistry {
     #[must_use]
     pub fn get(&self, agent_id: &EndpointId) -> Option<Arc<AgentSession>> {
         self.by_id.pin().get(agent_id).cloned()
+    }
+
+    /// Closes every TLS session. `endpoint.close()` ends the QUIC ones at
+    /// shutdown but knows nothing of these.
+    pub fn close_tls(&self, code: u32, reason: &[u8]) {
+        for (_, session) in &self.by_id.pin() {
+            if session.is_tls() {
+                session.close(code, reason);
+            }
+        }
     }
 
     /// Pairs each registered agent with its verified tenant; agents whose

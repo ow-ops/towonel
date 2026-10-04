@@ -36,13 +36,24 @@ pub(super) struct BootstrapRequest {
 pub(super) struct IrohEndpoint {
     node_id: iroh::EndpointId,
     addresses: Vec<String>,
+    /// `host:port` of the edge's TLS tunnel listener, for agents that cannot
+    /// use QUIC. Omitted when the edge has none, so older agents see no change.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    tls_addresses: Vec<String>,
 }
 
 /// An edge under consideration at bootstrap, before the region filter.
 struct EdgeCandidate {
     node_id: iroh::EndpointId,
     addresses: Vec<String>,
+    tls_addresses: Vec<String>,
     region: Option<String>,
+}
+
+impl EdgeCandidate {
+    const fn is_dialable(&self) -> bool {
+        !self.addresses.is_empty() || !self.tls_addresses.is_empty()
+    }
 }
 
 /// Colocated edge first, then port-capable edges, then portless edges as
@@ -76,6 +87,7 @@ fn select_edge_candidates(
         let candidate = EdgeCandidate {
             node_id,
             addresses,
+            tls_addresses: Vec::new(),
             region,
         };
         if (needs_tcp && !capabilities.tcp_services) || (needs_udp && !capabilities.udp_services) {
@@ -201,10 +213,16 @@ pub(super) async fn post_bootstrap(
     let colocated = state.identity.edge_node_id.map(|node_id| EdgeCandidate {
         node_id,
         addresses: state.identity.edge_iroh_addresses.clone(),
+        tls_addresses: state.identity.edge_tls_addresses.clone(),
         region: state.identity.edge_region.clone(),
     });
-    let candidates =
+    let mut candidates =
         select_edge_candidates(colocated, state.live_edges.snapshot(), needs_tcp, needs_udp);
+    for candidate in &mut candidates {
+        if candidate.tls_addresses.is_empty() {
+            candidate.tls_addresses = state.live_edges.tls_endpoints(candidate.node_id.as_bytes());
+        }
+    }
 
     // Keep only edges in the invite's allowed regions. If that leaves nothing
     // dialable, fall back to every candidate so the agent is never stranded.
@@ -218,7 +236,7 @@ pub(super) async fn post_bootstrap(
     };
     let any_dialable_in_region = candidates
         .iter()
-        .any(|c| region_rank(c).is_some() && !c.addresses.is_empty());
+        .any(|c| region_rank(c).is_some() && c.is_dialable());
     if !any_dialable_in_region {
         warn!(
             tenant = %invite.tenant_id,
@@ -233,16 +251,17 @@ pub(super) async fn post_bootstrap(
         .iter()
         .filter(|c| !any_dialable_in_region || region_rank(c).is_some())
         .collect();
-    ordered.sort_by_key(|c| (region_rank(c).unwrap_or(usize::MAX), c.addresses.is_empty()));
+    ordered.sort_by_key(|c| (region_rank(c).unwrap_or(usize::MAX), !c.is_dialable()));
 
     let mut trusted_edges: Vec<iroh::EndpointId> = Vec::new();
     let mut iroh_endpoints: Vec<IrohEndpoint> = Vec::new();
     for c in ordered {
         trusted_edges.push(c.node_id);
-        if !c.addresses.is_empty() {
+        if c.is_dialable() {
             iroh_endpoints.push(IrohEndpoint {
                 node_id: c.node_id,
                 addresses: c.addresses.clone(),
+                tls_addresses: c.tls_addresses.clone(),
             });
         }
     }
@@ -363,6 +382,7 @@ mod tests {
         let colocated = EdgeCandidate {
             node_id: endpoint_id(1),
             addresses: vec![],
+            tls_addresses: vec![],
             region: None,
         };
         // Same id appears again in the live set: must not be duplicated.

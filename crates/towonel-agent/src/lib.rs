@@ -342,7 +342,12 @@ async fn try_bring_up(
         .map(|url| towonel_common::relay::relay_urls_from_str(url, relay_source))
         .unwrap_or_default();
 
-    if relay_urls.is_empty() && ctx.edge_contacts.iter().all(|c| c.addrs.is_empty()) {
+    if relay_urls.is_empty()
+        && ctx
+            .edge_contacts
+            .iter()
+            .all(|c| c.addrs.is_empty() && c.tls_addrs.is_empty())
+    {
         warn!(
             "no edge advertised an iroh address and no relay is configured; waiting for \
              an edge to come online. Set TOWONEL_EDGE_IROH_PORT on the hub so it can \

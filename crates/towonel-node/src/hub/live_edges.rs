@@ -23,6 +23,8 @@ pub struct LiveEdge {
     pub public_ips: Vec<String>,
     /// Region this edge serves. `None` from a pre-v5 edge.
     pub region: Option<String>,
+    /// `host:port` of its TLS tunnel listener; empty from an edge without one.
+    pub tls_endpoints: Vec<String>,
     #[expect(dead_code, reason = "janitor sweep lands with the durable store")]
     pub last_seen_ms: u64,
 }
@@ -40,6 +42,10 @@ impl LiveEdges {
     }
 
     /// Returns the link generation for conditional cleanup.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one argument per advertised Hello field; a struct would only rename them"
+    )]
     pub fn upsert(
         &self,
         id: EdgeId,
@@ -47,6 +53,7 @@ impl LiveEdges {
         capabilities: EdgeCapabilities,
         public_ips: Vec<String>,
         region: Option<String>,
+        tls_endpoints: Vec<String>,
         now_ms: u64,
     ) -> u64 {
         let mut guard = self
@@ -62,6 +69,7 @@ impl LiveEdges {
                 capabilities,
                 public_ips,
                 region,
+                tls_endpoints,
                 last_seen_ms: now_ms,
             },
         );
@@ -79,6 +87,17 @@ impl LiveEdges {
         {
             guard.remove(id);
         }
+    }
+
+    pub fn tls_endpoints(&self, id: &EdgeId) -> Vec<String> {
+        let guard = self
+            .inner
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard
+            .get(id)
+            .map(|edge| edge.tls_endpoints.clone())
+            .unwrap_or_default()
     }
 
     pub fn snapshot(&self) -> Vec<EdgeSnapshot> {
@@ -123,6 +142,7 @@ mod tests {
             EdgeCapabilities::default(),
             vec!["1.2.3.4".into()],
             Some("EU".into()),
+            vec![],
             100,
         );
         live.upsert(
@@ -131,6 +151,7 @@ mod tests {
             EdgeCapabilities::default(),
             vec!["5.6.7.8".into()],
             Some("CA".into()),
+            vec![],
             200,
         );
         let mut snap = live.snapshot();
@@ -138,6 +159,23 @@ mod tests {
         assert_eq!(snap.len(), 2);
         assert_eq!(snap[0].0, [1u8; 32]);
         assert_eq!(snap[1].0, [2u8; 32]);
+    }
+
+    #[test]
+    fn tls_endpoints_follow_the_live_entry() {
+        let live = LiveEdges::new();
+        let id = [9u8; 32];
+        assert!(live.tls_endpoints(&id).is_empty());
+        live.upsert(
+            id,
+            vec![],
+            EdgeCapabilities::default(),
+            vec![],
+            None,
+            vec!["edge.example:51821".into()],
+            1,
+        );
+        assert_eq!(live.tls_endpoints(&id), ["edge.example:51821"]);
     }
 
     #[test]
@@ -149,6 +187,7 @@ mod tests {
             EdgeCapabilities::default(),
             vec![],
             None,
+            vec![],
             1,
         );
         assert!(!live.is_empty());
@@ -166,6 +205,7 @@ mod tests {
             EdgeCapabilities::default(),
             vec![],
             None,
+            vec![],
             1,
         );
         let new = live.upsert(
@@ -174,6 +214,7 @@ mod tests {
             EdgeCapabilities::default(),
             vec![],
             None,
+            vec![],
             2,
         );
         assert_ne!(old, new);

@@ -856,6 +856,80 @@ async fn bootstrap_iroh_endpoints_only_describe_colocated_edge() {
     assert_eq!(addrs, vec!["127.0.0.1:51820".to_string()]);
 }
 
+async fn bootstrap_edge_entries(hub: &TestHub) -> Vec<serde_json::Value> {
+    let client = reqwest::Client::new();
+    let token = create_invite(hub, &client, "alice", &["a.test"]).await;
+    let (status, body) = post_json(
+        &client,
+        &hub.url("/v1/bootstrap"),
+        json!({
+            "invite_id": B64.encode(token.invite_id),
+            "invite_secret": B64.encode(token.invite_secret),
+        }),
+        None,
+    )
+    .await;
+    assert_eq!(status, 200, "bootstrap: {body}");
+    body["iroh_endpoints"]
+        .as_array()
+        .expect("iroh_endpoints array")
+        .clone()
+}
+
+#[tokio::test]
+async fn bootstrap_reports_a_remote_edges_tls_address() {
+    let hub = TestHub::start().await;
+    let node_id = iroh::SecretKey::from([8u8; 32]).public();
+    hub.state.live_edges.upsert(
+        *node_id.as_bytes(),
+        vec!["9.9.9.9:51820".into()],
+        towonel_common::edge_link::EdgeCapabilities::default(),
+        vec![],
+        Some(towonel_common::DEFAULT_REGION.to_string()),
+        vec!["9.9.9.9:51821".into()],
+        towonel_common::time::now_ms(),
+    );
+
+    let endpoints = bootstrap_edge_entries(&hub).await;
+    let remote = endpoints
+        .iter()
+        .find(|e| e["node_id"] == node_id.to_string())
+        .expect("remote edge listed");
+    assert_eq!(remote["addresses"], json!(["9.9.9.9:51820"]));
+    assert_eq!(remote["tls_addresses"], json!(["9.9.9.9:51821"]));
+    let colocated = endpoints
+        .iter()
+        .find(|e| e["node_id"] != node_id.to_string())
+        .expect("colocated edge listed");
+    assert!(
+        colocated.get("tls_addresses").is_none(),
+        "an edge without a TLS listener adds nothing to the response"
+    );
+}
+
+#[tokio::test]
+async fn a_tls_only_edge_is_still_dialable() {
+    let hub = TestHub::start().await;
+    let node_id = iroh::SecretKey::from([9u8; 32]).public();
+    hub.state.live_edges.upsert(
+        *node_id.as_bytes(),
+        vec![],
+        towonel_common::edge_link::EdgeCapabilities::default(),
+        vec![],
+        Some(towonel_common::DEFAULT_REGION.to_string()),
+        vec!["tls.example:51821".into()],
+        towonel_common::time::now_ms(),
+    );
+
+    let endpoints = bootstrap_edge_entries(&hub).await;
+    let tls_only = endpoints
+        .iter()
+        .find(|e| e["node_id"] == node_id.to_string())
+        .expect("a TLS-only edge must not be dropped");
+    assert_eq!(tls_only["addresses"], json!([]));
+    assert_eq!(tls_only["tls_addresses"], json!(["tls.example:51821"]));
+}
+
 /// Create an invite with an explicit region + failover regions.
 async fn create_invite_with_region(
     hub: &TestHub,
@@ -892,6 +966,7 @@ fn inject_edge(hub: &TestHub, seed: u8, addr: &str, region: &str) -> String {
         towonel_common::edge_link::EdgeCapabilities::default(),
         vec![],
         Some(region.to_string()),
+        vec![],
         towonel_common::time::now_ms(),
     );
     node_id.to_string()
@@ -914,6 +989,7 @@ fn inject_edge_with_ips(
         towonel_common::edge_link::EdgeCapabilities::default(),
         public_ips.iter().map(|s| (*s).to_string()).collect(),
         Some(region.to_string()),
+        vec![],
         towonel_common::time::now_ms(),
     );
     node_id.to_string()
@@ -1153,6 +1229,7 @@ async fn bootstrap_in_region_but_undialable_falls_back() {
         towonel_common::edge_link::EdgeCapabilities::default(),
         vec![],
         Some("CA".to_string()),
+        vec![],
         towonel_common::time::now_ms(),
     );
 
