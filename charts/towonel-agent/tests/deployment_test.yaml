@@ -17,7 +17,7 @@ tests:
     asserts:
       - equal:
           path: spec.template.spec.containers[0].image
-          value: codeberg.org/towonel/towonel-agent:0.0.0
+          value: git.ow-ops.eu/towonel/towonel-agent:0.0.0
 
   - it: pins the image by digest when set
     set:
@@ -28,7 +28,7 @@ tests:
     asserts:
       - equal:
           path: spec.template.spec.containers[0].image
-          value: codeberg.org/towonel/towonel-agent:0.0.0@sha256:abc123
+          value: git.ow-ops.eu/towonel/towonel-agent:0.0.0@sha256:abc123
 
   - it: runs two replicas and rolls on upgrade
     documentSelector:

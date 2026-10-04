@@ -27,7 +27,7 @@ tests:
     asserts:
       - equal:
           path: spec.template.spec.containers[0].image
-          value: codeberg.org/towonel/towonel-node:0.0.0@sha256:abc123
+          value: git.ow-ops.eu/towonel/towonel-node:0.0.0@sha256:abc123
 
   - it: enables the hub role and its listeners
     documentSelector:
