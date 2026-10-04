@@ -1,0 +1,13 @@
+# Layered over docker-compose.e2e.yml by `make e2e-tls`: the agent cannot use
+# QUIC, so every session must come up over the TLS fallback.
+services:
+  agent:
+    cap_add:
+      - NET_ADMIN
+    environment:
+      # The entrypoint drops outbound UDP to this port before the agent starts,
+      # so QUIC is blocked from the first dial and DNS keeps working.
+      E2E_BLOCK_UDP_PORT: "51820"
+  test-runner:
+    environment:
+      E2E_EXPECT_TRANSPORT: tls

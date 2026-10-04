@@ -22,6 +22,13 @@ if [ -n "${PEBBLE_URL:-}" ]; then
     update-ca-certificates >/dev/null 2>&1
 fi
 
+# e2e-tls: drop outbound UDP to the edge's QUIC port so the agent has to use the
+# TLS fallback. Only that port, because the container resolver is UDP too.
+if [ -n "${E2E_BLOCK_UDP_PORT:-}" ]; then
+    iptables -A OUTPUT -p udp --dport "$E2E_BLOCK_UDP_PORT" -j DROP
+    ip6tables -A OUTPUT -p udp --dport "$E2E_BLOCK_UDP_PORT" -j DROP || true
+fi
+
 waited=0
 while :; do
     token=$(curl --fail --silent --max-time 2 "$BROKER_URL" 2>/dev/null || true)

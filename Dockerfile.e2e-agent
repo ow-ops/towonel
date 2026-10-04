@@ -18,7 +18,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
 
 FROM debian:bookworm-slim
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl \
+    && apt-get install -y --no-install-recommends ca-certificates curl iptables \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /usr/local/bin/towonel-agent /usr/local/bin/towonel-agent
 COPY tests/e2e/agent-entrypoint.sh /usr/local/bin/entrypoint.sh

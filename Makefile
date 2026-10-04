@@ -1,4 +1,4 @@
-.PHONY: build test lint fmt check docker docker-agent docker-node up down e2e release clean mesh-android mesh-bindings e2e-mesh
+.PHONY: build test lint fmt check docker docker-agent docker-node up down e2e e2e-tls release clean mesh-android mesh-bindings e2e-mesh
 
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 
@@ -34,15 +34,21 @@ down:
 # NB: run detached and `docker wait` on the runner instead of
 # --abort-on-container-exit; the route_recovery case restarts the hub, which
 # would otherwise trip the abort and kill the runner mid-test.
+E2E_FILES ?= -f docker-compose.e2e.yml
+
 e2e:
 	./tests/e2e/fixtures/make-fixtures.sh
-	docker compose --env-file .env.e2e -f docker-compose.e2e.yml down -v
-	docker compose --env-file .env.e2e -f docker-compose.e2e.yml up --build --detach
+	docker compose --env-file .env.e2e $(E2E_FILES) down -v
+	docker compose --env-file .env.e2e $(E2E_FILES) up --build --detach
 	@code=$$(docker wait towonel-e2e-runner); \
-		docker compose --env-file .env.e2e -f docker-compose.e2e.yml logs --no-color test-runner; \
+		docker compose --env-file .env.e2e $(E2E_FILES) logs --no-color test-runner; \
 		echo "test-runner exit code: $$code"; \
-		docker compose --env-file .env.e2e -f docker-compose.e2e.yml down -v; \
+		docker compose --env-file .env.e2e $(E2E_FILES) down -v; \
 		exit $$code
+
+# Same suite with the agent's outbound UDP to the edge's QUIC port dropped, so it runs over TLS.
+e2e-tls:
+	$(MAKE) e2e E2E_FILES="-f docker-compose.e2e.yml -f docker-compose.e2e-tls.yml"
 
 # Mesh with real TUN devices in containers.
 e2e-mesh:

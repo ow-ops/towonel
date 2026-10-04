@@ -43,6 +43,10 @@ async fn main() -> Result<()> {
 
     tokio::time::sleep(Duration::from_millis(500)).await;
 
+    if let Some(url) = ctx.agent_metrics_url.as_deref() {
+        cases::agent_transport::run(url, ctx.expect_transport, Duration::from_secs(60)).await?;
+    }
+
     cases::tcp_passthrough::run(&ctx.edge_host, ctx.origin_tcp_port).await?;
     cases::tls_passthrough::run(
         &ctx.edge_host,
@@ -52,9 +56,16 @@ async fn main() -> Result<()> {
     )
     .await?;
     cases::proxy_v2::run(&ctx.edge_host, ctx.edge_tls_port).await?;
-    cases::udp_echo::run(&ctx.edge_host, ctx.udp_echo_port).await?;
-    cases::udp_range::run(&ctx.edge_host, ctx.udp_range_start, ctx.udp_range_end).await?;
-    cases::udp_reply_source::run(&ctx.edge_vip, ctx.udp_echo_port).await?;
+    match ctx.expect_transport {
+        cases::agent_transport::Expected::Quic => {
+            cases::udp_echo::run(&ctx.edge_host, ctx.udp_echo_port).await?;
+            cases::udp_range::run(&ctx.edge_host, ctx.udp_range_start, ctx.udp_range_end).await?;
+            cases::udp_reply_source::run(&ctx.edge_vip, ctx.udp_echo_port).await?;
+        }
+        cases::agent_transport::Expected::Tls => {
+            cases::udp_refused_over_tls::run(&ctx.edge_host, ctx.udp_echo_port).await?;
+        }
+    }
 
     let docker = bollard::Docker::connect_with_local_defaults()?;
     cases::liveness_drop::run(
@@ -92,6 +103,9 @@ struct Context_ {
     udp_range_end: u16,
     agent_container: String,
     hub_container: String,
+    /// Agent `/metrics`, to check which transport its session is on.
+    agent_metrics_url: Option<String>,
+    expect_transport: cases::agent_transport::Expected,
     liveness_budget: Duration,
     recovery_budget: Duration,
 }
@@ -129,6 +143,10 @@ impl Context_ {
             udp_range_end: port_env("E2E_UDP_RANGE_END", 49162)?,
             agent_container: required("E2E_AGENT_CONTAINER")?,
             hub_container: required("E2E_HUB_CONTAINER")?,
+            agent_metrics_url: std::env::var("E2E_AGENT_METRICS_URL").ok(),
+            expect_transport: cases::agent_transport::Expected::from_env(
+                &std::env::var("E2E_EXPECT_TRANSPORT").unwrap_or_else(|_| "quic".to_string()),
+            )?,
             liveness_budget: Duration::from_secs(liveness_budget_secs),
             recovery_budget: Duration::from_secs(recovery_budget_secs),
         })

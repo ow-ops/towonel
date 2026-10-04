@@ -37,6 +37,7 @@ services:
       TOWONEL_HUB_LISTEN_ADDR: 0.0.0.0:8443
       TOWONEL_EDGE_LISTEN_ADDR: 0.0.0.0:4443
       TOWONEL_EDGE_IROH_PORT: "51820"
+      TOWONEL_EDGE_TLS_LISTEN_ADDR: 0.0.0.0:51821
       TOWONEL_EDGE_ADVERTISED_ADDRESSES: hub-node:4443
       TOWONEL_EDGE_PROXY_PROTOCOL: "true"
       TOWONEL_HUB_PUBLIC_URL: https://hub-node:8443
@@ -147,6 +148,9 @@ services:
       E2E_UDP_RANGE_END: "49162"
       E2E_BROKER_LISTEN: 0.0.0.0:7777
       E2E_AGENT_CONTAINER: towonel-e2e-agent
+      E2E_AGENT_METRICS_URL: http://agent:9090/metrics
+      # `docker-compose.e2e-tls.yml` flips this to `tls`.
+      E2E_EXPECT_TRANSPORT: quic
       E2E_HUB_CONTAINER: towonel-e2e-hub
       E2E_LIVENESS_BUDGET_SECS: "30"
       E2E_RECOVERY_BUDGET_SECS: "60"
@@ -167,6 +171,7 @@ services:
         condition: service_healthy
     environment:
       RUST_LOG: info
+      TOWONEL_AGENT_HEALTH_LISTEN_ADDR: 0.0.0.0:9090
       BROKER_URL: http://test-runner:7777/token
       # Fetch Pebble's issuing CA (management API on :15000) so the agent
       # trusts the hub's TLS cert.
