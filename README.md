@@ -65,6 +65,29 @@ iroh QUIC binds to UDP `51820` by default; override with
 `TOWONEL_EDGE_IROH_PORT` if you need a different port (remember to
 update the `-p` mapping too).
 
+#### Agents on networks that block UDP
+
+QUIC needs UDP. For agents behind a firewall or proxy that only passes
+TCP, set `TOWONEL_EDGE_TLS_LISTEN_ADDR` (for example `0.0.0.0:51821`) and
+open that TCP port; the hub advertises it next to the QUIC endpoint. The
+advertised host comes from `TOWONEL_EDGE_ADVERTISED_ADDRESSES`; with a
+wildcard bind and no advertised address the listener is not published.
+Agents try QUIC first and fall back to TLS 1.3 over TCP when QUIC cannot
+connect, authenticating with the same agent key. While on TLS an agent
+retries QUIC every ten minutes and moves back once it works; the move
+closes the connections in flight on the TLS session.
+
+TLS is a fallback. UDP services are not carried over it, and it has no
+relay or hole punching, so the edge's TCP port must be directly
+reachable. It also loses to QUIC on lossy links: over an emulated 40 ms
+round-trip, 100 Mbit path with four parallel downloads
+(`tests/transport-compare.sh`), QUIC held 8.7–10 MiB/s from 0% to 2%
+loss, while TLS ran 8.8 MiB/s with no loss but 0.7–1.1 MiB/s at 0.5% and
+0.3 MiB/s at 2%. A small stream's latency under load stayed near 40 ms
+on QUIC and was 0.5–3 s on TLS at 0.5–2% loss, because one lost segment
+stalls every stream on the connection. BBR on the sending host (the
+agent, for downloads) may help; it is not measured here.
+
 #### Bundled-Caddy variant
 
 `Dockerfile.hub-caddy` ships the same `towonel` binary alongside Caddy
@@ -558,7 +581,7 @@ identity at startup.
 | `TOWONEL_EDGE_TLS_CERT_DIR`         | `${DATA_DIR}/certs` or `/data/certs`   | Cert/storage directory                                                                                                                                                 |
 | `TOWONEL_EDGE_TLS_ACME_STAGING`     | `false`                                | Use Let's Encrypt staging                                                                                                                                              |
 | `TOWONEL_EDGE_IROH_PORT`            | `51820`                                | UDP port for the iroh QUIC socket. Operators forward this port through the firewall. Binds both `0.0.0.0` and `[::]` — IPv6 stack required          |
-| `TOWONEL_EDGE_TLS_LISTEN_ADDR`      | unset (disabled)                       | TCP bind address (e.g. `[::]:51821`) for the agent tunnel over TLS 1.3, advertised to agents next to the QUIC endpoint. Agents try QUIC first and fall back to this port when QUIC cannot connect. UDP services are not carried over it. Operators forward this port through the firewall |
+| `TOWONEL_EDGE_TLS_LISTEN_ADDR`      | unset (disabled)                       | TCP bind address (e.g. `[::]:51821`) for the agent tunnel over TLS 1.3, advertised to agents next to the QUIC endpoint. Agents try QUIC first and fall back to this port when QUIC cannot connect. UDP services are not carried over it. Open this TCP port in the firewall; it is advertised only with `TOWONEL_EDGE_ADVERTISED_ADDRESSES` or a non-wildcard address |
 | `TOWONEL_EDGE_HUB_LINK_ADDR`        |                                        | `host:port` of the hub's control-link listener. Enables the modern control plane in place of SSE federation (see [Hub↔edge control link](#hubedge-control-link)) |
 | `TOWONEL_EDGE_HUB_LINK_PSK`         |                                        | 32-byte hex PSK shared with the hub                                                                                                                                  |
 | `TOWONEL_EDGE_REGION`               | `EU`                                   | Region this edge serves. The hub hands an agent only the edges whose region matches its invite's region (plus failover regions). See [Multi-region](#multi-region) |
