@@ -7,7 +7,7 @@ use iroh::endpoint::{
     ConnectError, ConnectionError, PathEvent, PathEventStream, TransportErrorCode,
 };
 use iroh::{Endpoint, EndpointAddr, RelayUrl, TransportAddr};
-use tokio::net::lookup_host;
+use tokio::net::{TcpStream, lookup_host};
 use tokio::task::JoinSet;
 use tokio_stream::StreamExt as _;
 use tokio_util::sync::CancellationToken;
@@ -16,6 +16,7 @@ use tracing::{Instrument, debug, error, info, info_span, warn};
 use towonel_common::edge_cred::AuthFrame;
 use towonel_common::protocol::ALPN_TUNNEL;
 use towonel_common::transport::TunnelConn;
+use towonel_common::transport::tls::TlsDialer;
 use towonel_common::tunnel::{CONTROL_STATUS_OK, read_control_status, write_control_prefix};
 
 use crate::metrics::AgentMetrics;
@@ -38,6 +39,48 @@ const IDENTITY_MISMATCH_COOLDOWN: Duration = Duration::from_mins(5);
 /// TLS alert 48, `unknown_ca`: iroh's raw-public-key verifier rejected the peer.
 const TLS_ALERT_UNKNOWN_CA: u8 = 48;
 
+/// After QUIC fails, redials try TLS first for this long, and a TLS session
+/// probes QUIC at this interval. A network that blocks UDP then doesn't pay the
+/// QUIC timeout on every reconnect.
+const QUIC_RETRY_AFTER: Duration = Duration::from_mins(10);
+
+/// When QUIC last failed for an edge that TLS could still reach; outlives
+/// single redials.
+struct TransportMemory {
+    retry_after: Duration,
+    quic_failed_at: std::sync::Mutex<Option<Instant>>,
+}
+
+impl TransportMemory {
+    const fn new(retry_after: Duration) -> Self {
+        Self {
+            retry_after,
+            quic_failed_at: std::sync::Mutex::new(None),
+        }
+    }
+
+    fn quic_recently_failed(&self) -> bool {
+        self.quic_failed_at
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some_and(|at| at.elapsed() < self.retry_after)
+    }
+
+    fn quic_failed(&self) {
+        *self
+            .quic_failed_at
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Instant::now());
+    }
+
+    fn quic_worked(&self) {
+        *self
+            .quic_failed_at
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    }
+}
+
 struct ActiveSupervisor {
     token: CancellationToken,
     /// Addresses this supervisor was spawned with; a change for the same edge
@@ -55,6 +98,7 @@ pub struct SupervisorPool {
     metrics: Arc<AgentMetrics>,
     edge_cred: Arc<arc_swap::ArcSwapOption<CachedEdgeCred>>,
     relay_urls: Arc<Vec<RelayUrl>>,
+    tls: TlsDialer,
     shutdown: CancellationToken,
     active: std::collections::HashMap<iroh::EndpointId, ActiveSupervisor>,
     tasks: JoinSet<()>,
@@ -67,6 +111,7 @@ impl SupervisorPool {
         metrics: &Arc<AgentMetrics>,
         edge_cred: &Arc<arc_swap::ArcSwapOption<CachedEdgeCred>>,
         relay_urls: Vec<RelayUrl>,
+        tls: TlsDialer,
         shutdown: &CancellationToken,
     ) -> Self {
         Self {
@@ -75,6 +120,7 @@ impl SupervisorPool {
             metrics: Arc::clone(metrics),
             edge_cred: Arc::clone(edge_cred),
             relay_urls: Arc::new(relay_urls),
+            tls,
             shutdown: shutdown.clone(),
             active: std::collections::HashMap::new(),
             tasks: JoinSet::new(),
@@ -141,6 +187,7 @@ impl SupervisorPool {
                 token.clone(),
                 Arc::clone(&self.edge_cred),
                 Arc::clone(&self.relay_urls),
+                self.tls.clone(),
             ));
             self.active.insert(
                 id,
@@ -170,6 +217,10 @@ fn same_addr_set(a: &[String], b: &[String]) -> bool {
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "per-edge supervisor state threaded through; a context struct would only rename the list"
+)]
 async fn supervise(
     endpoint: Endpoint,
     contact: EdgeContact,
@@ -178,19 +229,23 @@ async fn supervise(
     shutdown: CancellationToken,
     edge_cred: Arc<arc_swap::ArcSwapOption<CachedEdgeCred>>,
     relay_urls: Arc<Vec<RelayUrl>>,
+    tls: TlsDialer,
 ) {
     let edge_label = contact.id.fmt_short().to_string();
+    let memory = TransportMemory::new(QUIC_RETRY_AFTER);
     let span = info_span!("edge_supervisor", edge = %edge_label);
     // A permanently-gone edge is cancelled by reconcile, so this just redials a
     // transiently-down one until it returns. Backoff escalates while dials keep
     // failing fast and resets once a session has held for a while.
-    let (endpoint, contact, service_map, metrics, edge_cred, relay_urls) = (
+    let (endpoint, contact, service_map, metrics, edge_cred, relay_urls, tls, memory) = (
         &endpoint,
         &contact,
         &service_map,
         &metrics,
         &edge_cred,
         &relay_urls,
+        &tls,
+        &memory,
     );
     crate::retry::supervise(
         &format!("edge:{edge_label}"),
@@ -205,6 +260,8 @@ async fn supervise(
                 metrics,
                 edge_cred,
                 relay_urls,
+                tls,
+                memory,
             )
             .await
             {
@@ -216,6 +273,7 @@ async fn supervise(
                         .inc();
                     error!(
                         addrs = ?contact.addrs,
+                        tls_addrs = ?contact.tls_addrs,
                         cooldown_secs = IDENTITY_MISMATCH_COOLDOWN.as_secs(),
                         "edge answered with a different endpoint identity than the hub \
                          advertised; the address belongs to another node"
@@ -234,8 +292,8 @@ async fn supervise(
     .await;
 }
 
-/// True when the peer's key didn't match the endpoint id we dialed. Only our
-/// own alert counts; the peer's would arrive as `ConnectionClosed`.
+/// True when the peer's key didn't match the endpoint id we dialed. For QUIC
+/// only our own alert counts; the peer's would arrive as `ConnectionClosed`.
 fn is_identity_mismatch(err: &anyhow::Error) -> bool {
     err.chain().any(|source| {
         matches!(
@@ -244,19 +302,42 @@ fn is_identity_mismatch(err: &anyhow::Error) -> bool {
                 source: ConnectionError::TransportError(e),
                 ..
             }) if e.code == TransportErrorCode::crypto(TLS_ALERT_UNKNOWN_CA)
-        )
+        ) || source
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(towonel_common::transport::tls::is_pin_mismatch)
     })
 }
 
-/// Returns the elapsed session duration on success, or the dial error.
-async fn dial_and_serve(
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Transport {
+    Quic,
+    Tls,
+}
+
+/// Transports to try for this redial, in order. QUIC leads unless it failed
+/// recently and TLS is on offer.
+fn dial_order(can_quic: bool, can_tls: bool, quic_recently_failed: bool) -> Vec<Transport> {
+    match (can_quic, can_tls) {
+        (true, true) if quic_recently_failed => vec![Transport::Tls, Transport::Quic],
+        (true, true) => vec![Transport::Quic, Transport::Tls],
+        (true, false) => vec![Transport::Quic],
+        (false, true) => vec![Transport::Tls],
+        (false, false) => Vec::new(),
+    }
+}
+
+struct Dialed {
+    conn: TunnelConn,
+    /// Kept for the path watcher, which only QUIC has.
+    quic: Option<iroh::endpoint::Connection>,
+    transport: Transport,
+}
+
+async fn connect_quic(
     endpoint: &Endpoint,
     contact: &EdgeContact,
-    service_map: &Arc<ServiceMap>,
-    metrics: &Arc<AgentMetrics>,
-    edge_cred: &Arc<arc_swap::ArcSwapOption<CachedEdgeCred>>,
     relay_urls: &[RelayUrl],
-) -> anyhow::Result<Duration> {
+) -> anyhow::Result<iroh::endpoint::Connection> {
     let resolved = resolve_addrs(&contact.addrs).await;
     if resolved.is_empty() && relay_urls.is_empty() {
         anyhow::bail!("no addresses resolved for edge {}", contact.id.fmt_short());
@@ -269,11 +350,147 @@ async fn dial_and_serve(
     for relay in relay_urls {
         addr = addr.with_relay_url(relay.clone());
     }
-    let iroh_conn = tokio::time::timeout(CONNECT_TIMEOUT, endpoint.connect(addr, ALPN_TUNNEL))
+    tokio::time::timeout(CONNECT_TIMEOUT, endpoint.connect(addr, ALPN_TUNNEL))
         .await
         .with_context(|| format!("connect to edge {} timed out", contact.id.fmt_short()))?
-        .with_context(|| format!("connect to edge {} failed", contact.id.fmt_short()))?;
-    let conn = TunnelConn::Iroh(iroh_conn.clone());
+        .with_context(|| format!("connect to edge {} failed", contact.id.fmt_short()))
+}
+
+/// Bounded as a whole, not per address: with several addresses that all black-hole,
+/// per-address timeouts would stack well past QUIC's single `CONNECT_TIMEOUT`.
+async fn connect_tls(tls: &TlsDialer, contact: &EdgeContact) -> anyhow::Result<TunnelConn> {
+    tokio::time::timeout(CONNECT_TIMEOUT, connect_tls_addrs(tls, contact))
+        .await
+        .with_context(|| format!("TLS dial to edge {} timed out", contact.id.fmt_short()))?
+}
+
+async fn connect_tls_addrs(tls: &TlsDialer, contact: &EdgeContact) -> anyhow::Result<TunnelConn> {
+    let resolved = resolve_addrs(&contact.tls_addrs).await;
+    let mut last: Option<anyhow::Error> = None;
+    for addr in resolved {
+        let attempt = async {
+            let tcp = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(addr))
+                .await
+                .with_context(|| format!("TCP connect to {addr} timed out"))?
+                .with_context(|| format!("TCP connect to {addr} failed"))?;
+            tls.connect(tcp, contact.id)
+                .await
+                .with_context(|| format!("TLS handshake with {addr} failed"))
+        };
+        match attempt.await {
+            Ok(conn) => return Ok(TunnelConn::Tls(conn)),
+            Err(e) => last = Some(e),
+        }
+    }
+    Err(last.unwrap_or_else(|| {
+        anyhow::anyhow!(
+            "no TLS address resolved for edge {}",
+            contact.id.fmt_short()
+        )
+    }))
+}
+
+async fn dial(
+    endpoint: &Endpoint,
+    contact: &EdgeContact,
+    relay_urls: &[RelayUrl],
+    tls: &TlsDialer,
+    memory: &TransportMemory,
+) -> anyhow::Result<Dialed> {
+    let can_quic = !contact.addrs.is_empty() || !relay_urls.is_empty();
+    let can_tls = !contact.tls_addrs.is_empty();
+    let order = dial_order(can_quic, can_tls, memory.quic_recently_failed());
+    if order.is_empty() {
+        anyhow::bail!(
+            "no addresses advertised for edge {}",
+            contact.id.fmt_short()
+        );
+    }
+
+    let mut quic_failed = false;
+    let mut mismatch: Option<anyhow::Error> = None;
+    let mut last_err: Option<anyhow::Error> = None;
+    for transport in order {
+        let attempt = match transport {
+            Transport::Quic => connect_quic(endpoint, contact, relay_urls)
+                .await
+                .map(|quic| Dialed {
+                    conn: TunnelConn::Iroh(quic.clone()),
+                    quic: Some(quic),
+                    transport,
+                }),
+            Transport::Tls => connect_tls(tls, contact).await.map(|conn| Dialed {
+                conn,
+                quic: None,
+                transport,
+            }),
+        };
+        match attempt {
+            Ok(dialed) => {
+                match transport {
+                    Transport::Quic => memory.quic_worked(),
+                    // Only a TLS success after a QUIC failure says UDP is the
+                    // problem; both failing means the edge is down.
+                    Transport::Tls if quic_failed => memory.quic_failed(),
+                    Transport::Tls => {}
+                }
+                return Ok(dialed);
+            }
+            // This address belongs to another node, but the other transport's
+            // address may not; report the mismatch only if nothing connects.
+            Err(e) if is_identity_mismatch(&e) => {
+                mismatch.get_or_insert(e);
+            }
+            Err(e) => {
+                debug!(edge = %contact.id.fmt_short(), ?transport, error = %e, "dial failed");
+                quic_failed |= transport == Transport::Quic;
+                last_err = Some(e);
+            }
+        }
+    }
+    Err(mismatch
+        .or(last_err)
+        .unwrap_or_else(|| anyhow::anyhow!("no transport could connect")))
+}
+
+/// While a session runs over TLS, tries QUIC every `every` and returns the
+/// first connection that comes up.
+async fn probe_quic(
+    endpoint: &Endpoint,
+    contact: &EdgeContact,
+    relay_urls: &[RelayUrl],
+    every: Duration,
+) -> iroh::endpoint::Connection {
+    loop {
+        tokio::time::sleep(every).await;
+        if let Ok(quic) = connect_quic(endpoint, contact, relay_urls).await {
+            return quic;
+        }
+    }
+}
+
+/// Dials, then serves until the session ends. A session that fell back to TLS
+/// moves to QUIC once it works again. Returns the session duration, or the dial
+/// or credential error.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "per-edge supervisor state threaded through; a context struct would only rename the list"
+)]
+async fn dial_and_serve(
+    endpoint: &Endpoint,
+    contact: &EdgeContact,
+    service_map: &Arc<ServiceMap>,
+    metrics: &Arc<AgentMetrics>,
+    edge_cred: &Arc<arc_swap::ArcSwapOption<CachedEdgeCred>>,
+    relay_urls: &[RelayUrl],
+    tls: &TlsDialer,
+    memory: &TransportMemory,
+) -> anyhow::Result<Duration> {
+    let Dialed {
+        mut conn,
+        quic,
+        mut transport,
+    } = dial(endpoint, contact, relay_urls, tls, memory).await?;
 
     let edge_label = contact.id.fmt_short().to_string();
 
@@ -285,7 +502,7 @@ async fn dial_and_serve(
         return Err(e);
     }
 
-    info!(edge = %edge_label, "edge session established");
+    info!(edge = %edge_label, ?transport, "edge session established");
     metrics
         .edge_session_reconnects
         .with_label_values(&[&edge_label])
@@ -293,24 +510,60 @@ async fn dial_and_serve(
     // Marks the session live; resets the gauge and aborts the path watcher on
     // Drop, surviving a mid-session cancellation (see `EdgeSessionGuard`).
     let mut guard = EdgeSessionGuard::live(Arc::clone(metrics), edge_label.clone(), conn.clone());
-
-    // iroh usually opens on the relay and upgrades to direct once holepunched.
-    guard.path_watcher = Some(tokio::spawn(watch_paths(
-        iroh_conn.path_events(),
-        edge_label.clone(),
-        Arc::clone(metrics),
-    )));
+    guard.path_watcher = quic.map(|quic| watch_path(&quic, &edge_label, metrics));
+    if transport == Transport::Tls {
+        metrics.set_edge_path(&edge_label, "tls");
+    }
 
     let started = Instant::now();
-    tunnel::handle_connection(
-        conn,
-        contact.id,
-        Arc::clone(service_map),
-        Arc::clone(metrics),
-    )
-    .await;
+    loop {
+        let serving = tunnel::handle_connection(
+            conn.clone(),
+            contact.id,
+            Arc::clone(service_map),
+            Arc::clone(metrics),
+        );
+        let can_move =
+            transport == Transport::Tls && (!contact.addrs.is_empty() || !relay_urls.is_empty());
+        if !can_move {
+            serving.await;
+            break;
+        }
+        let probe = probe_quic(endpoint, contact, relay_urls, memory.retry_after);
+        tokio::select! {
+            biased;
+            quic = probe => {
+                // The edge supersedes this TLS session as soon as QUIC connects,
+                // so there is no staying on it: finish the move and, if the
+                // credential is then refused, redial.
+                info!(edge = %edge_label, "QUIC is reachable again; leaving the TLS session");
+                let moved = TunnelConn::Iroh(quic.clone());
+                if let Some(cred) = edge_cred.load_full() {
+                    present_edge_cred(&moved, &edge_label, &cred).await?;
+                }
+                memory.quic_worked();
+                conn = moved;
+                transport = Transport::Quic;
+                guard.switch_to(conn.clone(), Some(watch_path(&quic, &edge_label, metrics)));
+            }
+            () = serving => break,
+        }
+    }
 
     Ok(started.elapsed())
+}
+
+fn watch_path(
+    quic: &iroh::endpoint::Connection,
+    edge_label: &str,
+    metrics: &Arc<AgentMetrics>,
+) -> tokio::task::JoinHandle<()> {
+    // iroh usually opens on the relay and upgrades to direct once holepunched.
+    tokio::spawn(watch_paths(
+        quic.path_events(),
+        edge_label.to_string(),
+        Arc::clone(metrics),
+    ))
 }
 
 /// Resets the liveness gauge, aborts the path watcher and closes the connection
@@ -334,6 +587,18 @@ impl EdgeSessionGuard {
             edge_label,
             path_watcher: None,
             conn,
+        }
+    }
+}
+
+impl EdgeSessionGuard {
+    /// Moves the guard to a new connection, closing the one it held.
+    fn switch_to(&mut self, conn: TunnelConn, path_watcher: Option<tokio::task::JoinHandle<()>>) {
+        self.metrics.clear_edge_path(&self.edge_label);
+        self.conn.close(0, b"moved to QUIC");
+        self.conn = conn;
+        if let Some(old) = std::mem::replace(&mut self.path_watcher, path_watcher) {
+            old.abort();
         }
     }
 }
@@ -467,6 +732,337 @@ mod tests {
     const V4: &str = "203.0.113.1:80";
     const V6: &str = "[2001:db8::1]:80";
 
+    #[test]
+    fn dial_order_leads_with_quic_unless_it_failed_recently() {
+        use Transport::{Quic, Tls};
+        assert_eq!(dial_order(true, true, false), [Quic, Tls]);
+        assert_eq!(dial_order(true, true, true), [Tls, Quic]);
+        assert_eq!(dial_order(true, false, true), [Quic]);
+        assert_eq!(dial_order(false, true, false), [Tls]);
+        assert!(dial_order(false, false, false).is_empty());
+    }
+
+    #[test]
+    fn transport_memory_forgets_a_quic_failure_once_it_works() {
+        let memory = TransportMemory::new(QUIC_RETRY_AFTER);
+        assert!(!memory.quic_recently_failed());
+        memory.quic_failed();
+        assert!(memory.quic_recently_failed());
+        memory.quic_worked();
+        assert!(!memory.quic_recently_failed());
+    }
+
+    #[tokio::test]
+    async fn falls_back_to_tls_and_carries_traffic_when_quic_cannot_dial() {
+        use iroh::endpoint::presets::Minimal;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+        use tokio::time::timeout;
+        use towonel_common::tls_policy::TlsMode;
+        use towonel_common::transport::tls::{TlsIdentity, TlsListener};
+        use towonel_common::tunnel::{ClientAddrs, write_handshake};
+
+        use crate::config::{ProxyProtocol, ServiceConfig};
+
+        const SETUP: Duration = Duration::from_secs(10);
+        const HOST: &str = "fallback.test";
+        drop(rustls::crypto::ring::default_provider().install_default());
+        let origin = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let services = Arc::new(
+            ServiceMap::from_config(
+                &[ServiceConfig {
+                    hostname: HOST.to_string(),
+                    origin: origin.local_addr().unwrap().to_string(),
+                    origin_server_name: None,
+                    tls_mode: TlsMode::Passthrough,
+                    proxy_protocol: Some(ProxyProtocol::None),
+                }],
+                &[],
+                &[],
+            )
+            .await
+            .unwrap(),
+        );
+        let endpoint = Endpoint::builder(Minimal)
+            .relay_mode(iroh::RelayMode::Disabled)
+            .clear_ip_transports()
+            .bind_addr("127.0.0.1:0")
+            .unwrap()
+            .bind()
+            .await
+            .unwrap();
+
+        let edge_identity = TlsIdentity::new(&iroh::SecretKey::generate()).unwrap();
+        let agent_key = iroh::SecretKey::generate();
+        let edge_socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let tls_addr = edge_socket.local_addr().unwrap().to_string();
+        let tls_listener = TlsListener::new(&edge_identity).unwrap();
+
+        let contact = EdgeContact {
+            id: edge_identity.id(),
+            // Not a socket address, so QUIC fails at once instead of waiting
+            // out its connect timeout.
+            addrs: vec!["not a socket".to_string()],
+            tls_addrs: vec![tls_addr],
+        };
+        let dialer = TlsDialer::new(TlsIdentity::new(&agent_key).unwrap());
+        let metrics = Arc::new(AgentMetrics::new());
+        let memory = Arc::new(TransportMemory::new(QUIC_RETRY_AFTER));
+        let session = tokio::spawn({
+            let (metrics, memory) = (Arc::clone(&metrics), Arc::clone(&memory));
+            async move {
+                let cred = Arc::new(arc_swap::ArcSwapOption::empty());
+                dial_and_serve(
+                    &endpoint,
+                    &contact,
+                    &services,
+                    &metrics,
+                    &cred,
+                    &[],
+                    &dialer,
+                    &memory,
+                )
+                .await
+            }
+        });
+
+        let (tcp, _) = timeout(SETUP, edge_socket.accept()).await.unwrap().unwrap();
+        let edge_conn = timeout(SETUP, tls_listener.accept(tcp))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(edge_conn.remote_id(), agent_key.public());
+
+        let addrs = ClientAddrs {
+            src: "127.0.0.1:12345".parse().unwrap(),
+            dst: "127.0.0.1:443".parse().unwrap(),
+        };
+        let (mut send, mut recv) = edge_conn.open_bi().await.unwrap();
+        write_handshake(&mut send, HOST, addrs).await.unwrap();
+        send.write_all(b"ping").await.unwrap();
+        let (mut socket, _) = timeout(SETUP, origin.accept()).await.unwrap().unwrap();
+        let mut request = [0; 4];
+        timeout(SETUP, socket.read_exact(&mut request))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&request, b"ping");
+        socket.write_all(b"pong").await.unwrap();
+        let mut reply = [0; 4];
+        timeout(SETUP, recv.read_exact(&mut reply))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&reply, b"pong");
+
+        assert_eq!(metrics.active_edge_sessions(), 1);
+        assert!(memory.quic_recently_failed());
+
+        edge_conn.close(0, b"done");
+        timeout(SETUP, session).await.unwrap().unwrap().unwrap();
+        assert_eq!(metrics.active_edge_sessions(), 0);
+    }
+
+    async fn origin_and_services(hostname: &str) -> (tokio::net::TcpListener, Arc<ServiceMap>) {
+        use towonel_common::tls_policy::TlsMode;
+
+        use crate::config::{ProxyProtocol, ServiceConfig};
+
+        drop(rustls::crypto::ring::default_provider().install_default());
+        let origin = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let services = Arc::new(
+            ServiceMap::from_config(
+                &[ServiceConfig {
+                    hostname: hostname.to_string(),
+                    origin: origin.local_addr().unwrap().to_string(),
+                    origin_server_name: None,
+                    tls_mode: TlsMode::Passthrough,
+                    proxy_protocol: Some(ProxyProtocol::None),
+                }],
+                &[],
+                &[],
+            )
+            .await
+            .unwrap(),
+        );
+        (origin, services)
+    }
+
+    async fn quic_endpoint(secret: Option<iroh::SecretKey>, accept: bool) -> Endpoint {
+        use iroh::endpoint::presets::Minimal;
+
+        let mut builder = Endpoint::builder(Minimal)
+            .relay_mode(iroh::RelayMode::Disabled)
+            .clear_ip_transports()
+            .bind_addr("127.0.0.1:0")
+            .unwrap()
+            .transport_config(towonel_common::protocol::tunnel_transport_config());
+        if let Some(secret) = secret {
+            builder = builder.secret_key(secret);
+        }
+        if accept {
+            builder = builder.alpns(vec![ALPN_TUNNEL.to_vec()]);
+        }
+        builder.bind().await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn both_transports_failing_does_not_blame_quic() {
+        use towonel_common::transport::tls::TlsIdentity;
+
+        let (_origin, services) = origin_and_services("down.test").await;
+        let endpoint = quic_endpoint(None, false).await;
+        let closed_port = {
+            let socket = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            socket.local_addr().unwrap()
+        };
+        let contact = EdgeContact {
+            id: iroh::SecretKey::generate().public(),
+            addrs: vec!["not a socket".to_string()],
+            tls_addrs: vec![closed_port.to_string()],
+        };
+        let dialer = TlsDialer::new(TlsIdentity::new(&iroh::SecretKey::generate()).unwrap());
+        let metrics = Arc::new(AgentMetrics::new());
+        let memory = TransportMemory::new(QUIC_RETRY_AFTER);
+
+        let cred = Arc::new(arc_swap::ArcSwapOption::empty());
+        dial_and_serve(
+            &endpoint,
+            &contact,
+            &services,
+            &metrics,
+            &cred,
+            &[],
+            &dialer,
+            &memory,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            !memory.quic_recently_failed(),
+            "an edge that is simply down must not push redials onto TLS"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tls_pin_mismatch_is_an_identity_mismatch() {
+        use tokio::net::TcpListener;
+        use towonel_common::transport::tls::{TlsIdentity, TlsListener};
+
+        let (_origin, services) = origin_and_services("mismatch.test").await;
+        let endpoint = quic_endpoint(None, false).await;
+        let edge_identity = TlsIdentity::new(&iroh::SecretKey::generate()).unwrap();
+        let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let tls_addr = socket.local_addr().unwrap().to_string();
+        let tls_listener = TlsListener::new(&edge_identity).unwrap();
+        tokio::spawn(async move {
+            let (tcp, _) = socket.accept().await.unwrap();
+            drop(tls_listener.accept(tcp).await);
+        });
+        // The hub advertised a different node than the one at this address.
+        let contact = EdgeContact {
+            id: iroh::SecretKey::generate().public(),
+            addrs: Vec::new(),
+            tls_addrs: vec![tls_addr],
+        };
+        let dialer = TlsDialer::new(TlsIdentity::new(&iroh::SecretKey::generate()).unwrap());
+        let metrics = Arc::new(AgentMetrics::new());
+        let memory = TransportMemory::new(QUIC_RETRY_AFTER);
+
+        let cred = Arc::new(arc_swap::ArcSwapOption::empty());
+        let err = dial_and_serve(
+            &endpoint,
+            &contact,
+            &services,
+            &metrics,
+            &cred,
+            &[],
+            &dialer,
+            &memory,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(is_identity_mismatch(&err), "got: {err:#}");
+    }
+
+    #[tokio::test]
+    async fn a_tls_session_moves_to_quic_once_it_works() {
+        use tokio::net::TcpListener;
+        use tokio::time::timeout;
+        use towonel_common::transport::tls::{TlsIdentity, TlsListener};
+
+        const SETUP: Duration = Duration::from_secs(10);
+        let (_origin, services) = origin_and_services("migrate.test").await;
+        let edge_key = iroh::SecretKey::generate();
+        let quic_edge = quic_endpoint(Some(edge_key.clone()), true).await;
+        let agent_endpoint = quic_endpoint(None, false).await;
+        let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let tls_listener = TlsListener::new(&TlsIdentity::new(&edge_key).unwrap()).unwrap();
+        let contact = EdgeContact {
+            id: edge_key.public(),
+            addrs: quic_edge
+                .bound_sockets()
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+            tls_addrs: vec![socket.local_addr().unwrap().to_string()],
+        };
+        let dialer = TlsDialer::new(TlsIdentity::new(&iroh::SecretKey::generate()).unwrap());
+        let metrics = Arc::new(AgentMetrics::new());
+        // QUIC "failed" a moment ago, so the dial leads with TLS and the probe
+        // retries QUIC after the short window.
+        let memory = Arc::new(TransportMemory::new(Duration::from_millis(1500)));
+        memory.quic_failed();
+        let session = tokio::spawn({
+            let (metrics, memory) = (Arc::clone(&metrics), Arc::clone(&memory));
+            async move {
+                let cred = Arc::new(arc_swap::ArcSwapOption::empty());
+                dial_and_serve(
+                    &agent_endpoint,
+                    &contact,
+                    &services,
+                    &metrics,
+                    &cred,
+                    &[],
+                    &dialer,
+                    &memory,
+                )
+                .await
+            }
+        });
+
+        let (tcp, _) = timeout(SETUP, socket.accept()).await.unwrap().unwrap();
+        let tls_conn = timeout(SETUP, tls_listener.accept(tcp))
+            .await
+            .unwrap()
+            .unwrap();
+        let incoming = timeout(SETUP, quic_edge.accept()).await.unwrap().unwrap();
+        let quic_conn = timeout(SETUP, incoming).await.unwrap().unwrap();
+
+        // The edge supersedes the TLS session the moment QUIC connects.
+        tls_conn.close(0, b"superseded");
+        timeout(SETUP, tls_conn.closed()).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            !session.is_finished(),
+            "the session must outlive the supersede"
+        );
+        assert!(!memory.quic_recently_failed());
+        assert_eq!(metrics.active_edge_sessions(), 1);
+        let label = edge_key.public().fmt_short().to_string();
+        assert_eq!(
+            metrics.edge_path.with_label_values(&[&label, "tls"]).get(),
+            0,
+            "the path gauge must stop saying tls"
+        );
+
+        quic_conn.close(0u32.into(), b"done");
+        timeout(SETUP, session).await.unwrap().unwrap().unwrap();
+        assert_eq!(metrics.active_edge_sessions(), 0);
+    }
+
     async fn cancellation_fixture(
         hostname: &str,
     ) -> (
@@ -521,7 +1117,11 @@ mod tests {
         let metrics = Arc::new(AgentMetrics::new());
         let cred = Arc::new(arc_swap::ArcSwapOption::empty());
         let shutdown = CancellationToken::new();
-        let mut pool = SupervisorPool::new(&agent, &services, &metrics, &cred, vec![], &shutdown);
+        let tls = TlsDialer::new(
+            towonel_common::transport::tls::TlsIdentity::new(&iroh::SecretKey::generate()).unwrap(),
+        );
+        let mut pool =
+            SupervisorPool::new(&agent, &services, &metrics, &cred, vec![], tls, &shutdown);
         pool.reconcile(&[EdgeContact {
             id: edge.id(),
             addrs: edge

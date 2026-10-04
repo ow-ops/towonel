@@ -21,7 +21,7 @@ pub mod direction {
 }
 
 /// `path` label values for `edge_path`; `set_edge_path` keeps exactly one at 1.
-pub const PATH_LABELS: [&str; 3] = ["direct", "relay", "custom"];
+pub const PATH_LABELS: [&str; 4] = ["direct", "relay", "custom", "tls"];
 
 #[derive(Clone)]
 pub struct AgentMetrics {

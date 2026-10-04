@@ -448,12 +448,16 @@ async fn try_bring_up(
 
     let cred_refresh = stateless::spawn_edge_cred_refresh(ctx.clone());
 
+    let tls_dialer = towonel_common::transport::tls::TlsDialer::new(
+        towonel_common::transport::tls::TlsIdentity::new(&ctx.iroh_secret_key())?,
+    );
     let mut pool = edge_session::SupervisorPool::new(
         &endpoint,
         service_map,
         metrics,
         &ctx.edge_cred,
         relay_urls,
+        tls_dialer,
         shutdown,
     );
     info!(edges = ctx.edge_contacts.len(), "starting edge supervisors");
