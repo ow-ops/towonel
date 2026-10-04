@@ -21,6 +21,7 @@ pub mod sni;
 pub mod telemetry;
 pub mod time;
 pub mod tls_policy;
+pub mod transport;
 pub mod tunnel;
 
 /// Region an edge or invite falls back to when none is set.

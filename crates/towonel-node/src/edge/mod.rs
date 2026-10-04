@@ -22,11 +22,12 @@ use towonel_common::http_host::extract_host_header;
 use towonel_common::metrics::GaugeGuard;
 use towonel_common::sni::extract_sni;
 use towonel_common::tls_policy::TlsMode;
+use towonel_common::transport::{TunnelConn, TunnelRecv, TunnelSend};
 use towonel_common::tunnel::{
     CONTROL_STATUS_INTERNAL_ERROR, CONTROL_STATUS_INVALID, CONTROL_STATUS_NOT_IMPLEMENTED,
     CONTROL_STATUS_OK, ClientAddrs, DatagramFrameReader, MAX_UDP_DATAGRAM, TCP_ROUTE_PREFIX,
-    UDP_ROUTE_PREFIX, copy_tcp_counting, forward_quic_to_writer, read_control_prefix,
-    write_control_status, write_datagram_frame, write_handshake,
+    UDP_ROUTE_PREFIX, copy_tcp_counting, read_control_prefix, write_control_status,
+    write_datagram_frame, write_handshake,
 };
 
 use self::health::{EdgeMetrics, session_reject_reason};
@@ -479,7 +480,7 @@ async fn handle_inbound_agent(
     hub_client: Option<Arc<dyn HubClient>>,
 ) -> anyhow::Result<()> {
     let conn = match incoming.await {
-        Ok(c) => c,
+        Ok(c) => TunnelConn::Iroh(c),
         Err(e) => {
             metrics
                 .sessions_rejected_total
@@ -498,7 +499,7 @@ async fn handle_inbound_agent(
             agent = %agent_id.fmt_short(),
             "rejecting inbound iroh connection from unknown agent"
         );
-        conn.close(403u32.into(), b"unknown agent");
+        conn.close(403, b"unknown agent");
         return Ok(());
     }
 
@@ -558,9 +559,9 @@ const CONTROL_STREAM_TIMEOUT: Duration = Duration::from_secs(10);
 const CONTROL_RESET_BODY_WRITE_FAILED: u32 = 1;
 
 async fn handle_agent_stream(
-    send: iroh::endpoint::SendStream,
-    recv: iroh::endpoint::RecvStream,
-    conn: iroh::endpoint::Connection,
+    send: TunnelSend,
+    recv: TunnelRecv,
+    conn: TunnelConn,
     agent_id: iroh::EndpointId,
     hub_client: Option<Arc<dyn HubClient>>,
     sessions: Arc<SessionRegistry>,
@@ -583,9 +584,9 @@ async fn handle_agent_stream(
 }
 
 async fn run_control_stream(
-    mut send: iroh::endpoint::SendStream,
-    mut recv: iroh::endpoint::RecvStream,
-    conn: iroh::endpoint::Connection,
+    mut send: TunnelSend,
+    mut recv: TunnelRecv,
+    conn: TunnelConn,
     agent_id: iroh::EndpointId,
     hub_client: Option<Arc<dyn HubClient>>,
     sessions: Arc<SessionRegistry>,
@@ -612,7 +613,7 @@ async fn run_control_stream(
             if let Err(e) = write_control_status(&mut send, CONTROL_STATUS_INVALID).await {
                 debug!(agent = %agent_id.fmt_short(), error = %e, "writing INVALID status failed");
             }
-            if let Err(e) = send.finish() {
+            if let Err(e) = send.finish().await {
                 debug!(agent = %agent_id.fmt_short(), error = %e, "finishing stream after INVALID failed");
             }
             return;
@@ -647,7 +648,7 @@ async fn run_control_stream(
                 agent = %agent_id.fmt_short(),
                 "rejecting agent connection: credential agent_id does not match connection"
             );
-            conn.close(403u32.into(), b"credential agent_id mismatch");
+            conn.close(403, b"credential agent_id mismatch");
             return;
         }
         if sessions.record_tenant(agent_id, tenant_id) {
@@ -659,7 +660,7 @@ async fn run_control_stream(
             );
             // Close our own connection, not a registry lookup that could hit
             // a superseding session for the same agent_id.
-            conn.close(429u32.into(), b"tenant connection limit reached");
+            conn.close(429, b"tenant connection limit reached");
             return;
         }
     }
@@ -673,12 +674,12 @@ async fn run_control_stream(
     {
         debug!(agent = %agent_id.fmt_short(), error = %e, "writing control response body failed");
         // Reset (not finish) so the agent distinguishes truncation from EOF.
-        if let Err(e) = send.reset(CONTROL_RESET_BODY_WRITE_FAILED.into()) {
+        if let Err(e) = send.reset(CONTROL_RESET_BODY_WRITE_FAILED) {
             debug!(agent = %agent_id.fmt_short(), error = %e, "resetting stream failed");
         }
         return;
     }
-    if let Err(e) = send.finish() {
+    if let Err(e) = send.finish().await {
         debug!(agent = %agent_id.fmt_short(), error = %e, "finishing control stream failed");
     }
 }
@@ -840,11 +841,7 @@ async fn pick_agent_and_open_stream(
     ctx: &ConnCtx,
     mut candidates: self::router::Candidates,
     mut refresh: impl FnMut() -> Option<self::router::Candidates>,
-) -> anyhow::Result<(
-    EndpointAddr,
-    iroh::endpoint::SendStream,
-    iroh::endpoint::RecvStream,
-)> {
+) -> anyhow::Result<(EndpointAddr, TunnelSend, TunnelRecv)> {
     fastrand::shuffle(&mut candidates);
 
     let mut last_err: Option<anyhow::Error> = None;
@@ -1050,8 +1047,8 @@ struct Preparation {
     hostname: String,
     policy: TlsMode,
     agent_addr: EndpointAddr,
-    send_stream: iroh::endpoint::SendStream,
-    recv_stream: iroh::endpoint::RecvStream,
+    send_stream: TunnelSend,
+    recv_stream: TunnelRecv,
 }
 
 async fn prepare_connection(tcp_stream: &TcpStream, ctx: &ConnCtx) -> anyhow::Result<Preparation> {
@@ -1248,7 +1245,7 @@ async fn peek_http_hostname(tcp: &TcpStream) -> anyhow::Result<String> {
 async fn open_agent_stream(
     ctx: &ConnCtx,
     agent_id: iroh::EndpointId,
-) -> anyhow::Result<(iroh::endpoint::SendStream, iroh::endpoint::RecvStream)> {
+) -> anyhow::Result<(TunnelSend, TunnelRecv)> {
     let Some(session) = ctx.sessions.get(&agent_id) else {
         ctx.metrics.route_no_session_total.inc();
         anyhow::bail!("agent {} has no active session", agent_id.fmt_short());
@@ -1553,8 +1550,8 @@ async fn pipe_tcp(
     tcp_stream: TcpStream,
     route_key: &str,
     client_addrs: ClientAddrs,
-    mut send_stream: iroh::endpoint::SendStream,
-    mut recv_stream: iroh::endpoint::RecvStream,
+    mut send_stream: TunnelSend,
+    mut recv_stream: TunnelRecv,
 ) -> anyhow::Result<(u64, u64)> {
     write_handshake(&mut send_stream, route_key, client_addrs).await?;
 
@@ -1565,11 +1562,11 @@ async fn pipe_tcp(
         if let Err(ref e) = res {
             warn!(%route_key, "client->agent forward: {e}");
         }
-        drop(send_stream.finish());
+        drop(send_stream.finish().await);
         n
     };
     let a2c = async {
-        let (n, res) = forward_quic_to_writer(&mut recv_stream, &mut tcp_write).await;
+        let (n, res) = recv_stream.forward_to_writer(&mut tcp_write).await;
         if let Err(ref e) = res {
             warn!(%route_key, "agent->client forward: {e}");
         }
@@ -1927,7 +1924,7 @@ async fn udp_session_pump(
                 }
             }
         }
-        drop(send_stream.finish());
+        drop(send_stream.finish().await);
         debug!("udp session closed");
     }
     .instrument(span)

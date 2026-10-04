@@ -2,35 +2,30 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use iroh::EndpointId;
-use iroh::endpoint::Connection;
 use tracing::{debug, info};
 
 use towonel_common::identity::TenantId;
+use towonel_common::transport::{TunnelConn, TunnelRecv, TunnelSend};
 
 use super::health::{EdgeMetrics, session_reject_reason};
 
 pub struct AgentSession {
     pub agent_id: EndpointId,
-    conn: Connection,
+    conn: TunnelConn,
 }
 
 impl AgentSession {
     #[must_use]
-    pub const fn new(agent_id: EndpointId, conn: Connection) -> Self {
+    pub const fn new(agent_id: EndpointId, conn: TunnelConn) -> Self {
         Self { agent_id, conn }
     }
 
-    pub async fn open_stream(
-        &self,
-    ) -> Result<
-        (iroh::endpoint::SendStream, iroh::endpoint::RecvStream),
-        iroh::endpoint::ConnectionError,
-    > {
+    pub async fn open_stream(&self) -> std::io::Result<(TunnelSend, TunnelRecv)> {
         self.conn.open_bi().await
     }
 
     pub fn close(&self, code: u32, reason: &[u8]) {
-        self.conn.close(code.into(), reason);
+        self.conn.close(code, reason);
     }
 
     pub fn conn_stable_id(&self) -> usize {
@@ -274,7 +269,8 @@ mod tests {
                 tokio::spawn(async move {
                     let Ok(conn) = incoming.await else { return };
                     let agent_id = conn.remote_id();
-                    let session = Arc::new(AgentSession::new(agent_id, conn.clone()));
+                    let session =
+                        Arc::new(AgentSession::new(agent_id, TunnelConn::Iroh(conn.clone())));
                     registry.register(&session);
                     let _ = conn.closed().await;
                     registry.remove_if_current(&session);

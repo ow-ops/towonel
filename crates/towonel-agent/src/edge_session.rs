@@ -15,6 +15,7 @@ use tracing::{Instrument, debug, error, info, info_span, warn};
 
 use towonel_common::edge_cred::AuthFrame;
 use towonel_common::protocol::ALPN_TUNNEL;
+use towonel_common::transport::TunnelConn;
 use towonel_common::tunnel::{CONTROL_STATUS_OK, read_control_status, write_control_prefix};
 
 use crate::metrics::AgentMetrics;
@@ -262,10 +263,11 @@ async fn dial_and_serve(
     for relay in relay_urls {
         addr = addr.with_relay_url(relay.clone());
     }
-    let conn = tokio::time::timeout(CONNECT_TIMEOUT, endpoint.connect(addr, ALPN_TUNNEL))
+    let iroh_conn = tokio::time::timeout(CONNECT_TIMEOUT, endpoint.connect(addr, ALPN_TUNNEL))
         .await
         .with_context(|| format!("connect to edge {} timed out", contact.id.fmt_short()))?
         .with_context(|| format!("connect to edge {} failed", contact.id.fmt_short()))?;
+    let conn = TunnelConn::Iroh(iroh_conn.clone());
 
     let edge_label = contact.id.fmt_short().to_string();
 
@@ -288,7 +290,7 @@ async fn dial_and_serve(
 
     // iroh usually opens on the relay and upgrades to direct once holepunched.
     guard.path_watcher = Some(tokio::spawn(watch_paths(
-        conn.path_events(),
+        iroh_conn.path_events(),
         edge_label.clone(),
         Arc::clone(metrics),
     )));
@@ -312,15 +314,11 @@ struct EdgeSessionGuard {
     metrics: Arc<AgentMetrics>,
     edge_label: String,
     path_watcher: Option<tokio::task::JoinHandle<()>>,
-    conn: iroh::endpoint::Connection,
+    conn: TunnelConn,
 }
 
 impl EdgeSessionGuard {
-    fn live(
-        metrics: Arc<AgentMetrics>,
-        edge_label: String,
-        conn: iroh::endpoint::Connection,
-    ) -> Self {
+    fn live(metrics: Arc<AgentMetrics>, edge_label: String, conn: TunnelConn) -> Self {
         metrics
             .edge_session_state
             .with_label_values(&[&edge_label])
@@ -336,7 +334,7 @@ impl EdgeSessionGuard {
 
 impl Drop for EdgeSessionGuard {
     fn drop(&mut self) {
-        self.conn.close(0u32.into(), b"edge supervisor stopped");
+        self.conn.close(0, b"edge supervisor stopped");
         if let Some(h) = self.path_watcher.take() {
             h.abort();
         }
@@ -351,7 +349,7 @@ impl Drop for EdgeSessionGuard {
 /// A rejected cred means the session is never reported live and no routes
 /// will point at it — fail so the supervisor redials with a refreshed cred.
 async fn present_edge_cred(
-    conn: &iroh::endpoint::Connection,
+    conn: &TunnelConn,
     edge_label: &str,
     cred: &CachedEdgeCred,
 ) -> anyhow::Result<()> {
@@ -376,10 +374,7 @@ async fn present_edge_cred(
     }
 }
 
-async fn do_present_edge_cred(
-    conn: &iroh::endpoint::Connection,
-    cred: &CachedEdgeCred,
-) -> anyhow::Result<u8> {
+async fn do_present_edge_cred(conn: &TunnelConn, cred: &CachedEdgeCred) -> anyhow::Result<u8> {
     let (mut send, mut recv) = conn.open_bi().await.context("open control bidi stream")?;
     write_control_prefix(&mut send)
         .await
@@ -391,7 +386,7 @@ async fn do_present_edge_cred(
     }
     .encode();
     send.write_all(&frame).await.context("write auth frame")?;
-    send.finish().context("finish send stream")?;
+    send.finish().await.context("finish send stream")?;
     let status = read_control_status(&mut recv)
         .await
         .context("read control status")?;

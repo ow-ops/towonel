@@ -12,10 +12,10 @@ use tracing::{Instrument, debug, info, info_span, warn};
 
 use towonel_common::hostname::wildcard_lookup;
 use towonel_common::metrics::GaugeGuard;
+use towonel_common::transport::{TunnelConn, TunnelRecv, TunnelSend};
 use towonel_common::tunnel::{
     COPY_BUF_SIZE, ClientAddrs, DatagramFrameReader, MAX_UDP_DATAGRAM, TCP_ROUTE_PREFIX,
-    UDP_ROUTE_PREFIX, copy_buf_counting, copy_tcp_counting, forward_quic_to_writer, read_handshake,
-    write_datagram_frame,
+    UDP_ROUTE_PREFIX, copy_buf_counting, copy_tcp_counting, read_handshake, write_datagram_frame,
 };
 
 use crate::config::{ProxyProtocol, ServiceConfig, TcpServiceConfig, UdpServiceConfig};
@@ -447,7 +447,7 @@ async fn resolve_origin_host_only(host: &str) -> (Vec<SocketAddr>, bool) {
 }
 
 pub async fn handle_connection(
-    conn: iroh::endpoint::Connection,
+    conn: TunnelConn,
     remote_id: iroh::EndpointId,
     service_map: Arc<ServiceMap>,
     metrics: Arc<AgentMetrics>,
@@ -457,7 +457,7 @@ pub async fn handle_connection(
 }
 
 async fn handle_connection_with_stream_limit(
-    conn: iroh::endpoint::Connection,
+    conn: TunnelConn,
     remote_id: iroh::EndpointId,
     service_map: Arc<ServiceMap>,
     metrics: Arc<AgentMetrics>,
@@ -500,8 +500,8 @@ async fn handle_connection_with_stream_limit(
     reason = "stream dispatch dispatches over PROXY/TLS/TCP shapes; splitting fragments the flow"
 )]
 async fn handle_stream(
-    mut quic_send: iroh::endpoint::SendStream,
-    mut quic_recv: iroh::endpoint::RecvStream,
+    mut quic_send: TunnelSend,
+    mut quic_recv: TunnelRecv,
     service_map: &ServiceMap,
     edge_id: iroh::EndpointId,
     metrics: &AgentMetrics,
@@ -668,8 +668,8 @@ async fn forward_plain(
     mut origin: TcpStream,
     proxy: ProxyProtocol,
     addrs: ClientAddrs,
-    quic_recv: &mut iroh::endpoint::RecvStream,
-    quic_send: &mut iroh::endpoint::SendStream,
+    quic_recv: &mut TunnelRecv,
+    quic_send: &mut TunnelSend,
     metrics: &AgentMetrics,
 ) -> anyhow::Result<()> {
     // Written eagerly (not coalesced with the first client chunk) so a
@@ -680,13 +680,13 @@ async fn forward_plain(
     let (mut origin_read, mut origin_write) = origin.into_split();
 
     let q2o = async {
-        let res = forward_quic_to_writer(quic_recv, &mut origin_write).await;
+        let res = quic_recv.forward_to_writer(&mut origin_write).await;
         drop(origin_write.shutdown().await);
         res
     };
     let o2q = async {
         let res = copy_tcp_counting(&mut origin_read, quic_send).await;
-        drop(quic_send.finish());
+        drop(quic_send.finish().await);
         res
     };
 
@@ -704,8 +704,8 @@ async fn forward_plain(
 async fn handle_tcp_stream(
     service_name: &str,
     client_addrs: ClientAddrs,
-    mut quic_send: iroh::endpoint::SendStream,
-    mut quic_recv: iroh::endpoint::RecvStream,
+    mut quic_send: TunnelSend,
+    mut quic_recv: TunnelRecv,
     service_map: &ServiceMap,
     edge_id: iroh::EndpointId,
     metrics: &AgentMetrics,
@@ -743,13 +743,13 @@ async fn handle_tcp_stream(
         let (mut origin_read, mut origin_write) = origin.into_split();
 
         let q2o = async {
-            let res = forward_quic_to_writer(&mut quic_recv, &mut origin_write).await;
+            let res = quic_recv.forward_to_writer(&mut origin_write).await;
             drop(origin_write.shutdown().await);
             res
         };
         let o2q = async {
             let res = copy_tcp_counting(&mut origin_read, &mut quic_send).await;
-            drop(quic_send.finish());
+            drop(quic_send.finish().await);
             res
         };
 
@@ -792,8 +792,8 @@ const fn is_transient_origin_error(kind: std::io::ErrorKind) -> bool {
 async fn handle_udp_stream(
     service_name: &str,
     client_addrs: ClientAddrs,
-    mut quic_send: iroh::endpoint::SendStream,
-    mut quic_recv: iroh::endpoint::RecvStream,
+    mut quic_send: TunnelSend,
+    mut quic_recv: TunnelRecv,
     service_map: &ServiceMap,
     edge_id: iroh::EndpointId,
     metrics: &AgentMetrics,
@@ -869,7 +869,7 @@ async fn handle_udp_stream(
                 },
             }
         };
-        drop(quic_send.finish());
+        drop(quic_send.finish().await);
 
         metrics.add_bytes(metrics::direction::EDGE_TO_ORIGIN, bytes_e2o);
         metrics.add_bytes(metrics::direction::ORIGIN_TO_EDGE, bytes_o2e);
@@ -903,8 +903,8 @@ async fn forward_tls(
     tls_config: Arc<rustls::ClientConfig>,
     proxy: ProxyProtocol,
     addrs: ClientAddrs,
-    quic_recv: &mut iroh::endpoint::RecvStream,
-    quic_send: &mut iroh::endpoint::SendStream,
+    quic_recv: &mut TunnelRecv,
+    quic_send: &mut TunnelSend,
     metrics: &AgentMetrics,
 ) -> anyhow::Result<()> {
     // PROXY v2 must precede the TLS ClientHello so the origin's TLS layer
@@ -928,13 +928,13 @@ async fn forward_tls(
     let mut tls_read = io::BufReader::with_capacity(COPY_BUF_SIZE, tls_read);
 
     let q2o = async {
-        let res = forward_quic_to_writer(quic_recv, &mut tls_write).await;
+        let res = quic_recv.forward_to_writer(&mut tls_write).await;
         drop(tls_write.shutdown().await);
         res
     };
     let o2q = async {
         let res = copy_buf_counting(&mut tls_read, quic_send).await;
-        drop(quic_send.finish());
+        drop(quic_send.finish().await);
         res
     };
 
@@ -1007,7 +1007,7 @@ mod tests {
         let metrics = Arc::new(AgentMetrics::new());
         let stream_limit = Arc::new(tokio::sync::Semaphore::new(1));
         let mut handler = tokio::spawn(handle_connection_with_stream_limit(
-            conn.unwrap(),
+            TunnelConn::Iroh(conn.unwrap()),
             edge.id(),
             services,
             Arc::clone(&metrics),
