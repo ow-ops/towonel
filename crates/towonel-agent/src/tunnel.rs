@@ -453,11 +453,27 @@ pub async fn handle_connection(
     metrics: Arc<AgentMetrics>,
 ) {
     let stream_limit = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_STREAMS));
+    handle_connection_with_stream_limit(conn, remote_id, service_map, metrics, stream_limit).await;
+}
+
+async fn handle_connection_with_stream_limit(
+    conn: iroh::endpoint::Connection,
+    remote_id: iroh::EndpointId,
+    service_map: Arc<ServiceMap>,
+    metrics: Arc<AgentMetrics>,
+    stream_limit: Arc<tokio::sync::Semaphore>,
+) {
+    let mut tasks = tokio::task::JoinSet::new();
     loop {
-        // Acquire before accepting so a flood of stream-opens backs up on the
-        // QUIC layer instead of spawning unbounded tasks. The Semaphore is
-        // never closed, so acquire only fails if we drop it — treat as exit.
-        let Ok(permit) = Arc::clone(&stream_limit).acquire_owned().await else {
+        while tasks.try_join_next().is_some() {}
+        // Backpressure stream opens, but still exit if a saturated session closes.
+        let Ok(permit) = tokio::select! (
+            permit = Arc::clone(&stream_limit).acquire_owned() => permit,
+            error = conn.closed() => {
+                info!("connection closed: {error}");
+                return;
+            }
+        ) else {
             return;
         };
         let (send, recv) = match conn.accept_bi().await {
@@ -470,7 +486,7 @@ pub async fn handle_connection(
 
         let map = Arc::clone(&service_map);
         let m = Arc::clone(&metrics);
-        tokio::spawn(async move {
+        tasks.spawn(async move {
             let _permit = permit;
             if let Err(e) = handle_stream(send, recv, &map, remote_id, &m).await {
                 warn!("stream error: {e}");
@@ -932,6 +948,106 @@ async fn forward_tls(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn local_endpoint() -> iroh::Endpoint {
+        iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+            .alpns(vec![towonel_common::protocol::ALPN_TUNNEL.to_vec()])
+            .relay_mode(iroh::RelayMode::Disabled)
+            .clear_ip_transports()
+            .bind_addr("127.0.0.1:0")
+            .unwrap()
+            .transport_config(towonel_common::protocol::tunnel_transport_config())
+            .bind()
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn peer_close_releases_forwarding_when_stream_limit_is_saturated() {
+        use tokio::io::AsyncReadExt;
+        use tokio::net::TcpListener;
+        use tokio::time::timeout;
+        use towonel_common::protocol::ALPN_TUNNEL;
+        use towonel_common::tls_policy::TlsMode;
+        use towonel_common::tunnel::write_handshake;
+
+        const SETUP: Duration = Duration::from_secs(3);
+        const HOST: &str = "saturated.test";
+
+        drop(rustls::crypto::ring::default_provider().install_default());
+        let origin = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let services = Arc::new(
+            ServiceMap::from_config(
+                &[ServiceConfig {
+                    hostname: HOST.to_string(),
+                    origin: origin.local_addr().unwrap().to_string(),
+                    origin_server_name: None,
+                    tls_mode: TlsMode::Passthrough,
+                    proxy_protocol: Some(ProxyProtocol::None),
+                }],
+                &[],
+                &[],
+            )
+            .await
+            .unwrap(),
+        );
+        let edge = local_endpoint().await;
+        let agent = local_endpoint().await;
+        let mut addr = iroh::EndpointAddr::new(edge.id());
+        for socket in edge.bound_sockets() {
+            addr = addr.with_ip_addr(socket);
+        }
+        let (conn, peer) = timeout(SETUP, async {
+            tokio::join!(agent.connect(addr, ALPN_TUNNEL), async {
+                edge.accept().await.unwrap().await.unwrap()
+            })
+        })
+        .await
+        .unwrap();
+        let metrics = Arc::new(AgentMetrics::new());
+        let stream_limit = Arc::new(tokio::sync::Semaphore::new(1));
+        let mut handler = tokio::spawn(handle_connection_with_stream_limit(
+            conn.unwrap(),
+            edge.id(),
+            services,
+            Arc::clone(&metrics),
+            Arc::clone(&stream_limit),
+        ));
+        let (mut send, _recv) = peer.open_bi().await.unwrap();
+        write_handshake(&mut send, HOST, v4_addrs()).await.unwrap();
+        send.write_all(b"ping").await.unwrap();
+        send.finish().unwrap();
+        let (mut socket, _) = timeout(SETUP, origin.accept()).await.unwrap().unwrap();
+        let mut request = Vec::new();
+        timeout(SETUP, socket.read_to_end(&mut request))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(request, b"ping");
+        // The half-closed origin holds the only stream permit.
+        assert_eq!(metrics.streams_active.get(), 1);
+        assert_eq!(stream_limit.available_permits(), 0);
+        assert!(!handler.is_finished());
+
+        peer.close(0u32.into(), b"test peer closed");
+        let handler_exited = timeout(SETUP, &mut handler).await;
+        // Abort before closing the origin so cleanup cannot mask the leak.
+        handler.abort();
+        let forwarding_released = timeout(SETUP, async {
+            while metrics.streams_active.get() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        drop(socket);
+        agent.close().await;
+        edge.close().await;
+        handler_exited
+            .expect("permit wait blocked after peer closed")
+            .unwrap();
+        forwarding_released.expect("forwarding tasks still active after peer closed");
+        assert_eq!(stream_limit.available_permits(), 1);
+    }
 
     fn v4_addrs() -> ClientAddrs {
         ClientAddrs {
