@@ -284,7 +284,7 @@ async fn dial_and_serve(
         .inc();
     // Marks the session live; resets the gauge and aborts the path watcher on
     // Drop, surviving a mid-session cancellation (see `EdgeSessionGuard`).
-    let mut guard = EdgeSessionGuard::live(Arc::clone(metrics), edge_label.clone());
+    let mut guard = EdgeSessionGuard::live(Arc::clone(metrics), edge_label.clone(), conn.clone());
 
     // iroh usually opens on the relay and upgrades to direct once holepunched.
     guard.path_watcher = Some(tokio::spawn(watch_paths(
@@ -305,18 +305,22 @@ async fn dial_and_serve(
     Ok(started.elapsed())
 }
 
-/// Holds an edge session's liveness gauge and path-watcher task, resetting both
-/// on Drop. A cancelled session (supervisor token fired mid-connection) would
-/// otherwise skip the straight-line cleanup, leaking the watcher and pinning
-/// `edge_session_state` at 1.
+/// Resets the liveness gauge, aborts the path watcher and closes the connection
+/// on Drop, so a cancelled session doesn't skip cleanup while forwarding
+/// streams still hold the connection.
 struct EdgeSessionGuard {
     metrics: Arc<AgentMetrics>,
     edge_label: String,
     path_watcher: Option<tokio::task::JoinHandle<()>>,
+    conn: iroh::endpoint::Connection,
 }
 
 impl EdgeSessionGuard {
-    fn live(metrics: Arc<AgentMetrics>, edge_label: String) -> Self {
+    fn live(
+        metrics: Arc<AgentMetrics>,
+        edge_label: String,
+        conn: iroh::endpoint::Connection,
+    ) -> Self {
         metrics
             .edge_session_state
             .with_label_values(&[&edge_label])
@@ -325,12 +329,14 @@ impl EdgeSessionGuard {
             metrics,
             edge_label,
             path_watcher: None,
+            conn,
         }
     }
 }
 
 impl Drop for EdgeSessionGuard {
     fn drop(&mut self) {
+        self.conn.close(0u32.into(), b"edge supervisor stopped");
         if let Some(h) = self.path_watcher.take() {
             h.abort();
         }
@@ -459,6 +465,145 @@ mod tests {
 
     const V4: &str = "203.0.113.1:80";
     const V6: &str = "[2001:db8::1]:80";
+
+    async fn cancellation_fixture(
+        hostname: &str,
+    ) -> (
+        Endpoint,
+        Endpoint,
+        tokio::net::TcpListener,
+        Arc<AgentMetrics>,
+        SupervisorPool,
+    ) {
+        use iroh::endpoint::presets::Minimal;
+        use tokio::net::TcpListener;
+        use towonel_common::tls_policy::TlsMode;
+
+        use crate::config::{ProxyProtocol, ServiceConfig};
+
+        drop(rustls::crypto::ring::default_provider().install_default());
+        let origin = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let services = Arc::new(
+            ServiceMap::from_config(
+                &[ServiceConfig {
+                    hostname: hostname.to_string(),
+                    origin: origin.local_addr().unwrap().to_string(),
+                    origin_server_name: None,
+                    tls_mode: TlsMode::Passthrough,
+                    proxy_protocol: Some(ProxyProtocol::None),
+                }],
+                &[],
+                &[],
+            )
+            .await
+            .unwrap(),
+        );
+        let edge = Endpoint::builder(Minimal)
+            .alpns(vec![ALPN_TUNNEL.to_vec()])
+            .relay_mode(iroh::RelayMode::Disabled)
+            .clear_ip_transports()
+            .bind_addr("127.0.0.1:0")
+            .unwrap()
+            .transport_config(towonel_common::protocol::tunnel_transport_config())
+            .bind()
+            .await
+            .unwrap();
+        let agent = Endpoint::builder(Minimal)
+            .relay_mode(iroh::RelayMode::Disabled)
+            .clear_ip_transports()
+            .bind_addr("127.0.0.1:0")
+            .unwrap()
+            .transport_config(towonel_common::protocol::tunnel_transport_config())
+            .bind()
+            .await
+            .unwrap();
+        let metrics = Arc::new(AgentMetrics::new());
+        let cred = Arc::new(arc_swap::ArcSwapOption::empty());
+        let shutdown = CancellationToken::new();
+        let mut pool = SupervisorPool::new(&agent, &services, &metrics, &cred, vec![], &shutdown);
+        pool.reconcile(&[EdgeContact {
+            id: edge.id(),
+            addrs: edge
+                .bound_sockets()
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+        }]);
+        (edge, agent, origin, metrics, pool)
+    }
+
+    #[tokio::test]
+    async fn cancelled_supervisor_does_not_leave_routable_unserved_connection() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::time::timeout;
+        use towonel_common::tunnel::{ClientAddrs, write_handshake};
+
+        const SETUP: Duration = Duration::from_secs(3);
+        const HOST: &str = "cancel.test";
+
+        let (edge, agent, origin, metrics, mut pool) = cancellation_fixture(HOST).await;
+        // Only forwarding tasks retain the agent connection.
+        let peer = timeout(SETUP, async { edge.accept().await.unwrap().await.unwrap() })
+            .await
+            .unwrap();
+        let addrs = ClientAddrs {
+            src: "127.0.0.1:12345".parse().unwrap(),
+            dst: "127.0.0.1:443".parse().unwrap(),
+        };
+        let (mut first_send, mut first_recv) = peer.open_bi().await.unwrap();
+        write_handshake(&mut first_send, HOST, addrs).await.unwrap();
+        first_send.write_all(b"ping").await.unwrap();
+        let (mut socket, _) = timeout(SETUP, origin.accept()).await.unwrap().unwrap();
+        let (release_origin, hold_origin) = tokio::sync::oneshot::channel();
+        let origin_task = tokio::spawn(async move {
+            let mut buf = [0; 4];
+            loop {
+                let n = socket.read(&mut buf).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                socket.write_all(&buf[..n]).await.unwrap();
+            }
+            // Hold the origin write half open until forwarding tasks exit.
+            hold_origin.await.unwrap();
+            drop(socket);
+        });
+        let mut reply = [0; 4];
+        timeout(SETUP, first_recv.read_exact(&mut reply))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&reply, b"ping");
+        assert_eq!(metrics.active_edge_sessions(), 1);
+        assert_eq!(metrics.streams_active.get(), 1);
+
+        pool.reconcile(&[]);
+        timeout(SETUP, pool.tasks.join_next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(metrics.active_edge_sessions(), 0);
+        timeout(SETUP, peer.closed())
+            .await
+            .expect("session still open after cancellation");
+        let _closed = peer
+            .open_bi()
+            .await
+            .expect_err("closed session accepted a stream");
+        let forwarding_released = timeout(SETUP, async {
+            while metrics.streams_active.get() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        release_origin.send(()).unwrap();
+        timeout(SETUP, origin_task).await.unwrap().unwrap();
+        pool.shutdown().await;
+        agent.close().await;
+        edge.close().await;
+        forwarding_released.expect("forwarding tasks still active after cancellation");
+    }
 
     /// Context-wrapped like `dial_and_serve` reports it, so the chain walk is
     /// what's under test.
