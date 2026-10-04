@@ -37,6 +37,9 @@ allowPrivilegeEscalation (NoNewPrivs would block the file-cap bind of 443/80).
   {{- $_ := set $env "TOWONEL_EDGE_LISTEN_ADDR" (printf "%s:%v" $edge.bindAddress $edge.httpsPort) -}}
   {{- $_ := set $env "TOWONEL_EDGE_HTTP_LISTEN_ADDR" (printf "%s:%v" $edge.bindAddress $edge.httpPort) -}}
   {{- $_ := set $env "TOWONEL_EDGE_HEALTH_LISTEN_ADDR" (printf "%s:%v" $edge.healthBindAddress $edge.metricsPort) -}}
+  {{- if gt ($edge.tlsPort | int) 0 -}}
+    {{- $_ := set $env "TOWONEL_EDGE_TLS_LISTEN_ADDR" (printf "%s:%v" $edge.bindAddress $edge.tlsPort) -}}
+  {{- end -}}
   {{- $_ := set $env "TOWONEL_DATA_DIR" $edge.dataDir -}}
 {{- end -}}
 {{- $_ := set $container "env" $env -}}
@@ -52,6 +55,9 @@ allowPrivilegeEscalation (NoNewPrivs would block the file-cap bind of 443/80).
   {{- $ports = append $ports (dict "name" "edge" "containerPort" ($edge.httpsPort | int) "protocol" "TCP") -}}
   {{- $ports = append $ports (dict "name" "edge-http" "containerPort" ($edge.httpPort | int) "protocol" "TCP") -}}
   {{- $ports = append $ports (dict "name" "edge-metrics" "containerPort" ($edge.metricsPort | int) "protocol" "TCP") -}}
+  {{- if gt ($edge.tlsPort | int) 0 -}}
+    {{- $ports = append $ports (dict "name" "edge-tls" "containerPort" ($edge.tlsPort | int) "protocol" "TCP") -}}
+  {{- end -}}
 {{- end -}}
 {{- $_ := set $container "ports" $ports -}}
 

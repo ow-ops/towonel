@@ -78,6 +78,7 @@ Kubernetes: `>=1.31.0-0`
 | edge.httpPort | int | `80` | Plain HTTP port for ACME HTTP-01 and redirects. |
 | edge.httpsPort | int | `443` | Public TLS port. |
 | edge.metricsPort | int | `9090` | Port serving edge health and Prometheus metrics. |
+| edge.tlsPort | int | `0` | TCP port for the agent tunnel over TLS 1.3, the fallback for agents that cannot use QUIC (TOWONEL_EDGE_TLS_LISTEN_ADDR). 0 disables it. |
 | global.fullnameOverride | string | `""` | Override the full release name. |
 | global.nameOverride | string | `""` | Override the chart name used in resource names. |
 | hub.apiPort | int | `8443` | Port the user/operator HTTP API listens on. |

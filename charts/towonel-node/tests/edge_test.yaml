@@ -118,3 +118,33 @@ tests:
           content:
             name: hub-api
           any: true
+
+  - it: leaves the TLS tunnel listener off by default
+    documentSelector:
+      path: kind
+      value: DaemonSet
+    asserts:
+      - notContains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: TOWONEL_EDGE_TLS_LISTEN_ADDR
+          any: true
+
+  - it: serves the TLS tunnel listener when tlsPort is set
+    set:
+      edge.tlsPort: 51821
+    documentSelector:
+      path: kind
+      value: DaemonSet
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: TOWONEL_EDGE_TLS_LISTEN_ADDR
+            value: "[::]:51821"
+      - contains:
+          path: spec.template.spec.containers[0].ports
+          content:
+            name: edge-tls
+            containerPort: 51821
+            protocol: TCP
