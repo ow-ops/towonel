@@ -981,21 +981,19 @@ async fn handle_connection_inner(
     async move {
         let start = Instant::now();
 
-        let prep = match prepare_connection(&tcp_stream, ctx).await {
-            Ok(p) => p,
-            Err(e) => {
-                drop(tcp_stream.shutdown().await);
-                return Err(e);
-            }
-        };
-
         let Preparation {
             hostname,
             policy,
             agent_addr,
             send_stream,
             recv_stream,
-        } = prep;
+        } = match prepare_connection(&tcp_stream, ctx).await {
+            Ok(prep) => prep,
+            Err(e) => {
+                drop(tcp_stream.shutdown().await);
+                return Err(e);
+            }
+        };
         let agent_short = agent_addr.id.fmt_short();
         // Resolve the tenant before piping: an abnormal close can remove the
         // session mid-transfer, so looking it up afterward would drop the

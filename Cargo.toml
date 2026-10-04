@@ -214,7 +214,8 @@ backon = "1"
 ppp = "2"
 papaya = "0.2"
 smallvec = "1"
-tokio-util = { version = "0.7", features = ["rt"] }
+tokio-util = { version = "0.7", features = ["rt", "compat"] }
+yamux = "0.14"
 blake3 = "1"
 normpath = "1"
 petname = { version = "3", default-features = false, features = [

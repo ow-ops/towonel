@@ -18,6 +18,11 @@ serde = { workspace = true }
 serde_bytes = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+rustls = { workspace = true }
+tokio-rustls = { workspace = true }
+tokio-util = { workspace = true }
+socket2 = { workspace = true }
+yamux = { workspace = true }
 tokio = { workspace = true }
 hex = { workspace = true }
 clienthello = { workspace = true }
@@ -38,6 +43,9 @@ prometheus = { workspace = true }
 petname = { workspace = true }
 ppp = { workspace = true }
 aes-gcm = { workspace = true }
+
+[dev-dependencies]
+rcgen = { workspace = true }
 
 [lints]
 workspace = true
