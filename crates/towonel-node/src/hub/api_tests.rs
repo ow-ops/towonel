@@ -1368,7 +1368,7 @@ async fn session_removed_drops_agent_from_route_table() {
         assert_eq!(resp.status(), 200);
     }
 
-    let source = SourceKey::Remote([0xAB; 32]);
+    let source = SourceKey::Remote([0xAB; 32], 0);
     assert!(
         hub.state
             .live_agents

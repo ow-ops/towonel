@@ -200,7 +200,7 @@ async fn handle_connection(
     // Upsert AFTER Welcome lands so a peer that disconnects mid-handshake
     // doesn't leave a stale entry; there is no janitor yet.
     write_hub_to_edge(&mut writer, &welcome).await?;
-    state.live_edges.upsert(
+    let generation = state.live_edges.upsert(
         edge_id,
         iroh_endpoints,
         capabilities,
@@ -208,6 +208,7 @@ async fn handle_connection(
         region,
         now_ms(),
     );
+    let source = SourceKey::Remote(edge_id, generation);
 
     let (writer_tx, writer_rx) = mpsc::channel::<HubToEdge>(64);
     let writer_task = tokio::spawn(run_writer(writer, writer_rx));
@@ -228,6 +229,7 @@ async fn handle_connection(
         ReadLoopCtx {
             state: &state,
             edge_id,
+            source,
             control_handler: &control_handler,
             control_semaphore: &control_semaphore,
             writer_tx: writer_tx.clone(),
@@ -240,8 +242,8 @@ async fn handle_connection(
     drop(writer_tx);
     pusher_task.abort();
     writer_task.abort();
-    state.live_edges.remove(&edge_id);
-    if state.live_agents.drop_source(SourceKey::Remote(edge_id)) {
+    state.live_edges.remove_if_current(&edge_id, generation);
+    if state.live_agents.drop_source(source) {
         trigger_route_rebuild(&state);
     }
     info!(edge = %hex::encode(edge_id), "edge_link disconnected");
@@ -251,6 +253,7 @@ async fn handle_connection(
 struct ReadLoopCtx<'a> {
     state: &'a Arc<AppState>,
     edge_id: EdgeId,
+    source: SourceKey,
     control_handler: &'a Arc<dyn ControlFrameHandler>,
     control_semaphore: &'a Arc<Semaphore>,
     writer_tx: mpsc::Sender<HubToEdge>,
@@ -265,13 +268,13 @@ where
     let ReadLoopCtx {
         state,
         edge_id,
+        source,
         control_handler,
         control_semaphore,
         writer_tx,
         shutdown,
         snapshot_received,
     } = ctx;
-    let source = SourceKey::Remote(edge_id);
     loop {
         tokio::select! {
             () = shutdown.cancelled() => return Ok(()),
@@ -455,4 +458,236 @@ fn current_signing_keys(state: &AppState) -> anyhow::Result<Vec<HubSigningKey>> 
     let signer = state.signer.as_ref();
     let pubkey = signer.public_key().as_bytes().to_vec();
     Ok(vec![HubSigningKey::new(signer.kid(), pubkey)?])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use towonel_common::edge_link::{EdgeCapabilities, read_hub_to_edge, write_edge_to_hub};
+    use towonel_common::identity::{AgentKeypair, TenantKeypair};
+
+    use crate::hub::test_helpers::TestHub;
+
+    struct EchoControl;
+
+    #[async_trait::async_trait]
+    impl ControlFrameHandler for EchoControl {
+        async fn handle(&self, frame: Vec<u8>) -> anyhow::Result<(u8, Vec<u8>)> {
+            Ok((0, frame))
+        }
+    }
+
+    async fn connect_link(
+        state: Arc<AppState>,
+        edge_id: EdgeId,
+    ) -> (TcpStream, tokio::task::JoinHandle<anyhow::Result<()>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (server, peer) = listener.accept().await.unwrap();
+        let route_rx = state.route_tx.subscribe();
+        let handler = tokio::spawn(async move {
+            handle_connection(
+                server,
+                peer,
+                &[7; 32],
+                [8; 32],
+                state,
+                Arc::new(EchoControl),
+                route_rx,
+                CancellationToken::new(),
+            )
+            .await
+        });
+        write_edge_to_hub(
+            &mut client,
+            &EdgeToHub::Hello {
+                edge_id,
+                iroh_endpoints: vec!["127.0.0.1:51820".into()],
+                software_version: "test".into(),
+                psk: [7; 32],
+                capabilities: EdgeCapabilities::default(),
+                public_ips: vec!["127.0.0.1".into()],
+                region: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(2), read_hub_to_edge(&mut client))
+                .await
+                .unwrap()
+                .unwrap(),
+            HubToEdge::Welcome { .. }
+        ));
+        (client, handler)
+    }
+
+    async fn assert_link_responds(client: &mut TcpStream) {
+        write_edge_to_hub(
+            client,
+            &EdgeToHub::ControlRequest {
+                request_id: 42,
+                frame: b"still live".to_vec(),
+            },
+        )
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let HubToEdge::ControlResponse {
+                    request_id: 42,
+                    status,
+                    body,
+                } = read_hub_to_edge(client).await.unwrap()
+                {
+                    assert_eq!(status, 0);
+                    assert_eq!(body, b"still live");
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn old_hub_link_cleanup_preserves_replacement() {
+        let hub = TestHub::start().await;
+        let edge_id = [9; 32];
+        let (mut old, old_handler) = connect_link(Arc::clone(&hub.state), edge_id).await;
+        let (mut new, new_handler) = connect_link(Arc::clone(&hub.state), edge_id).await;
+        let tenant = TenantKeypair::generate().id();
+        let agent = AgentKeypair::generate().id();
+        let live_key = (tenant, agent.clone());
+        write_edge_to_hub(
+            &mut new,
+            &EdgeToHub::SessionsSnapshot {
+                sessions: vec![(agent, tenant)],
+            },
+        )
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !hub.state.live_agents.snapshot().contains(&live_key) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            hub.state
+                .live_edges
+                .snapshot()
+                .iter()
+                .any(|e| e.0 == edge_id)
+        );
+
+        // Ignore the old link's late snapshot.
+        write_edge_to_hub(&mut old, &EdgeToHub::SessionsSnapshot { sessions: vec![] })
+            .await
+            .unwrap();
+        assert_link_responds(&mut old).await;
+        assert!(hub.state.live_agents.snapshot().contains(&live_key));
+
+        drop(old);
+        let _disconnected = tokio::time::timeout(Duration::from_secs(2), old_handler)
+            .await
+            .unwrap()
+            .unwrap();
+        let edge_present = hub
+            .state
+            .live_edges
+            .snapshot()
+            .iter()
+            .any(|e| e.0 == edge_id);
+        let agent_present = hub.state.live_agents.snapshot().contains(&live_key);
+
+        assert_link_responds(&mut new).await;
+        drop(new);
+        let _disconnected = tokio::time::timeout(Duration::from_secs(2), new_handler)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            edge_present && agent_present,
+            "old link removed the replacement's live state"
+        );
+    }
+
+    #[tokio::test]
+    async fn replacement_snapshot_fences_old_link_presence() {
+        let hub = TestHub::start().await;
+        let edge_id = [10; 32];
+        let tenant = TenantKeypair::generate().id();
+        let agent = AgentKeypair::generate().id();
+        let key = (tenant, agent.clone());
+        let snapshot = EdgeToHub::SessionsSnapshot {
+            sessions: vec![(agent.clone(), tenant)],
+        };
+        let (mut old, old_handler) = connect_link(Arc::clone(&hub.state), edge_id).await;
+        write_edge_to_hub(&mut old, &snapshot).await.unwrap();
+        assert_link_responds(&mut old).await;
+        assert!(hub.state.live_agents.snapshot().contains(&key));
+
+        let (mut new, new_handler) = connect_link(Arc::clone(&hub.state), edge_id).await;
+        write_edge_to_hub(&mut new, &snapshot).await.unwrap();
+        write_edge_to_hub(
+            &mut new,
+            &EdgeToHub::SessionRemoved {
+                agent_id: agent.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_link_responds(&mut new).await;
+        let removed = !hub.state.live_agents.snapshot().contains(&key);
+
+        // The old link must not restore the removed agent.
+        write_edge_to_hub(&mut old, &snapshot).await.unwrap();
+        assert_link_responds(&mut old).await;
+        let stale_snapshot_ignored = !hub.state.live_agents.snapshot().contains(&key);
+        write_edge_to_hub(&mut new, &snapshot).await.unwrap();
+        write_edge_to_hub(&mut new, &EdgeToHub::SessionsSnapshot { sessions: vec![] })
+            .await
+            .unwrap();
+        assert_link_responds(&mut new).await;
+        let empty_snapshot_removed = !hub.state.live_agents.snapshot().contains(&key);
+
+        drop(new);
+        let _disconnected = tokio::time::timeout(Duration::from_secs(2), new_handler)
+            .await
+            .unwrap()
+            .unwrap();
+        write_edge_to_hub(
+            &mut old,
+            &EdgeToHub::SessionAdded {
+                agent_id: agent,
+                tenant_id: tenant,
+            },
+        )
+        .await
+        .unwrap();
+        assert_link_responds(&mut old).await;
+        let stale_add_ignored = !hub.state.live_agents.snapshot().contains(&key);
+        drop(old);
+        let _disconnected = tokio::time::timeout(Duration::from_secs(2), old_handler)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(removed, "replacement removal left old-link presence behind");
+        assert!(
+            stale_snapshot_ignored,
+            "old snapshot resurrected agent presence"
+        );
+        assert!(
+            empty_snapshot_removed,
+            "replacement snapshot left stale presence"
+        );
+        assert!(
+            stale_add_ignored,
+            "old link recreated presence after replacement closed"
+        );
+    }
 }

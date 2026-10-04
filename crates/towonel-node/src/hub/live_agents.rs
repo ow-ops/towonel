@@ -13,10 +13,32 @@ use super::live_edges::EdgeId;
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum SourceKey {
     Local,
-    Remote(EdgeId),
+    /// Edge identity and hub-link generation.
+    Remote(EdgeId, u64),
 }
 
 type LiveSet = HashSet<(TenantId, AgentId)>;
+
+/// Transfer presence to the newer link and reject stale generations.
+fn promote_source(sources: &mut HashMap<SourceKey, LiveSet>, src: SourceKey) -> bool {
+    let SourceKey::Remote(edge, generation) = src else {
+        return true;
+    };
+    let previous = sources.keys().find_map(|key| match key {
+        SourceKey::Remote(id, current) if *id == edge => Some((*key, *current)),
+        _ => None,
+    });
+    if let Some((previous, current)) = previous {
+        if current > generation {
+            return false;
+        }
+        if current < generation {
+            let sessions = sources.remove(&previous).unwrap_or_default();
+            sources.insert(src, sessions);
+        }
+    }
+    true
+}
 
 #[derive(Default)]
 pub struct LiveAgents {
@@ -37,6 +59,9 @@ impl LiveAgents {
             .by_source
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !promote_source(&mut guard, src) {
+            return false;
+        }
         let already_live = guard.iter().any(|(k, set)| *k != src && set.contains(&key));
         let inserted = guard.entry(src).or_default().insert(key);
         drop(guard);
@@ -69,6 +94,9 @@ impl LiveAgents {
             .by_source
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !promote_source(&mut guard, src) {
+            return false;
+        }
         let prev = guard.insert(src, new_set.clone()).unwrap_or_default();
         let added_globally = new_set
             .difference(&prev)
@@ -88,8 +116,14 @@ impl LiveAgents {
             .by_source
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let Some(removed) = guard.remove(&src) else {
+        // Disconnecting an unreported link must not clear current presence.
+        if !guard.contains_key(&src) {
             return false;
+        }
+        let removed = match src {
+            SourceKey::Local => guard.remove(&src).unwrap_or_default(),
+            // Retain the generation to reject late frames from older links.
+            SourceKey::Remote(..) => std::mem::take(guard.entry(src).or_default()),
         };
         let changed = removed
             .into_iter()
@@ -145,7 +179,7 @@ mod tests {
     }
 
     fn edge(seed: u8) -> SourceKey {
-        SourceKey::Remote([seed; 32])
+        SourceKey::Remote([seed; 32], 0)
     }
 
     #[test]
@@ -215,6 +249,69 @@ mod tests {
     fn drop_source_no_op_when_unknown() {
         let live = LiveAgents::new();
         assert!(!live.drop_source(edge(1)));
+    }
+
+    #[test]
+    fn reconnect_generations_do_not_erase_each_other() {
+        let live = LiveAgents::new();
+        let key = (tenant(1), agent());
+        let old = SourceKey::Remote([1; 32], 0);
+        let new = SourceKey::Remote([1; 32], 1);
+        assert!(live.replace(old, [key.clone()]));
+        assert!(!live.replace(new, [key.clone()]));
+        assert!(!live.replace(old, []));
+        assert!(!live.drop_source(old));
+        assert!(live.snapshot().contains(&key));
+        assert!(live.drop_source(new));
+        assert!(live.snapshot().is_empty());
+        assert!(!live.record_added(old, key.0, key.1));
+        assert!(live.snapshot().is_empty());
+    }
+
+    #[test]
+    fn replacement_removal_is_authoritative_for_edge() {
+        let live = LiveAgents::new();
+        let key = (tenant(1), agent());
+        let old = SourceKey::Remote([1; 32], 0);
+        let new = SourceKey::Remote([1; 32], 1);
+        assert!(live.replace(old, [key.clone()]));
+        assert!(!live.replace(new, [key.clone()]));
+        assert!(live.record_removed(new, key.0, key.1.clone()));
+        assert!(!live.replace(old, [key]));
+        assert!(live.snapshot().is_empty());
+    }
+
+    #[test]
+    fn disconnect_without_snapshot_does_not_supersede_reporting_link() {
+        let live = LiveAgents::new();
+        let key = (tenant(1), agent());
+        let old = SourceKey::Remote([1; 32], 0);
+        let unreported = SourceKey::Remote([1; 32], 1);
+        assert!(live.replace(old, [key.clone()]));
+        assert!(!live.drop_source(unreported));
+        assert!(live.snapshot().contains(&key));
+        let other = (tenant(2), agent());
+        assert!(live.record_added(old, other.0, other.1.clone()));
+        assert!(live.snapshot().contains(&other));
+    }
+
+    #[test]
+    fn three_overlapping_links_keep_only_latest_reporting_generation() {
+        let live = LiveAgents::new();
+        let key = (tenant(1), agent());
+        let a = SourceKey::Remote([1; 32], 0);
+        let b = SourceKey::Remote([1; 32], 1);
+        let c = SourceKey::Remote([1; 32], 2);
+        assert!(live.replace(a, [key.clone()]));
+        assert!(!live.replace(c, [key.clone()]));
+        assert!(!live.replace(b, []));
+        assert!(!live.drop_source(a));
+        assert!(!live.drop_source(b));
+        assert!(live.snapshot().contains(&key));
+        assert!(live.replace(c, []));
+        assert!(!live.replace(a, [key.clone()]));
+        assert!(!live.replace(b, [key]));
+        assert!(live.snapshot().is_empty());
     }
 
     #[test]
