@@ -39,17 +39,11 @@ use crate::config::ProxyProtocolConfig;
 /// 16 KiB is more than enough for any realistic `ClientHello`.
 const PEEK_BUF_SIZE: usize = 16_384;
 
-/// Cap on retries while waiting for a full `ClientHello` to arrive in the
-/// kernel peek buffer. With a 5 ms sleep between attempts this gives the peer
-/// ~100 ms to finish sending the record — more than enough for realistic
-/// handshakes even across a congested link.
+/// Retry budget for plain HTTP request-head peeking.
 const PEEK_MAX_ATTEMPTS: u32 = 20;
 const PEEK_RETRY_DELAY: Duration = Duration::from_millis(5);
 
-/// Wall-clock bound on the peek phase. `PEEK_MAX_ATTEMPTS` only caps retries
-/// between peeks; a peer that connects and sends nothing blocks the first
-/// `tcp.peek()` forever, pinning one accept task and socket FD per stalled
-/// connection — the same FD-exhaustion guarded by `PROXY_PROTOCOL_TIMEOUT`.
+/// Wall-clock bound on peeking, including silent or incomplete handshakes.
 const PEEK_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Bound on how long we'll wait for a trusted peer to deliver its PROXY v2
@@ -889,14 +883,13 @@ async fn pick_agent_and_open_stream(
 
 /// Peek bytes until a full TLS record is visible in the kernel buffer,
 /// allowing SNI extraction to succeed even when the `ClientHello` is split
-/// across multiple TCP segments. Returns once the record is complete or the
-/// attempt budget is exhausted.
+/// across multiple TCP segments. Non-TLS bytes return immediately.
 async fn peek_client_hello(tcp: &TcpStream, buf: &mut [u8]) -> std::io::Result<usize> {
     let peek = async {
-        for attempt in 0..PEEK_MAX_ATTEMPTS {
+        loop {
             let n = tcp.peek(buf).await?;
             let peeked = buf.get(..n).unwrap_or(buf);
-            if tls_record_complete(peeked) || n >= buf.len() {
+            if tls_record_complete(peeked) || n >= buf.len() || not_tls_handshake(peeked) {
                 return Ok(n);
             }
             if n == 0 {
@@ -905,11 +898,8 @@ async fn peek_client_hello(tcp: &TcpStream, buf: &mut [u8]) -> std::io::Result<u
                     "client closed before sending ClientHello",
                 ));
             }
-            if attempt + 1 < PEEK_MAX_ATTEMPTS {
-                tokio::time::sleep(PEEK_RETRY_DELAY).await;
-            }
+            tokio::time::sleep(PEEK_RETRY_DELAY).await;
         }
-        tcp.peek(buf).await
     };
     tokio::time::timeout(PEEK_TIMEOUT, peek)
         .await
@@ -919,6 +909,10 @@ async fn peek_client_hello(tcp: &TcpStream, buf: &mut [u8]) -> std::io::Result<u
                 "client did not send a complete ClientHello within the peek timeout",
             ))
         })
+}
+
+const fn not_tls_handshake(buf: &[u8]) -> bool {
+    matches!(buf, [first, second, ..] if *first != 22 || *second != 3)
 }
 
 /// TLS record framing: `[content_type:1][version:2][length:2][fragment:length]`.
@@ -2057,6 +2051,46 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let _client = TcpStream::connect(addr).await.unwrap();
         let (server, _) = listener.accept().await.unwrap();
+        let mut buf = [0u8; PEEK_BUF_SIZE];
+        let err = peek_client_hello(&server, &mut buf).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+    }
+
+    #[tokio::test]
+    async fn peek_client_hello_waits_for_delayed_fragment() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        let record = [22, 3, 3, 0, 6, 1, 2, 3, 4, 5, 6];
+        client.write_all(&record[..6]).await.unwrap();
+        let writer = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            client.write_all(&record[6..]).await.unwrap();
+            client
+        });
+
+        let mut buf = [0u8; PEEK_BUF_SIZE];
+        let n = peek_client_hello(&server, &mut buf).await.unwrap();
+        assert_eq!(&buf[..n], &record);
+        let mut received = [0u8; 11];
+        assert_eq!(server.try_read(&mut received).unwrap(), record.len());
+        assert_eq!(received, record, "peeking must leave the hello untouched");
+        drop(writer.await.unwrap());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn peek_client_hello_returns_early_on_non_tls_bytes() {
+        let (server, _client) = server_side_with(b"GET / HTTP/1.1\r\n").await;
+        let mut buf = [0u8; PEEK_BUF_SIZE];
+        let n = peek_client_hello(&server, &mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"GET / HTTP/1.1\r\n");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn peek_client_hello_times_out_on_incomplete_record() {
+        let (server, _client) = server_side_with(&[22, 3, 3, 0, 6, 1]).await;
         let mut buf = [0u8; PEEK_BUF_SIZE];
         let err = peek_client_hello(&server, &mut buf).await.unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
