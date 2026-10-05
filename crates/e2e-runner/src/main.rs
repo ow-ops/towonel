@@ -55,6 +55,14 @@ async fn main() -> Result<()> {
         std::path::Path::new("/fixtures/origin-tls.pem"),
     )
     .await?;
+    cases::tls_passthrough::run_as_client(
+        &ctx.edge_host,
+        ctx.edge_tls_port,
+        &ctx.tenant_hostname,
+        std::path::Path::new("/fixtures/origin-tls.pem"),
+        Some(("[2001:db8::7]:54321".parse()?, "[2001:db8::1]:443".parse()?)),
+    )
+    .await?;
     cases::proxy_v2::run(&ctx.edge_host, ctx.edge_tls_port).await?;
     match ctx.expect_transport {
         cases::agent_transport::Expected::Quic => {

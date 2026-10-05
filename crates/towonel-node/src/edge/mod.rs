@@ -1121,6 +1121,15 @@ fn tls_record_complete(buf: &[u8]) -> bool {
     buf.len() >= 5 + usize::from(u16::from_be_bytes([len_hi, len_lo]))
 }
 
+/// Behind a PROXY v2 hop the local socket can be in another family than the
+/// client, which the tunnel handshake rejects; use the dialed IP, keep the port.
+fn client_dst(
+    local: std::net::SocketAddr,
+    proxied: Option<std::net::SocketAddr>,
+) -> std::net::SocketAddr {
+    proxied.map_or(local, |p| std::net::SocketAddr::new(p.ip(), local.port()))
+}
+
 /// Recover the real client address before TLS peek/handshake. Trusted-CIDR
 /// peers must prepend a PROXY v2 header; untrusted peers are passed through.
 ///
@@ -1131,16 +1140,16 @@ async fn resolve_peer_addr(
     tcp_stream: &mut TcpStream,
     immediate_peer: std::net::SocketAddr,
     ctx: &ConnCtx,
-) -> anyhow::Result<std::net::SocketAddr> {
+) -> anyhow::Result<(std::net::SocketAddr, Option<std::net::SocketAddr>)> {
     if !ctx.proxy_protocol.is_trusted(immediate_peer.ip()) {
-        return Ok(immediate_peer);
+        return Ok((immediate_peer, None));
     }
     let read =
         tokio::time::timeout(PROXY_PROTOCOL_TIMEOUT, proxy_protocol::read_v2(tcp_stream)).await;
     match read {
-        Ok(Ok(addr)) => {
-            debug!(advertised = %addr, immediate = %immediate_peer, "PROXY v2 header consumed");
-            Ok(addr)
+        Ok(Ok(addrs)) => {
+            debug!(advertised = %addrs.src, immediate = %immediate_peer, "PROXY v2 header consumed");
+            Ok((addrs.src, Some(addrs.dst)))
         }
         Ok(Err(e)) => {
             warn!(immediate = %immediate_peer, error = %e, "trusted peer sent invalid PROXY v2 header");
@@ -1166,13 +1175,14 @@ async fn handle_connection_inner(
     immediate_peer: std::net::SocketAddr,
     ctx: &ConnCtx,
 ) -> anyhow::Result<()> {
-    let peer_addr = match resolve_peer_addr(&mut tcp_stream, immediate_peer, ctx).await {
-        Ok(a) => a,
-        Err(e) => {
-            drop(tcp_stream.shutdown().await);
-            return Err(e);
-        }
-    };
+    let (peer_addr, proxied_dst) =
+        match resolve_peer_addr(&mut tcp_stream, immediate_peer, ctx).await {
+            Ok(a) => a,
+            Err(e) => {
+                drop(tcp_stream.shutdown().await);
+                return Err(e);
+            }
+        };
 
     let span = info_span!("conn", peer = %peer_addr);
     async move {
@@ -1198,7 +1208,7 @@ async fn handle_connection_inner(
         let tenant = ctx.sessions.tenant_for(&agent_addr.id);
         let client_addrs = ClientAddrs {
             src: peer_addr,
-            dst: tcp_stream.local_addr()?,
+            dst: client_dst(tcp_stream.local_addr()?, proxied_dst),
         };
         let (bytes_in, bytes_out) = match policy {
             TlsMode::Passthrough => {
@@ -1316,13 +1326,14 @@ async fn handle_http_connection_inner(
     immediate_peer: std::net::SocketAddr,
     ctx: &ConnCtx,
 ) -> anyhow::Result<()> {
-    let peer_addr = match resolve_peer_addr(&mut tcp_stream, immediate_peer, ctx).await {
-        Ok(a) => a,
-        Err(e) => {
-            drop(tcp_stream.shutdown().await);
-            return Err(e);
-        }
-    };
+    let (peer_addr, proxied_dst) =
+        match resolve_peer_addr(&mut tcp_stream, immediate_peer, ctx).await {
+            Ok(a) => a,
+            Err(e) => {
+                drop(tcp_stream.shutdown().await);
+                return Err(e);
+            }
+        };
 
     let span = info_span!("http_conn", peer = %peer_addr);
     async move {
@@ -1355,7 +1366,7 @@ async fn handle_http_connection_inner(
 
         // The agent keys its cleartext origin-`:80` dial off
         // `dst.port() == 80`; the listener may be bound elsewhere (tests).
-        let mut dst = tcp_stream.local_addr()?;
+        let mut dst = client_dst(tcp_stream.local_addr()?, proxied_dst);
         dst.set_port(80);
         let client_addrs = ClientAddrs {
             src: peer_addr,
@@ -2452,6 +2463,18 @@ mod tests {
         let hostname = Box::pin(peek_http_hostname(&server)).await.unwrap();
         assert_eq!(hostname, "app.alice.test");
         drop(writer.await.unwrap());
+    }
+
+    #[test]
+    fn client_dst_takes_proxied_ip_and_local_port() {
+        let local: std::net::SocketAddr = "10.0.0.5:4443".parse().unwrap();
+        let proxied: std::net::SocketAddr = "[2001:db8::1]:443".parse().unwrap();
+        assert_eq!(
+            client_dst(local, Some(proxied)),
+            "[2001:db8::1]:4443"
+                .parse::<std::net::SocketAddr>()
+                .unwrap()
+        );
     }
 
     #[tokio::test]

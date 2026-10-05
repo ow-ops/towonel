@@ -1,3 +1,4 @@
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use anyhow::{Result, anyhow, ensure};
@@ -15,10 +16,24 @@ pub async fn run(
     sni: &str,
     fixture_pem_path: &std::path::Path,
 ) -> Result<()> {
+    run_as_client(edge_host, edge_tls_port, sni, fixture_pem_path, None).await
+}
+
+pub async fn run_as_client(
+    edge_host: &str,
+    edge_tls_port: u16,
+    sni: &str,
+    fixture_pem_path: &std::path::Path,
+    claimed_client: Option<(SocketAddr, SocketAddr)>,
+) -> Result<()> {
     let expected_der = load_fixture_leaf_der(fixture_pem_path)?;
 
     let mut tcp = TcpStream::connect((edge_host, edge_tls_port)).await?;
-    let header = proxy_v2::tcp_header(tcp.local_addr()?, tcp.peer_addr()?);
+    let (src, dst) = match claimed_client {
+        Some(addrs) => addrs,
+        None => (tcp.local_addr()?, tcp.peer_addr()?),
+    };
+    let header = proxy_v2::tcp_header(src, dst);
     tcp.write_all(&header).await?;
 
     let client_config = rustls::ClientConfig::builder()

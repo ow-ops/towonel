@@ -11,11 +11,18 @@ const V2_SIGNATURE: [u8; SIGNATURE_LEN] = [
     0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A,
 ];
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProxiedAddrs {
+    pub src: SocketAddr,
+    pub dst: SocketAddr,
+}
+
 /// Read a `HAProxy` PROXY protocol v2 header from `stream` and return the
-/// originating client address. The stream is advanced past the header so the
-/// caller can keep reading the original payload (TLS handshake, HTTP request,
-/// etc.). Returns an error if the bytes don't form a valid v2 PROXY header.
-pub async fn read_v2<R: AsyncRead + Unpin>(stream: &mut R) -> anyhow::Result<SocketAddr> {
+/// originating client and destination addresses. The stream is advanced past the
+/// header so the caller can keep reading the original payload (TLS handshake,
+/// HTTP request, etc.). Returns an error if the bytes don't form a valid v2
+/// PROXY header.
+pub async fn read_v2<R: AsyncRead + Unpin>(stream: &mut R) -> anyhow::Result<ProxiedAddrs> {
     let mut head = [0u8; FIXED_HEADER_LEN];
     stream.read_exact(&mut head).await?;
 
@@ -40,8 +47,14 @@ pub async fn read_v2<R: AsyncRead + Unpin>(stream: &mut R) -> anyhow::Result<Soc
         .map_err(|e| anyhow::anyhow!("parse PROXY v2: {e:?}"))?;
 
     match header.addresses {
-        v2::Addresses::IPv4(a) => Ok(SocketAddr::from((a.source_address, a.source_port))),
-        v2::Addresses::IPv6(a) => Ok(SocketAddr::from((a.source_address, a.source_port))),
+        v2::Addresses::IPv4(a) => Ok(ProxiedAddrs {
+            src: SocketAddr::from((a.source_address, a.source_port)),
+            dst: SocketAddr::from((a.destination_address, a.destination_port)),
+        }),
+        v2::Addresses::IPv6(a) => Ok(ProxiedAddrs {
+            src: SocketAddr::from((a.source_address, a.source_port)),
+            dst: SocketAddr::from((a.destination_address, a.destination_port)),
+        }),
         v2::Addresses::Unix(_) | v2::Addresses::Unspecified => {
             anyhow::bail!("unsupported PROXY v2 address family")
         }
@@ -76,13 +89,31 @@ mod tests {
         drop(client);
 
         let parsed = read_v2(&mut server).await.unwrap();
-        assert_eq!(parsed, src);
+        assert_eq!(parsed, ProxiedAddrs { src, dst });
 
         let mut rest = Vec::new();
         tokio::io::AsyncReadExt::read_to_end(&mut server, &mut rest)
             .await
             .unwrap();
         assert_eq!(rest, b"\x16\x03\x01trailing-tls-bytes");
+    }
+
+    #[tokio::test]
+    async fn parses_v6_header_with_destination() {
+        let src: SocketAddr = "[2001:db8::7]:54321".parse().unwrap();
+        let dst: SocketAddr = "[2001:db8::1]:443".parse().unwrap();
+        let bytes = build_v4_header(src, dst);
+
+        let (mut client, mut server) = tokio::io::duplex(8192);
+        tokio::io::AsyncWriteExt::write_all(&mut client, &bytes)
+            .await
+            .unwrap();
+        drop(client);
+
+        assert_eq!(
+            read_v2(&mut server).await.unwrap(),
+            ProxiedAddrs { src, dst }
+        );
     }
 
     #[tokio::test]
