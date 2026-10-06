@@ -19,9 +19,12 @@ use super::{
     json_ok_paged, json_with_status, not_found, paginate,
 };
 
-const MIN_RESERVABLE_PORT: u16 = 1024;
+pub(super) const MIN_RESERVABLE_PORT: u16 = 1024;
 
 const HUB_RESERVED_PORTS: &[u16] = &[4443, 8443, 51820];
+
+/// The edge's own HTTP/TLS listeners; never reservable, even by the operator.
+const EDGE_LISTENER_PORTS: &[u16] = &[80, 443];
 
 const AUTO_PICK_START: u16 = 10_000;
 const AUTO_PICK_END: u16 = 32_767;
@@ -32,6 +35,7 @@ pub(super) struct ReservePortRequest {
     protocol: String,
     #[serde(default)]
     ip: Option<String>,
+    /// Specific port to claim. Ports below 1024 are operator-only.
     #[serde(default)]
     preferred: Option<u16>,
     /// First port of a contiguous claim; set with `port_end` instead of
@@ -148,13 +152,14 @@ pub(super) async fn post_port(
         return invalid_request("protocol must be \"tcp\" or \"udp\"");
     };
 
-    let span = match requested_span(&state, &req, protocol) {
+    let operator = owner_user_id.is_none();
+    let span = match requested_span(&state, &req, protocol, operator) {
         Ok(span) => span,
         Err(resp) => return resp,
     };
 
     if let Some(p) = req.preferred
-        && let Err(msg) = validate_port_allowed(p)
+        && let Err(msg) = validate_port_allowed(p, operator)
     {
         return invalid_request(msg);
     }
@@ -572,6 +577,7 @@ fn requested_span(
     state: &AppState,
     req: &ReservePortRequest,
     protocol: PortProtocol,
+    operator: bool,
 ) -> Result<Option<(u16, u16)>, Response> {
     let (start, end) = match (req.port_start, req.port_end) {
         (None, None) => return Ok(None),
@@ -604,11 +610,12 @@ fn requested_span(
             state.max_udp_port_range
         )));
     }
-    if let Err(msg) = validate_port_allowed(start) {
+    if let Err(msg) = validate_port_allowed(start, operator) {
         return Err(invalid_request(msg));
     }
     if let Some(p) = HUB_RESERVED_PORTS
         .iter()
+        .chain(EDGE_LISTENER_PORTS)
         .find(|p| (start..=end).contains(p))
     {
         return Err(invalid_request(format!(
@@ -698,13 +705,17 @@ async fn pick_ip_for_span(
     ))
 }
 
-fn validate_port_allowed(port: u16) -> Result<(), String> {
-    if port < MIN_RESERVABLE_PORT {
+/// The operator may go below [`MIN_RESERVABLE_PORT`]; users may not.
+fn validate_port_allowed(port: u16, operator: bool) -> Result<(), String> {
+    if port == 0 {
+        return Err("port 0 is not reservable".to_string());
+    }
+    if port < MIN_RESERVABLE_PORT && !operator {
         return Err(format!(
             "port {port} is below the reservable floor ({MIN_RESERVABLE_PORT})"
         ));
     }
-    if HUB_RESERVED_PORTS.contains(&port) {
+    if HUB_RESERVED_PORTS.contains(&port) || EDGE_LISTENER_PORTS.contains(&port) {
         return Err(format!("port {port} is reserved by the hub/edge"));
     }
     Ok(())
@@ -993,20 +1004,29 @@ mod tests {
 
     #[test]
     fn validate_blocks_floor() {
-        assert!(validate_port_allowed(1023).is_err());
-        assert!(validate_port_allowed(80).is_err());
+        assert!(validate_port_allowed(1023, false).is_err());
+        assert!(validate_port_allowed(22, false).is_err());
+        assert!(validate_port_allowed(80, false).is_err());
     }
 
     #[test]
     fn validate_blocks_hub_ports() {
-        assert!(validate_port_allowed(4443).is_err());
-        assert!(validate_port_allowed(8443).is_err());
-        assert!(validate_port_allowed(51820).is_err());
+        for operator in [false, true] {
+            for port in [0, 80, 443, 4443, 8443, 51820] {
+                assert!(validate_port_allowed(port, operator).is_err(), "{port}");
+            }
+        }
     }
 
     #[test]
     fn validate_allows_normal_port() {
-        validate_port_allowed(22000).unwrap();
-        validate_port_allowed(9000).unwrap();
+        validate_port_allowed(22000, false).unwrap();
+        validate_port_allowed(9000, false).unwrap();
+    }
+
+    #[test]
+    fn validate_lets_operator_below_floor() {
+        validate_port_allowed(22, true).unwrap();
+        validate_port_allowed(1023, true).unwrap();
     }
 }

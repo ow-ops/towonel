@@ -2293,6 +2293,113 @@ async fn require_reservation_is_per_protocol() {
 }
 
 #[tokio::test]
+async fn operator_can_reserve_privileged_ports() {
+    let hub = TestHub::start().await;
+    let client = reqwest::Client::new();
+    let token = create_invite(&hub, &client, "alice", &["app.alice.test"]).await;
+    let tenant = tenant_from_token(&token);
+    let url = hub.url(&format!("/v1/tenants/{}/ports", tenant.id()));
+
+    let (status, body) = post_json(
+        &client,
+        &url,
+        json!({"protocol": "tcp", "preferred": 22, "label": "ssh"}),
+        Some(OPERATOR_KEY),
+    )
+    .await;
+    assert_eq!(status, 201, "{body}");
+    assert_eq!(body["port"], 22);
+
+    let (status, body) = post_json(
+        &client,
+        &url,
+        json!({"protocol": "udp", "port_start": 500, "port_end": 510}),
+        Some(OPERATOR_KEY),
+    )
+    .await;
+    assert_eq!(status, 201, "{body}");
+}
+
+#[tokio::test]
+async fn operator_cannot_reserve_edge_or_hub_ports() {
+    let hub = TestHub::start().await;
+    let client = reqwest::Client::new();
+    let token = create_invite(&hub, &client, "alice", &["app.alice.test"]).await;
+    let tenant = tenant_from_token(&token);
+    let url = hub.url(&format!("/v1/tenants/{}/ports", tenant.id()));
+
+    for port in [0, 80, 443, 4443, 8443, 51820] {
+        let (status, body) = post_json(
+            &client,
+            &url,
+            json!({"protocol": "tcp", "preferred": port}),
+            Some(OPERATOR_KEY),
+        )
+        .await;
+        assert_eq!(status, 400, "port {port}: {body}");
+    }
+
+    let (status, body) = post_json(
+        &client,
+        &url,
+        json!({"protocol": "udp", "port_start": 400, "port_end": 500}),
+        Some(OPERATOR_KEY),
+    )
+    .await;
+    assert_eq!(status, 400, "{body}");
+}
+
+#[tokio::test]
+async fn reserved_privileged_port_publishable_only_by_its_tenant() {
+    let hub = TestHub::start_with(true).await;
+    let client = reqwest::Client::new();
+    let alice_token = create_invite(&hub, &client, "alice", &["app.alice.test"]).await;
+    let alice = tenant_from_token(&alice_token);
+    let bob_token = create_invite(&hub, &client, "bob", &["app.bob.test"]).await;
+    let bob = tenant_from_token(&bob_token);
+
+    let (status, body) = post_json(
+        &client,
+        &hub.url(&format!("/v1/tenants/{}/ports", alice.id())),
+        json!({"protocol": "tcp", "preferred": 22}),
+        Some(OPERATOR_KEY),
+    )
+    .await;
+    assert_eq!(status, 201, "{body}");
+
+    let ssh = ConfigOp::UpsertTcpService {
+        service: "ssh".into(),
+        listen_port: 22,
+    };
+    let (status, body) = submit_entry(&client, &hub, &bob, 1, ssh.clone()).await;
+    assert_eq!(status, 400, "{body}");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("privileged"),
+        "got body: {body}"
+    );
+
+    let (status, body) = submit_entry(
+        &client,
+        &hub,
+        &alice,
+        1,
+        ConfigOp::UpsertUdpService {
+            service: "ssh-udp".into(),
+            listen_port: 22,
+            idle_timeout_secs: None,
+        },
+    )
+    .await;
+    assert_eq!(status, 400, "tcp reservation must not unlock udp: {body}");
+
+    let (status, body) = submit_entry(&client, &hub, &alice, 2, ssh).await;
+    assert_eq!(status, 200, "{body}");
+}
+
+#[tokio::test]
 async fn unknown_op_variant_returns_unsupported_op() {
     #[derive(Serialize)]
     #[serde(rename_all = "snake_case")]
@@ -3676,6 +3783,53 @@ async fn owner_user_can_reserve_port() {
     let body: Value = resp.json().await.unwrap();
     assert_eq!(status, 201, "expected 201, got {status}: {body}");
     assert_eq!(body["port"], 22200);
+}
+
+#[tokio::test]
+async fn owner_user_cannot_reserve_privileged_port() {
+    let hub = TestHub::start().await;
+    let client = reqwest::Client::new();
+
+    let cookie = signup_and_login_user(&hub, &client, "owner@example.test", "hunter22!").await;
+    let user_id = user_id_by_email(&hub, "owner@example.test").await;
+
+    let token = create_invite(&hub, &client, "tenant-owner", &["a.owner.test"]).await;
+    let tenant = tenant_from_token(&token);
+
+    hub.state
+        .db
+        .insert_tenant_ownership(super::db::tenant_ownership::NewTenantOwnership {
+            user_id: &user_id,
+            tenant_id: tenant.id().as_bytes(),
+            invite_id: &[0u8; 16],
+            display_name: "test",
+            now_ms: 1,
+        })
+        .await
+        .expect("insert_tenant_ownership");
+
+    for req in [
+        json!({"protocol": "tcp", "preferred": 22}),
+        json!({"protocol": "udp", "port_start": 500, "port_end": 510}),
+    ] {
+        let resp = client
+            .post(hub.url(&format!("/v1/tenants/{}/ports", tenant.id())))
+            .header(reqwest::header::COOKIE, &cookie)
+            .json(&req)
+            .send()
+            .await
+            .unwrap();
+        let status = resp.status();
+        let body: Value = resp.json().await.unwrap();
+        assert_eq!(status, 400, "{req}: {body}");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("floor"),
+            "got body: {body}"
+        );
+    }
 }
 
 #[tokio::test]

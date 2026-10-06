@@ -239,8 +239,10 @@ decommissions a tenant in one shot.
 Each port is unique per tenant and across tenants: claiming a port
 already bound to a different service — yours or somebody else's — is
 rejected at submission time. Privileged ports (`< 1024`) are blocked by
-default — set `TOWONEL_HUB_ALLOW_PRIVILEGED_PORTS=true` on the hub to
-allow them.
+default. Only the operator can reserve one for a tenant (`POST
+/v1/tenants/$TENANT/ports` with the operator key; 80 and 443 stay off-limits),
+and that tenant can then serve it. Set `TOWONEL_HUB_ALLOW_PRIVILEGED_PORTS=true`
+on the hub to allow them for every tenant.
 
 ## Raw UDP services
 

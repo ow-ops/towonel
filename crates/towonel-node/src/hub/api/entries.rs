@@ -89,13 +89,13 @@ fn allow_privileged_ports() -> bool {
     })
 }
 
-fn validate_listen_port(port: u16) -> Result<(), &'static str> {
+fn validate_listen_port(port: u16, reserved: bool) -> Result<(), &'static str> {
     if port == 0 {
         return Err("must not be 0");
     }
-    if port < 1024 && !allow_privileged_ports() {
+    if port < super::ports::MIN_RESERVABLE_PORT && !reserved && !allow_privileged_ports() {
         return Err(
-            "privileged ports (<1024) are blocked; set TOWONEL_HUB_ALLOW_PRIVILEGED_PORTS=true to override",
+            "privileged ports (<1024) need an operator reservation; set TOWONEL_HUB_ALLOW_PRIVILEGED_PORTS=true to override",
         );
     }
     Ok(())
@@ -162,6 +162,40 @@ fn find_port_conflict(
     None
 }
 
+async fn tenant_owns_span(
+    state: &Arc<AppState>,
+    kind: ServiceKind,
+    port_start: u16,
+    port_end: u16,
+    tenant_id: &TenantId,
+) -> Result<bool, Response> {
+    let protocol = match kind {
+        ServiceKind::Tcp => PortProtocol::Tcp,
+        ServiceKind::Udp => PortProtocol::Udp,
+    };
+    state
+        .db
+        .tenant_owns_port_span(tenant_id, port_start, port_end, protocol)
+        .await
+        .map_err(|e| {
+            warn!(error = %e, "tenant_owns_port_span query failed");
+            internal_error()
+        })
+}
+
+async fn privileged_span_reserved(
+    state: &Arc<AppState>,
+    kind: ServiceKind,
+    port_start: u16,
+    port_end: u16,
+    tenant_id: &TenantId,
+) -> Result<bool, Response> {
+    if port_start >= super::ports::MIN_RESERVABLE_PORT {
+        return Ok(false);
+    }
+    tenant_owns_span(state, kind, port_start, port_end, tenant_id).await
+}
+
 async fn require_reservation(
     state: &Arc<AppState>,
     kind: ServiceKind,
@@ -169,19 +203,7 @@ async fn require_reservation(
     port_end: u16,
     tenant_id: &TenantId,
 ) -> Result<(), Response> {
-    let protocol = match kind {
-        ServiceKind::Tcp => PortProtocol::Tcp,
-        ServiceKind::Udp => PortProtocol::Udp,
-    };
-    let owns = state
-        .db
-        .tenant_owns_port_span(tenant_id, port_start, port_end, protocol)
-        .await
-        .map_err(|e| {
-            warn!(error = %e, "tenant_owns_port_span query failed");
-            internal_error()
-        })?;
-    if owns {
+    if tenant_owns_span(state, kind, port_start, port_end, tenant_id).await? {
         return Ok(());
     }
     state
@@ -236,7 +258,10 @@ async fn validate_service_op(
     };
     if let Some((kind, listen_port)) = upsert {
         let r = kind.reasons();
-        if let Err(e) = validate_listen_port(listen_port) {
+        let reserved =
+            privileged_span_reserved(state, kind, listen_port, listen_port, &payload.tenant_id)
+                .await?;
+        if let Err(e) = validate_listen_port(listen_port, reserved) {
             state.metrics.record_reject(r.invalid_port);
             return Err(invalid_request(format!(
                 "invalid {} listen_port {listen_port}: {e}",
@@ -275,7 +300,15 @@ async fn validate_service_op(
         ..
     } = &payload.op
     {
-        if let Some(resp) = validate_udp_range(state, *port_start, *port_end) {
+        let reserved = privileged_span_reserved(
+            state,
+            ServiceKind::Udp,
+            *port_start,
+            *port_end,
+            &payload.tenant_id,
+        )
+        .await?;
+        if let Some(resp) = validate_udp_range(state, *port_start, *port_end, reserved) {
             return Err(resp);
         }
         if state.ports_require_reservation
@@ -297,8 +330,13 @@ async fn validate_service_op(
 /// Validate a UDP range against the privileged-port gate, ordering, and the
 /// hub's `max_udp_port_range` cap. Returns the rejection response (and records
 /// the reject metric) on failure, mirroring [`check_port_conflict`].
-fn validate_udp_range(state: &AppState, port_start: u16, port_end: u16) -> Option<Response> {
-    let msg = if let Err(e) = validate_listen_port(port_start) {
+fn validate_udp_range(
+    state: &AppState,
+    port_start: u16,
+    port_end: u16,
+    reserved: bool,
+) -> Option<Response> {
+    let msg = if let Err(e) = validate_listen_port(port_start, reserved) {
         format!("invalid udp port_start {port_start}: {e}")
     } else if port_end < port_start {
         format!("udp port_end {port_end} must be >= port_start {port_start}")
