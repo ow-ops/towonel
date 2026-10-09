@@ -1,6 +1,12 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
-  "extends": ["local>eleboucher/renovate-config"],
+  "extends": [
+    "config:recommended",
+    ":semanticCommitTypeAll(chore)",
+    ":gitSignOff",
+    "helpers:pinGitHubActionDigests",
+    "docker:pinDigests"
+  ],
   "lockFileMaintenance": {
     "enabled": true,
     "schedule": ["before 5am on monday"]
