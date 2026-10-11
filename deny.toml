@@ -81,6 +81,7 @@ skip = [
   { crate = "syn" },
   { crate = "thiserror" },
   { crate = "thiserror-impl" },
+  { crate = "windows-link" },
   { crate = "windows-sys" },
   { crate = "windows-targets" },
   { crate = "windows_aarch64_gnullvm" },
@@ -112,4 +113,5 @@ skip-tree = []
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
-allow-git = []
+# noq BBRv3 pacing fix (n0-computer/noq#802) until it ships.
+allow-git = ["https://github.com/richinsley/noq"]
