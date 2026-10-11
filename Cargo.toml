@@ -246,3 +246,9 @@ opentelemetry-http = { version = "0.32", default-features = false }
 tracing-opentelemetry = "0.33"
 webauthn-rs = { version = "0.5" }
 uuid = { version = "1", features = ["v5"] }
+
+# BBRv3 never paces app-limited flows (n0-computer/noq#800); drop once #802 ships.
+[patch.crates-io]
+noq = { git = "https://github.com/richinsley/noq", rev = "b97db8b0740b692a7879865734ff670aecd8a18c" }
+noq-proto = { git = "https://github.com/richinsley/noq", rev = "b97db8b0740b692a7879865734ff670aecd8a18c" }
+noq-udp = { git = "https://github.com/richinsley/noq", rev = "b97db8b0740b692a7879865734ff670aecd8a18c" }
