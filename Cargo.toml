@@ -247,8 +247,9 @@ tracing-opentelemetry = "0.33"
 webauthn-rs = { version = "0.5" }
 uuid = { version = "1", features = ["v5"] }
 
-# BBRv3 never paces app-limited flows (n0-computer/noq#800); drop once #802 ships.
+# BBRv3 fixes: app-limited pacing (n0-computer/noq#802) and idle keepalives
+# collapsing max_bw (n0-computer/noq#852). Drop once both ship.
 [patch.crates-io]
-noq = { git = "https://github.com/richinsley/noq", rev = "b97db8b0740b692a7879865734ff670aecd8a18c" }
-noq-proto = { git = "https://github.com/richinsley/noq", rev = "b97db8b0740b692a7879865734ff670aecd8a18c" }
-noq-udp = { git = "https://github.com/richinsley/noq", rev = "b97db8b0740b692a7879865734ff670aecd8a18c" }
+noq = { git = "https://github.com/eleboucher/noq", rev = "77b0c5c21b51800e9bf60362bc913894d52c49e1" }
+noq-proto = { git = "https://github.com/eleboucher/noq", rev = "77b0c5c21b51800e9bf60362bc913894d52c49e1" }
+noq-udp = { git = "https://github.com/eleboucher/noq", rev = "77b0c5c21b51800e9bf60362bc913894d52c49e1" }
