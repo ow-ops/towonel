@@ -238,7 +238,7 @@ async fn handle_connection(
         edge_public_ips,
     ));
     let control_semaphore = Arc::new(Semaphore::new(MAX_INFLIGHT_CONTROL));
-    let result = read_loop(
+    let read = read_loop(
         reader,
         ReadLoopCtx {
             state: &state,
@@ -250,8 +250,15 @@ async fn handle_connection(
             shutdown: shutdown.clone(),
             snapshot_received,
         },
-    )
-    .await;
+    );
+    let result = tokio::select! {
+        result = read => result,
+        () = async {
+            while state.is_leader.load(std::sync::atomic::Ordering::Relaxed) {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        } => Err(anyhow::anyhow!("hub is no longer the leader")),
+    };
 
     drop(writer_tx);
     pusher_task.abort();
@@ -565,6 +572,59 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn edge_reconnects_after_demotion() {
+        let old_hub = TestHub::start().await;
+        let edge_id = [11; 32];
+        let tenant = TenantKeypair::generate().id();
+        let agent = AgentKeypair::generate().id();
+        let key = (tenant, agent.clone());
+        let snapshot = EdgeToHub::SessionsSnapshot {
+            sessions: vec![(agent, tenant)],
+        };
+        let (mut old, old_handler) = connect_link(Arc::clone(&old_hub.state), edge_id).await;
+        write_edge_to_hub(&mut old, &snapshot).await.unwrap();
+        assert_link_responds(&mut old).await;
+        assert!(old_hub.state.live_agents.snapshot().contains(&key));
+        assert!(!old_hub.state.live_edges.snapshot().is_empty());
+
+        old_hub
+            .state
+            .is_leader
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        let result = tokio::time::timeout(Duration::from_secs(3), old_handler)
+            .await
+            .expect("former leader kept its idle edge link open")
+            .unwrap();
+        assert!(result.is_err());
+        assert!(old_hub.state.live_edges.snapshot().is_empty());
+        assert!(!old_hub.state.live_agents.snapshot().contains(&key));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while read_hub_to_edge(&mut old).await.is_ok() {}
+        })
+        .await
+        .expect("former leader did not close the edge socket");
+
+        let new_hub = TestHub::start().await;
+        let (mut new, new_handler) = connect_link(Arc::clone(&new_hub.state), edge_id).await;
+        write_edge_to_hub(&mut new, &snapshot).await.unwrap();
+        assert_link_responds(&mut new).await;
+        assert!(new_hub.state.live_agents.snapshot().contains(&key));
+        assert!(
+            new_hub
+                .state
+                .live_edges
+                .snapshot()
+                .iter()
+                .any(|edge| edge.0 == edge_id)
+        );
+        drop(new);
+        let _disconnected = tokio::time::timeout(Duration::from_secs(2), new_handler)
+            .await
+            .unwrap()
+            .unwrap();
     }
 
     #[tokio::test]
