@@ -17,7 +17,7 @@ jobs:
       release_id: ${{ steps.create.outputs.release_id }}
       tag: ${{ steps.create.outputs.tag }}
     steps:
-      - uses: https://data.forgejo.org/actions/checkout@v7
+      - uses: https://data.forgejo.org/actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 0
       - name: Install git-cliff
@@ -87,38 +87,38 @@ jobs:
       # renovate: datasource=github-releases depName=sigstore/cosign
       COSIGN_VERSION: "3.0.5"
     steps:
-      - uses: https://data.forgejo.org/actions/checkout@v7
-      - uses: https://data.forgejo.org/docker/setup-qemu-action@v4
+      - uses: https://data.forgejo.org/actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: https://data.forgejo.org/docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4
         with:
           platforms: arm64
-      - uses: https://data.forgejo.org/docker/setup-buildx-action@v4
+      - uses: https://data.forgejo.org/docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
       - uses: https://github.com/dtolnay/rust-toolchain@1.96.0
-      - uses: https://github.com/taiki-e/install-action@v2
+      - uses: https://github.com/taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2
         with:
           tool: cargo-edit
       - name: Set version from git tag
         run: cargo set-version "${GITHUB_REF#refs/tags/v}"
       - name: Login to git.ow-ops.eu
-        uses: https://data.forgejo.org/docker/login-action@v4
+        uses: https://data.forgejo.org/docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4
         with:
           registry: git.ow-ops.eu
           username: owl-bot
           password: ${{ secrets.FORGE_TOKEN }}
       - name: Login to codeberg.org
-        uses: https://data.forgejo.org/docker/login-action@v4
+        uses: https://data.forgejo.org/docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4
         with:
           registry: codeberg.org
           username: owl-bot
           password: ${{ secrets.CODEBERG_TOKEN }}
       - name: Login to registry.erwanleboucher.dev
-        uses: https://data.forgejo.org/docker/login-action@v4
+        uses: https://data.forgejo.org/docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4
         with:
           registry: registry.erwanleboucher.dev
           username: eleboucher
           password: ${{ secrets.APOCI_REGISTRY_TOKEN }}
       - name: Compute node image metadata
         id: meta-node
-        uses: https://data.forgejo.org/docker/metadata-action@v6
+        uses: https://data.forgejo.org/docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6
         with:
           images: |
             git.ow-ops.eu/towonel/towonel-node
@@ -129,7 +129,7 @@ jobs:
             type=semver,pattern={{major}}.{{minor}}
       - name: Build and push towonel-node
         id: build-node
-        uses: https://data.forgejo.org/docker/build-push-action@v7
+        uses: https://data.forgejo.org/docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
         with:
           context: .
           file: Dockerfile.node
@@ -147,7 +147,7 @@ jobs:
           cache-from: type=registry,ref=git.ow-ops.eu/towonel/towonel-buildcache:node
           cache-to: type=registry,ref=git.ow-ops.eu/towonel/towonel-buildcache:node,mode=max,ignore-error=true
       - name: Extract node binaries
-        uses: https://data.forgejo.org/docker/build-push-action@v7
+        uses: https://data.forgejo.org/docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
         with:
           context: .
           file: Dockerfile.node
@@ -162,7 +162,7 @@ jobs:
           cache-from: type=registry,ref=git.ow-ops.eu/towonel/towonel-buildcache:node
       - name: Compute agent image metadata
         id: meta-agent
-        uses: https://data.forgejo.org/docker/metadata-action@v6
+        uses: https://data.forgejo.org/docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6
         with:
           images: |
             git.ow-ops.eu/towonel/towonel-agent
@@ -173,7 +173,7 @@ jobs:
             type=semver,pattern={{major}}.{{minor}}
       - name: Build and push towonel-agent
         id: build-agent
-        uses: https://data.forgejo.org/docker/build-push-action@v7
+        uses: https://data.forgejo.org/docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
         with:
           context: .
           file: Dockerfile.agent
@@ -191,7 +191,7 @@ jobs:
           cache-from: type=registry,ref=git.ow-ops.eu/towonel/towonel-buildcache:agent
           cache-to: type=registry,ref=git.ow-ops.eu/towonel/towonel-buildcache:agent,mode=max,ignore-error=true
       - name: Extract agent binaries
-        uses: https://data.forgejo.org/docker/build-push-action@v7
+        uses: https://data.forgejo.org/docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
         with:
           context: .
           file: Dockerfile.agent
@@ -206,7 +206,7 @@ jobs:
           cache-from: type=registry,ref=git.ow-ops.eu/towonel/towonel-buildcache:agent
       - name: Compute hub-caddy image metadata
         id: meta-hub-caddy
-        uses: https://data.forgejo.org/docker/metadata-action@v6
+        uses: https://data.forgejo.org/docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6
         with:
           images: |
             git.ow-ops.eu/towonel/towonel-hub-caddy
@@ -217,7 +217,7 @@ jobs:
             type=semver,pattern={{major}}.{{minor}}
       - name: Build and push towonel-hub-caddy
         id: build-hub-caddy
-        uses: https://data.forgejo.org/docker/build-push-action@v7
+        uses: https://data.forgejo.org/docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
         with:
           context: .
           file: Dockerfile.hub-caddy
@@ -337,8 +337,8 @@ jobs:
       # renovate: datasource=github-releases depName=sigstore/cosign
       COSIGN_VERSION: "3.0.5"
     steps:
-      - uses: https://data.forgejo.org/actions/checkout@v7
-      - uses: https://github.com/azure/setup-helm@v5
+      - uses: https://data.forgejo.org/actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: https://github.com/azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5
         with:
           # Pin Helm 3 so `helm push` keeps emitting the "Digest:" line the
           # chart-signing step parses; Helm 4 changed plugin/OCI behaviour.

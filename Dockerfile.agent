@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:1.26
+# syntax=docker/dockerfile:1.26@sha256:ecfaec9ed6d810b56388c508f4121597bfbba70d41a6dfeee4d8cad5f295fc32
 
 FROM --platform=$BUILDPLATFORM rust:1.98-bookworm AS chef
 ARG BUILDARCH
@@ -114,12 +114,12 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,id=cargo-registry-${TARG
 FROM scratch AS artifact
 COPY --from=builder /towonel-agent /towonel-agent
 
-FROM debian:bookworm-slim AS runtime-prep
+FROM debian:bookworm-slim@sha256:7ff6ba31527b9e336162fa061746c366c4b2032f4d2cff2078bea43f78efe3f8 AS runtime-prep
 RUN groupadd -g 10001 nonroot \
     && useradd -u 10001 -g 10001 -M -s /sbin/nologin nonroot \
     && install -d -o 10001 -g 10001 /home/nonroot
 
-FROM gcr.io/distroless/cc-debian12
+FROM gcr.io/distroless/cc-debian12@sha256:e5d81ddde149641e2a9ba55be4545bc125c67de07508b03ba4c22e6eb0ded5aa
 ARG VERSION=dev
 ARG REVISION=unknown
 ARG CREATED=

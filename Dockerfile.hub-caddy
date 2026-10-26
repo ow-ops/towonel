@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:1.26
+# syntax=docker/dockerfile:1.26@sha256:ecfaec9ed6d810b56388c508f4121597bfbba70d41a6dfeee4d8cad5f295fc32
 
 # Bundled hub image: towonel-node + Caddy (with the L4 plugin), supervised
 # by tini and a small bash entrypoint. Caddy binds the privileged ports
@@ -137,7 +137,7 @@ RUN GOOS=linux GOARCH=${TARGETARCH} CGO_ENABLED=0 \
 # ============================================================
 # Stage 3: runtime prep — users, dirs, binaries
 # ============================================================
-FROM debian:bookworm-slim AS runtime-prep
+FROM debian:bookworm-slim@sha256:7ff6ba31527b9e336162fa061746c366c4b2032f4d2cff2078bea43f78efe3f8 AS runtime-prep
 RUN groupadd -g 10001 nonroot \
     && useradd -u 10001 -g 10001 -M -s /sbin/nologin nonroot \
     && install -d -o 10001 -g 10001 /var/lib/towonel /etc/towonel /data /data/certs /home/nonroot
@@ -148,7 +148,7 @@ COPY --from=caddy-builder /caddy-build/caddy /usr/local/bin/caddy
 # ============================================================
 # Stage 4: final runtime image
 # ============================================================
-FROM debian:bookworm-slim
+FROM debian:bookworm-slim@sha256:7ff6ba31527b9e336162fa061746c366c4b2032f4d2cff2078bea43f78efe3f8
 ARG VERSION=dev
 ARG REVISION=unknown
 ARG CREATED=
