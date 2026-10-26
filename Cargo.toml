@@ -177,8 +177,8 @@ async-stream = "0.3"
 tower_governor = { version = "0.8", default-features = false, features = [
   "axum",
 ] }
-utoipa = { version = "5", features = ["axum_extras"] }
-utoipa-swagger-ui = { version = "9", default-features = false, features = [
+utoipa = { version = "6", features = ["axum_extras"] }
+utoipa-swagger-ui = { version = "10", default-features = false, features = [
   "axum",
 ] }
 aes-gcm = "0.11"
