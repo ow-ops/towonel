@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:1.26
+# syntax=docker/dockerfile:1.26@sha256:ecfaec9ed6d810b56388c508f4121597bfbba70d41a6dfeee4d8cad5f295fc32
 #
 # The production agent image is distroless. This e2e variant rebases on
 # debian-slim so the entrypoint can poll the test-runner's token broker
@@ -16,7 +16,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     cargo build --release -p towonel-agent \
     && cp target/release/towonel-agent /usr/local/bin/towonel-agent
 
-FROM debian:bookworm-slim
+FROM debian:bookworm-slim@sha256:7ff6ba31527b9e336162fa061746c366c4b2032f4d2cff2078bea43f78efe3f8
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl iptables \
     && rm -rf /var/lib/apt/lists/*
