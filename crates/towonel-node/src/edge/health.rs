@@ -13,11 +13,13 @@ use towonel_common::identity::TenantId;
 use towonel_common::metrics::{
     register_counter, register_counter_vec, register_gauge, register_gauge_vec,
 };
+use towonel_common::quic_metrics::QuicMetrics;
 
 /// Edge observability surface. Cheap to clone: the `prometheus` metric
 /// types are internally `Arc`-shared and the `Registry` is held as an `Arc`.
 #[derive(Clone)]
 pub struct EdgeMetrics {
+    pub quic: QuicMetrics,
     pub active_connections: IntGauge,
     pub total_connections: IntCounter,
     pub total_bytes_in: IntCounter,
@@ -127,6 +129,7 @@ impl EdgeMetrics {
         let r = Registry::new();
         towonel_common::process_metrics::register(&r);
         Self {
+            quic: QuicMetrics::register(&r, "towonel_edge_quic", "agent"),
             active_connections: register_gauge(
                 &r,
                 "towonel_edge_active_connections",

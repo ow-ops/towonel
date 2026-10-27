@@ -30,7 +30,7 @@ tests:
           origin: pg:5432
     asserts:
       - equal:
-          path: spec.groups[0].rules[3].alert
+          path: spec.groups[0].rules[4].alert
           value: TowonelAgentMeshDown
 
   - it: has no mesh alert without the mesh
@@ -38,4 +38,25 @@ tests:
       monitoring.prometheusRule.enabled: true
     asserts:
       - notExists:
-          path: spec.groups[0].rules[3]
+          path: spec.groups[0].rules[4]
+
+  - it: alerts on connected replicas that accept no traffic
+    set:
+      monitoring.prometheusRule.enabled: true
+      monitoring.prometheusRule.additionalRuleLabels.team: tunnels
+    asserts:
+      - equal:
+          path: spec.groups[0].rules[3].alert
+          value: TowonelAgentStalled
+      - equal:
+          path: spec.groups[0].rules[3].for
+          value: 15m
+      - matchRegex:
+          path: spec.groups[0].rules[3].expr
+          pattern: 'and on \(cluster, namespace, job\) sum by \(cluster, namespace, job\)'
+      - matchRegex:
+          path: spec.groups[0].rules[3].expr
+          pattern: 'towonel_agent_edge_session_state.*== 1'
+      - equal:
+          path: spec.groups[0].rules[3].labels.team
+          value: tunnels

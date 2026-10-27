@@ -31,6 +31,10 @@ pub const HTTP_ROUTE_PREFIX: &str = "http:";
 /// so it skips the PROXY v2 wrap entirely.
 pub const CONTROL_PREFIX: &str = "ctrl:";
 
+/// Agent supports acknowledging routing headers before client data is sent.
+pub const CONTROL_OPCODE_STREAM_ACK: u8 = 0x02;
+pub const STREAM_ACK_PREFIX: &str = "ctrl:ack:";
+
 pub const CONTROL_STATUS_OK: u8 = 0;
 pub const CONTROL_STATUS_NOT_IMPLEMENTED: u8 = 1;
 pub const CONTROL_STATUS_INVALID: u8 = 2;

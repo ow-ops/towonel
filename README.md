@@ -518,6 +518,43 @@ hostNetwork DaemonSet. Values are documented in the chart READMEs:
 [`charts/towonel-agent`](charts/towonel-agent/README.md). Standalone
 Grafana dashboards live in [`deploy/grafana/`](deploy/grafana/).
 
+## Stream admission
+
+Agents advertise support for stream acknowledgements on each connection.
+The edge then waits up to five seconds for the agent to acknowledge the
+routing header before forwarding client data. On failure it closes the
+session and tries another replica. Stream-credit exhaustion keeps its
+existing two-second timeout without closing the session.
+
+This adds one tunnel round trip per service connection and requires both
+agent and edge to be updated. Older peers keep the previous stream format.
+The `TowonelAgentStalled` chart alert also detects connected replicas that
+accept no traffic while their peers are active.
+
+## QUIC metrics
+
+Both `/metrics` endpoints collect live QUIC sessions on each scrape.
+Names start with `towonel_agent_quic_` (`edge` label: short endpoint ID)
+or `towonel_edge_quic_` (`agent` label: full endpoint ID).
+
+| Suffix | Type | Additional labels | Meaning |
+| --- | --- | --- | --- |
+| `path_rtt_seconds` | gauge | `path` | Path round-trip time estimate |
+| `path_cwnd_bytes` | gauge | `path` | Path congestion window |
+| `path_congestion_events_total` | counter | `path` | Congestion events |
+| `path_lost_packets_total` | counter | `path` | Lost packets |
+| `path_udp_bytes_total` | counter | `path`, `direction` | UDP payload bytes (`tx` or `rx`) |
+| `path_selected` | gauge | `path` | 1 for the path selected for application data, 0 otherwise |
+| `path_relay` | gauge | `path` | 1 for a relay path, 0 otherwise |
+| `frames_total` | counter | `direction`, `frame` | Connection frame counts |
+
+`path` is iroh's connection-local path ID. Counters reset when their
+connection or path is replaced; closed sessions and paths disappear on
+the next scrape. TLS fallback sessions have no QUIC series. Frame counts
+include closed paths. `direction` is `tx` or `rx`; `frame` is `stream`,
+`max_streams_bidi`, `streams_blocked_bidi`, or `max_data`. Flow-control
+counters count frames, not available credit.
+
 ## Configuration reference
 
 All settings come from `TOWONEL_*` environment variables (flat names,

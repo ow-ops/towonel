@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use iroh::EndpointId;
@@ -12,12 +12,25 @@ use super::health::{EdgeMetrics, session_reject_reason};
 pub struct AgentSession {
     pub agent_id: EndpointId,
     conn: TunnelConn,
+    stream_acks: AtomicBool,
 }
 
 impl AgentSession {
     #[must_use]
     pub const fn new(agent_id: EndpointId, conn: TunnelConn) -> Self {
-        Self { agent_id, conn }
+        Self {
+            agent_id,
+            conn,
+            stream_acks: AtomicBool::new(false),
+        }
+    }
+
+    pub(super) fn enable_stream_acks(&self) {
+        self.stream_acks.store(true, Ordering::Relaxed);
+    }
+
+    pub(super) fn stream_acks_enabled(&self) -> bool {
+        self.stream_acks.load(Ordering::Relaxed)
     }
 
     pub async fn open_stream(&self) -> std::io::Result<(TunnelSend, TunnelRecv)> {
@@ -183,6 +196,9 @@ impl SessionRegistry {
             }
         }
         self.metrics.sessions_total.inc();
+        self.metrics
+            .quic
+            .insert(&agent_id.to_string(), &session.conn);
         info!(agent = %agent_id.fmt_short(), "agent session registered");
     }
 
@@ -198,6 +214,7 @@ impl SessionRegistry {
             current.conn_stable_id() == stable_id
         });
         if let Ok(Some(_)) = result {
+            self.metrics.quic.remove(&agent_id.to_string(), stable_id);
             self.metrics.active_sessions.dec();
             // The membership lock guarantees no `register` interleaved, so a
             // matched removal means this was the live session — release its
@@ -294,6 +311,30 @@ mod tests {
     }
 
     const TEST_MAX_PER_TENANT: usize = 1000;
+
+    async fn scrape(registry: &SessionRegistry) -> String {
+        use axum::body::{Body, to_bytes};
+        use axum::http::{Request, StatusCode};
+        use tower::ServiceExt as _;
+
+        let response = super::super::health::router(registry.metrics.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        String::from_utf8(
+            to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap()
+    }
 
     #[test]
     fn per_tenant_connection_limit_enforced() {
@@ -411,6 +452,9 @@ mod tests {
             registry.get(&agent_id).is_some(),
             "agent did not register within timeout"
         );
+        let metrics = scrape(&registry).await;
+        assert!(metrics.contains("towonel_edge_quic_frames_total"));
+        assert!(metrics.contains(&format!("agent=\"{agent_id}\"")));
 
         conn.close(0u32.into(), b"bye");
         agent_ep.close().await;
@@ -425,6 +469,7 @@ mod tests {
             registry.get(&agent_id).is_none(),
             "session was not removed after connection close"
         );
+        assert!(!scrape(&registry).await.contains("towonel_edge_quic_"));
 
         edge_ep.close().await;
     }
@@ -531,6 +576,11 @@ mod tests {
             .get(&agent_id)
             .expect("fresh session should still be registered");
         assert_eq!(after.conn_stable_id(), fresh_id);
+        assert!(
+            scrape(&registry)
+                .await
+                .contains(&format!("agent=\"{agent_id}\""))
+        );
 
         conn2.close(0u32.into(), b"bye");
         drop(conn1);

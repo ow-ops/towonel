@@ -1,3 +1,5 @@
+#[cfg(test)]
+mod admission_tests;
 pub mod health;
 pub mod hub_client;
 pub mod hub_link;
@@ -25,10 +27,11 @@ use towonel_common::tls_policy::TlsMode;
 use towonel_common::transport::tls::TlsListener;
 use towonel_common::transport::{TunnelConn, TunnelRecv, TunnelSend};
 use towonel_common::tunnel::{
-    CONTROL_STATUS_INTERNAL_ERROR, CONTROL_STATUS_INVALID, CONTROL_STATUS_NOT_IMPLEMENTED,
-    CONTROL_STATUS_OK, ClientAddrs, DatagramFrameReader, MAX_UDP_DATAGRAM, TCP_ROUTE_PREFIX,
-    UDP_ROUTE_PREFIX, copy_tcp_counting, read_control_prefix, write_control_status,
-    write_datagram_frame, write_handshake,
+    CONTROL_OPCODE_STREAM_ACK, CONTROL_STATUS_INTERNAL_ERROR, CONTROL_STATUS_INVALID,
+    CONTROL_STATUS_NOT_IMPLEMENTED, CONTROL_STATUS_OK, ClientAddrs, DatagramFrameReader,
+    MAX_UDP_DATAGRAM, STREAM_ACK_PREFIX, TCP_ROUTE_PREFIX, UDP_ROUTE_PREFIX, copy_tcp_counting,
+    read_control_prefix, read_control_status, write_control_status, write_datagram_frame,
+    write_handshake,
 };
 
 use self::health::{EdgeMetrics, session_reject_reason};
@@ -794,6 +797,19 @@ async fn run_control_stream(
         }
     };
 
+    if frame == [CONTROL_OPCODE_STREAM_ACK] {
+        if let Some(session) = sessions.get(&agent_id)
+            && session.conn_stable_id() == conn.stable_id()
+        {
+            session.enable_stream_acks();
+            if let Err(e) = write_control_status(&mut send, CONTROL_STATUS_OK).await {
+                debug!(agent = %agent_id.fmt_short(), error = %e, "writing stream acknowledgement support status failed");
+            }
+            drop(send.finish().await);
+        }
+        return;
+    }
+
     let (status, body) = match hub_client.as_deref() {
         Some(client) => match client.handle_control_frame(frame.clone()).await {
             Ok(resp) => resp,
@@ -1007,6 +1023,7 @@ const PICK_AGENT_BACKOFF: Duration = Duration::from_millis(200);
 
 /// `open_bi` blocks while the agent is at its concurrent-stream cap.
 const AGENT_STREAM_OPEN_TIMEOUT: Duration = Duration::from_secs(2);
+const AGENT_STREAM_ACCEPT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// What a stream will carry. Over TCP one lost segment stalls every stream on
 /// the session, so UDP stays off TLS sessions.
@@ -1030,6 +1047,8 @@ fn retain_carriers(ctx: &ConnCtx, payload: Payload, candidates: &mut self::route
 async fn pick_agent_and_open_stream(
     ctx: &ConnCtx,
     payload: Payload,
+    route_key: &str,
+    client_addrs: ClientAddrs,
     mut candidates: self::router::Candidates,
     mut refresh: impl FnMut() -> Option<self::router::Candidates>,
 ) -> anyhow::Result<(EndpointAddr, TunnelSend, TunnelRecv)> {
@@ -1043,7 +1062,7 @@ async fn pick_agent_and_open_stream(
     let mut last_err: Option<anyhow::Error> = None;
     for attempt in 0..PICK_AGENT_ATTEMPTS {
         for agent_addr in &candidates {
-            match open_agent_stream(ctx, agent_addr.id).await {
+            match open_agent_stream(ctx, agent_addr.id, route_key, client_addrs).await {
                 Ok((send, recv)) => {
                     if let Some(tenant) = ctx.sessions.tenant_for(&agent_addr.id) {
                         ctx.metrics.tenant_counters(&tenant).connections_total.inc();
@@ -1194,7 +1213,16 @@ async fn handle_connection_inner(
             agent_addr,
             send_stream,
             recv_stream,
-        } = match prepare_connection(&tcp_stream, ctx).await {
+        } = match prepare_connection(
+            &tcp_stream,
+            ClientAddrs {
+                src: peer_addr,
+                dst: client_dst(tcp_stream.local_addr()?, proxied_dst),
+            },
+            ctx,
+        )
+        .await
+        {
             Ok(prep) => prep,
             Err(e) => {
                 drop(tcp_stream.shutdown().await);
@@ -1206,20 +1234,9 @@ async fn handle_connection_inner(
         // session mid-transfer, so looking it up afterward would drop the
         // per-tenant byte counts for exactly the connections we want to keep.
         let tenant = ctx.sessions.tenant_for(&agent_addr.id);
-        let client_addrs = ClientAddrs {
-            src: peer_addr,
-            dst: client_dst(tcp_stream.local_addr()?, proxied_dst),
-        };
         let (bytes_in, bytes_out) = match policy {
             TlsMode::Passthrough => {
-                pipe_tcp(
-                    tcp_stream,
-                    &hostname,
-                    client_addrs,
-                    send_stream,
-                    recv_stream,
-                )
-                .await?
+                pipe_tcp(tcp_stream, &hostname, send_stream, recv_stream).await?
             }
         };
         ctx.metrics.total_bytes_in.inc_by(bytes_in);
@@ -1256,7 +1273,11 @@ struct Preparation {
     recv_stream: TunnelRecv,
 }
 
-async fn prepare_connection(tcp_stream: &TcpStream, ctx: &ConnCtx) -> anyhow::Result<Preparation> {
+async fn prepare_connection(
+    tcp_stream: &TcpStream,
+    client_addrs: ClientAddrs,
+    ctx: &ConnCtx,
+) -> anyhow::Result<Preparation> {
     let mut peek_buf = [0u8; PEEK_BUF_SIZE];
     let n = peek_client_hello(tcp_stream, &mut peek_buf).await?;
     let peeked = peek_buf.get(..n).unwrap_or(&peek_buf);
@@ -1283,11 +1304,15 @@ async fn prepare_connection(tcp_stream: &TcpStream, ctx: &ConnCtx) -> anyhow::Re
         "route matched"
     );
 
-    let (agent_addr, send_stream, recv_stream) =
-        pick_agent_and_open_stream(ctx, Payload::Stream, candidates, || {
-            ctx.router.route(&hostname).map(|(c, _)| c)
-        })
-        .await?;
+    let (agent_addr, send_stream, recv_stream) = pick_agent_and_open_stream(
+        ctx,
+        Payload::Stream,
+        &hostname,
+        client_addrs,
+        candidates,
+        || ctx.router.route(&hostname).map(|(c, _)| c),
+    )
+    .await?;
     debug!(agent = %agent_addr.id.fmt_short(), "agent selected, stream opened");
 
     Ok(Preparation {
@@ -1353,17 +1378,6 @@ async fn handle_http_connection_inner(
             .ok_or_else(|| anyhow::anyhow!("no route for hostname: {hostname}"))?;
         debug!(%hostname, candidates = candidates.len(), "http route matched");
 
-        let (agent_addr, send_stream, recv_stream) =
-            pick_agent_and_open_stream(ctx, Payload::Stream, candidates, || {
-                ctx.router.route(&hostname).map(|(c, _)| c)
-            })
-            .await?;
-        let agent_short = agent_addr.id.fmt_short();
-        // Resolve the tenant before piping: an abnormal close can remove the
-        // session mid-transfer, so looking it up afterward would drop the
-        // per-tenant byte counts.
-        let tenant = ctx.sessions.tenant_for(&agent_addr.id);
-
         // The agent keys its cleartext origin-`:80` dial off
         // `dst.port() == 80`; the listener may be bound elsewhere (tests).
         let mut dst = client_dst(tcp_stream.local_addr()?, proxied_dst);
@@ -1372,14 +1386,24 @@ async fn handle_http_connection_inner(
             src: peer_addr,
             dst,
         };
-        let (bytes_in, bytes_out) = pipe_tcp(
-            tcp_stream,
+
+        let (agent_addr, send_stream, recv_stream) = pick_agent_and_open_stream(
+            ctx,
+            Payload::Stream,
             &hostname,
             client_addrs,
-            send_stream,
-            recv_stream,
+            candidates,
+            || ctx.router.route(&hostname).map(|(c, _)| c),
         )
         .await?;
+        let agent_short = agent_addr.id.fmt_short();
+        // Resolve the tenant before piping: an abnormal close can remove the
+        // session mid-transfer, so looking it up afterward would drop the
+        // per-tenant byte counts.
+        let tenant = ctx.sessions.tenant_for(&agent_addr.id);
+
+        let (bytes_in, bytes_out) =
+            pipe_tcp(tcp_stream, &hostname, send_stream, recv_stream).await?;
 
         ctx.metrics.total_bytes_in.inc_by(bytes_in);
         ctx.metrics.total_bytes_out.inc_by(bytes_out);
@@ -1442,15 +1466,22 @@ async fn peek_http_hostname(tcp: &TcpStream) -> anyhow::Result<String> {
     let mut peek_buf = [0u8; PEEK_BUF_SIZE];
     let n = peek_http_request(tcp, &mut peek_buf).await?;
     let peeked = peek_buf.get(..n).unwrap_or(&peek_buf);
-    extract_host_header(peeked).ok_or_else(|| anyhow::anyhow!("no Host header in HTTP request"))
+    let hostname = extract_host_header(peeked)
+        .ok_or_else(|| anyhow::anyhow!("no Host header in HTTP request"))?;
+    anyhow::ensure!(
+        !towonel_common::routing::is_reserved_route_key(&hostname),
+        "Host uses a reserved route-key prefix: {hostname}"
+    );
+    Ok(hostname)
 }
 
-/// Open a bi-stream on the agent's registered session. Returns an error
-/// if the agent has no session (offline) or if `open_bi` fails on a
-/// broken connection — the supersede-race retry happens at the caller.
+/// Send the routing header before consuming client data, so admission can
+/// fail over safely. Agents that opted in must acknowledge acceptance.
 async fn open_agent_stream(
     ctx: &ConnCtx,
     agent_id: iroh::EndpointId,
+    route_key: &str,
+    client_addrs: ClientAddrs,
 ) -> anyhow::Result<(TunnelSend, TunnelRecv)> {
     let Some(session) = ctx.sessions.get(&agent_id) else {
         ctx.metrics.route_no_session_total.inc();
@@ -1464,18 +1495,47 @@ async fn open_agent_stream(
             agent_id.fmt_short()
         );
     };
-    match opened {
+    let acknowledged = session.stream_acks_enabled();
+    let handshake = async {
+        let (mut send, mut recv) = opened?;
+        let route_key = if acknowledged {
+            format!("{STREAM_ACK_PREFIX}{route_key}")
+        } else {
+            route_key.to_owned()
+        };
+        write_handshake(&mut send, &route_key, client_addrs).await?;
+        if acknowledged && read_control_status(&mut recv).await? != CONTROL_STATUS_OK {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "agent rejected stream",
+            ));
+        }
+        Ok((send, recv))
+    };
+    let result = tokio::time::timeout(AGENT_STREAM_ACCEPT_TIMEOUT, handshake)
+        .await
+        .unwrap_or_else(|_| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "agent stream acceptance timed out",
+            ))
+        });
+    match result {
         Ok(pair) => Ok(pair),
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => Err(e.into()),
         Err(e) => {
             // Capture the tenant before removing so we can tell the hub the
             // agent is gone — the `conn.closed()` cleanup path would otherwise
             // see the entry already removed and skip the notification.
             let tenant = ctx.sessions.tenant_for(&agent_id);
-            if ctx.sessions.remove_if_current(&session) {
+            let removed = ctx.sessions.remove_if_current(&session);
+            session.close(504, b"agent stream admission failed");
+            if removed {
+                warn!(agent = %agent_id.fmt_short(), error = %e, "closed unusable agent session");
                 notify_session_removed(ctx, tenant, agent_id).await;
             }
             Err(anyhow::anyhow!(
-                "open_bi on agent {} session failed: {e}",
+                "stream admission on agent {} failed: {e}",
                 agent_id.fmt_short()
             ))
         }
@@ -1704,29 +1764,29 @@ async fn handle_tcp_connection(
             "tcp route matched"
         );
 
-        let (agent_addr, send_stream, recv_stream) =
-            pick_agent_and_open_stream(ctx, Payload::Stream, candidates, || {
-                ctx.router
-                    .route_tcp_service(&binding.tenant, &binding.service)
-            })
-            .await?;
-        let agent_short = agent_addr.id.fmt_short();
-        debug!(agent = %agent_short, "tcp agent selected, stream opened");
-
         let client_addrs = ClientAddrs {
             src: peer_addr,
             dst: tcp_stream.local_addr()?,
         };
-
         let route_key = format!("{TCP_ROUTE_PREFIX}{}", binding.service);
-        let (bytes_in, bytes_out) = pipe_tcp(
-            tcp_stream,
+
+        let (agent_addr, send_stream, recv_stream) = pick_agent_and_open_stream(
+            ctx,
+            Payload::Stream,
             &route_key,
             client_addrs,
-            send_stream,
-            recv_stream,
+            candidates,
+            || {
+                ctx.router
+                    .route_tcp_service(&binding.tenant, &binding.service)
+            },
         )
         .await?;
+        let agent_short = agent_addr.id.fmt_short();
+        debug!(agent = %agent_short, "tcp agent selected, stream opened");
+
+        let (bytes_in, bytes_out) =
+            pipe_tcp(tcp_stream, &route_key, send_stream, recv_stream).await?;
 
         ctx.metrics.total_bytes_in.inc_by(bytes_in);
         ctx.metrics.total_bytes_out.inc_by(bytes_out);
@@ -1755,12 +1815,9 @@ async fn handle_tcp_connection(
 async fn pipe_tcp(
     tcp_stream: TcpStream,
     route_key: &str,
-    client_addrs: ClientAddrs,
     mut send_stream: TunnelSend,
     mut recv_stream: TunnelRecv,
 ) -> anyhow::Result<(u64, u64)> {
-    write_handshake(&mut send_stream, route_key, client_addrs).await?;
-
     let (mut tcp_read, mut tcp_write) = tcp_stream.into_split();
 
     let c2a = async {
@@ -2046,20 +2103,6 @@ async fn udp_session_pump(
             return;
         };
 
-        let (agent_addr, mut send_stream, mut recv_stream) =
-            match pick_agent_and_open_stream(&ctx, Payload::Datagrams, candidates, || {
-                ctx.router
-                    .route_udp_service(&binding.tenant, &binding.service)
-            })
-            .await
-            {
-                Ok(t) => t,
-                Err(e) => {
-                    warn!(error = %e, "no agent could accept udp session");
-                    return;
-                }
-            };
-
         let route_key = format!("{UDP_ROUTE_PREFIX}{}", binding.service);
         let local_addr = match socket.local_addr() {
             Ok(a) => a,
@@ -2074,10 +2117,19 @@ async fn udp_session_pump(
             // the client actually sent to.
             dst: local_dst.map_or(local_addr, |ip| std::net::SocketAddr::new(ip, local_addr.port())),
         };
-        if let Err(e) = write_handshake(&mut send_stream, &route_key, client_addrs).await {
-            warn!(error = %e, "udp handshake to agent failed");
-            return;
-        }
+        let (agent_addr, mut send_stream, mut recv_stream) =
+            match pick_agent_and_open_stream(&ctx, Payload::Datagrams, &route_key, client_addrs, candidates, || {
+                ctx.router
+                    .route_udp_service(&binding.tenant, &binding.service)
+            })
+            .await
+            {
+                Ok(t) => t,
+                Err(e) => {
+                    warn!(error = %e, "no agent could accept udp session");
+                    return;
+                }
+            };
 
         debug!(agent = %agent_addr.id.fmt_short(), "udp session opened");
 
@@ -2231,6 +2283,18 @@ mod tests {
 
         wait_until(|| sessions.get(&id).is_some()).await;
         assert!(sessions.get(&id).unwrap().is_tls());
+        assert!(!sessions.get(&id).unwrap().stream_acks_enabled());
+        let (mut send, mut recv) = agent.open_bi().await.unwrap();
+        towonel_common::tunnel::write_control_prefix(&mut send)
+            .await
+            .unwrap();
+        send.write_all(&[CONTROL_OPCODE_STREAM_ACK]).await.unwrap();
+        send.finish().await.unwrap();
+        assert_eq!(
+            read_control_status(&mut recv).await.unwrap(),
+            CONTROL_STATUS_OK
+        );
+        assert!(sessions.get(&id).unwrap().stream_acks_enabled());
 
         agent.close(0, b"bye");
         wait_until(|| sessions.get(&id).is_none()).await;
@@ -2441,6 +2505,13 @@ mod tests {
         let (server, _client) = server_side_with(req).await;
         let hostname = Box::pin(peek_http_hostname(&server)).await.unwrap();
         assert_eq!(hostname, "app.alice.test");
+    }
+
+    #[tokio::test]
+    async fn http_host_cannot_request_stream_acknowledgement() {
+        let (server, _client) =
+            server_side_with(b"GET / HTTP/1.1\r\nHost: [ctrl:ack:tcp:db]\r\n\r\n").await;
+        Box::pin(peek_http_hostname(&server)).await.unwrap_err();
     }
 
     #[tokio::test]

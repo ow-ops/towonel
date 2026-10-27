@@ -61,6 +61,21 @@ spec:
             {{- with .Values.monitoring.prometheusRule.additionalRuleLabels }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
+
+        - alert: TowonelAgentStalled
+          expr: |-
+            sum by (cluster, namespace, job, pod) (increase(towonel_agent_streams_accepted_total{job="{{ $job }}"}[30m])) == 0
+              and on (cluster, namespace, job) sum by (cluster, namespace, job) (increase(towonel_agent_streams_accepted_total{job="{{ $job }}"}[30m])) > 30
+              and on (cluster, namespace, job, pod) max by (cluster, namespace, job, pod) (towonel_agent_edge_session_state{job="{{ $job }}"}) == 1
+          for: 15m
+          annotations:
+            summary: >-
+              Towonel agent {{ `{{ $labels.pod }}` }} accepts no streams while other replicas receive traffic
+          labels:
+            severity: critical
+            {{- with .Values.monitoring.prometheusRule.additionalRuleLabels }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
         {{- if .Values.mesh.enabled }}
 
         - alert: TowonelAgentMeshDown

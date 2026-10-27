@@ -14,8 +14,10 @@ use towonel_common::hostname::wildcard_lookup;
 use towonel_common::metrics::GaugeGuard;
 use towonel_common::transport::{TunnelConn, TunnelRecv, TunnelSend};
 use towonel_common::tunnel::{
-    COPY_BUF_SIZE, ClientAddrs, DatagramFrameReader, MAX_UDP_DATAGRAM, TCP_ROUTE_PREFIX,
-    UDP_ROUTE_PREFIX, copy_buf_counting, copy_tcp_counting, read_handshake, write_datagram_frame,
+    CONTROL_OPCODE_STREAM_ACK, CONTROL_STATUS_NOT_IMPLEMENTED, CONTROL_STATUS_OK, COPY_BUF_SIZE,
+    ClientAddrs, DatagramFrameReader, MAX_UDP_DATAGRAM, STREAM_ACK_PREFIX, TCP_ROUTE_PREFIX,
+    UDP_ROUTE_PREFIX, copy_buf_counting, copy_tcp_counting, read_control_status, read_handshake,
+    write_control_prefix, write_control_status, write_datagram_frame,
 };
 
 use crate::config::{ProxyProtocol, ServiceConfig, TcpServiceConfig, UdpServiceConfig};
@@ -464,6 +466,15 @@ async fn handle_connection_with_stream_limit(
     stream_limit: Arc<tokio::sync::Semaphore>,
 ) {
     let mut tasks = tokio::task::JoinSet::new();
+    tasks.spawn({
+        let conn = conn.clone();
+        async move {
+            if let Err(e) = enable_stream_acks(&conn).await {
+                warn!(error = %e, "enabling stream acknowledgements failed");
+                conn.close(504, b"stream acknowledgement negotiation failed");
+            }
+        }
+    });
     loop {
         while tasks.try_join_next().is_some() {}
         // Backpressure stream opens, but still exit if a saturated session closes.
@@ -493,6 +504,33 @@ async fn handle_connection_with_stream_limit(
             }
         });
     }
+}
+
+async fn enable_stream_acks(conn: &TunnelConn) -> io::Result<()> {
+    let exchange = async {
+        let (mut send, mut recv) = conn.open_bi().await?;
+        write_control_prefix(&mut send).await?;
+        send.write_all(&[CONTROL_OPCODE_STREAM_ACK]).await?;
+        send.finish().await?;
+        let status = read_control_status(&mut recv).await?;
+        if status == CONTROL_STATUS_NOT_IMPLEMENTED {
+            debug!(status, "edge does not support stream acknowledgements");
+        } else if status != CONTROL_STATUS_OK {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "edge rejected stream acknowledgement negotiation",
+            ));
+        }
+        Ok(())
+    };
+    tokio::time::timeout(Duration::from_secs(15), exchange)
+        .await
+        .map_err(|_elapsed| {
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                "stream acknowledgement negotiation timed out",
+            )
+        })?
 }
 
 #[expect(
@@ -528,6 +566,13 @@ async fn handle_stream(
             Ok(Ok(v)) => v,
         };
 
+    let route_key = if let Some(route_key) = route_key.strip_prefix(STREAM_ACK_PREFIX) {
+        write_control_status(&mut quic_send, CONTROL_STATUS_OK).await?;
+        route_key
+    } else {
+        &route_key
+    };
+
     if let Some(service_name) = route_key.strip_prefix(TCP_ROUTE_PREFIX) {
         return handle_tcp_stream(
             service_name,
@@ -557,7 +602,7 @@ async fn handle_stream(
     }
 
     let hostname = route_key;
-    let Some(target) = service_map.lookup(&hostname) else {
+    let Some(target) = service_map.lookup(hostname) else {
         metrics.record_stream_error(metrics::stream_error::NO_SERVICE);
         return Err(anyhow::anyhow!(
             "no service configured for hostname {hostname}"
@@ -962,12 +1007,56 @@ mod tests {
             .unwrap()
     }
 
+    async fn local_connection() -> (
+        iroh::Endpoint,
+        iroh::Endpoint,
+        iroh::endpoint::Connection,
+        iroh::endpoint::Connection,
+    ) {
+        let edge = local_endpoint().await;
+        let agent = local_endpoint().await;
+        let addr = iroh::EndpointAddr::new(edge.id())
+            .with_ip_addr(edge.bound_sockets().into_iter().next().unwrap());
+        let (conn, peer) = tokio::time::timeout(Duration::from_secs(3), async {
+            tokio::join!(
+                agent.connect(addr, towonel_common::protocol::ALPN_TUNNEL),
+                async { edge.accept().await.unwrap().await.unwrap() }
+            )
+        })
+        .await
+        .unwrap();
+        (edge, agent, conn.unwrap(), peer)
+    }
+
+    #[tokio::test]
+    async fn stream_ack_negotiation_accepts_legacy_edge() {
+        let (edge, agent, conn, peer) = local_connection().await;
+        let conn = TunnelConn::Iroh(conn);
+        let (negotiated, ()) = tokio::join!(enable_stream_acks(&conn), async {
+            let (mut send, mut recv) = peer.accept_bi().await.unwrap();
+            towonel_common::tunnel::read_control_prefix(&mut recv)
+                .await
+                .unwrap();
+            assert_eq!(
+                recv.read_to_end(10).await.unwrap(),
+                [CONTROL_OPCODE_STREAM_ACK]
+            );
+            send.write_all(&[CONTROL_STATUS_NOT_IMPLEMENTED])
+                .await
+                .unwrap();
+            send.finish().unwrap();
+        });
+        negotiated.unwrap();
+        assert!(peer.close_reason().is_none());
+        agent.close().await;
+        edge.close().await;
+    }
+
     #[tokio::test]
     async fn peer_close_releases_forwarding_when_stream_limit_is_saturated() {
         use tokio::io::AsyncReadExt;
         use tokio::net::TcpListener;
         use tokio::time::timeout;
-        use towonel_common::protocol::ALPN_TUNNEL;
         use towonel_common::tls_policy::TlsMode;
         use towonel_common::tunnel::write_handshake;
 
@@ -991,30 +1080,27 @@ mod tests {
             .await
             .unwrap(),
         );
-        let edge = local_endpoint().await;
-        let agent = local_endpoint().await;
-        let mut addr = iroh::EndpointAddr::new(edge.id());
-        for socket in edge.bound_sockets() {
-            addr = addr.with_ip_addr(socket);
-        }
-        let (conn, peer) = timeout(SETUP, async {
-            tokio::join!(agent.connect(addr, ALPN_TUNNEL), async {
-                edge.accept().await.unwrap().await.unwrap()
-            })
-        })
-        .await
-        .unwrap();
+        let (edge, agent, conn, peer) = local_connection().await;
         let metrics = Arc::new(AgentMetrics::new());
         let stream_limit = Arc::new(tokio::sync::Semaphore::new(1));
         let mut handler = tokio::spawn(handle_connection_with_stream_limit(
-            TunnelConn::Iroh(conn.unwrap()),
+            TunnelConn::Iroh(conn),
             edge.id(),
             services,
             Arc::clone(&metrics),
             Arc::clone(&stream_limit),
         ));
-        let (mut send, _recv) = peer.open_bi().await.unwrap();
-        write_handshake(&mut send, HOST, v4_addrs()).await.unwrap();
+        let (mut send, mut recv) = peer.open_bi().await.unwrap();
+        write_handshake(&mut send, &format!("{STREAM_ACK_PREFIX}{HOST}"), v4_addrs())
+            .await
+            .unwrap();
+        assert_eq!(
+            timeout(SETUP, read_control_status(&mut recv))
+                .await
+                .unwrap()
+                .unwrap(),
+            CONTROL_STATUS_OK
+        );
         send.write_all(b"ping").await.unwrap();
         send.finish().unwrap();
         let (mut socket, _) = timeout(SETUP, origin.accept()).await.unwrap().unwrap();

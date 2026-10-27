@@ -13,6 +13,7 @@ pub mod metrics;
 pub mod ownership;
 pub mod process_metrics;
 pub mod protocol;
+pub mod quic_metrics;
 pub mod random_name;
 pub mod relay;
 pub mod routing;

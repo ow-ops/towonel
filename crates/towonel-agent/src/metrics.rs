@@ -4,6 +4,7 @@ use prometheus::{IntCounter, IntCounterVec, IntGauge, IntGaugeVec, Registry};
 use towonel_common::metrics::{
     register_counter, register_counter_vec, register_gauge, register_gauge_vec,
 };
+use towonel_common::quic_metrics::QuicMetrics;
 
 /// Values become label strings on exported metrics; keep them stable so
 /// dashboards and alerts keep matching.
@@ -25,6 +26,7 @@ pub const PATH_LABELS: [&str; 4] = ["direct", "relay", "custom", "tls"];
 
 #[derive(Clone)]
 pub struct AgentMetrics {
+    pub quic: QuicMetrics,
     pub edge_session_reconnects: IntCounterVec,
     pub edge_session_state: IntGaugeVec,
     pub edge_identity_mismatches: IntCounterVec,
@@ -44,6 +46,7 @@ impl AgentMetrics {
         let r = Registry::new();
         towonel_common::process_metrics::register(&r);
         Self {
+            quic: QuicMetrics::register(&r, "towonel_agent_quic", "edge"),
             edge_session_reconnects: register_counter_vec(
                 &r,
                 "towonel_agent_edge_session_reconnects_total",

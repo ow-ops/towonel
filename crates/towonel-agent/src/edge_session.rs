@@ -578,6 +578,7 @@ struct EdgeSessionGuard {
 
 impl EdgeSessionGuard {
     fn live(metrics: Arc<AgentMetrics>, edge_label: String, conn: TunnelConn) -> Self {
+        metrics.quic.insert(&edge_label, &conn);
         metrics
             .edge_session_state
             .with_label_values(&[&edge_label])
@@ -597,6 +598,7 @@ impl EdgeSessionGuard {
         self.metrics.clear_edge_path(&self.edge_label);
         self.conn.close(0, b"moved to QUIC");
         self.conn = conn;
+        self.metrics.quic.insert(&self.edge_label, &self.conn);
         if let Some(old) = std::mem::replace(&mut self.path_watcher, path_watcher) {
             old.abort();
         }
@@ -605,6 +607,9 @@ impl EdgeSessionGuard {
 
 impl Drop for EdgeSessionGuard {
     fn drop(&mut self) {
+        self.metrics
+            .quic
+            .remove(&self.edge_label, self.conn.stable_id());
         self.conn.close(0, b"edge supervisor stopped");
         if let Some(h) = self.path_watcher.take() {
             h.abort();
@@ -729,6 +734,14 @@ fn is_routable(addr: &SocketAddr) -> bool {
 mod tests {
     use super::*;
 
+    fn has_quic_metrics(metrics: &AgentMetrics) -> bool {
+        metrics
+            .registry()
+            .gather()
+            .iter()
+            .any(|f| f.name() == "towonel_agent_quic_frames_total")
+    }
+
     const V4: &str = "203.0.113.1:80";
     const V6: &str = "[2001:db8::1]:80";
 
@@ -758,31 +771,12 @@ mod tests {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::TcpListener;
         use tokio::time::timeout;
-        use towonel_common::tls_policy::TlsMode;
         use towonel_common::transport::tls::{TlsIdentity, TlsListener};
         use towonel_common::tunnel::{ClientAddrs, write_handshake};
 
-        use crate::config::{ProxyProtocol, ServiceConfig};
-
         const SETUP: Duration = Duration::from_secs(10);
         const HOST: &str = "fallback.test";
-        drop(rustls::crypto::ring::default_provider().install_default());
-        let origin = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let services = Arc::new(
-            ServiceMap::from_config(
-                &[ServiceConfig {
-                    hostname: HOST.to_string(),
-                    origin: origin.local_addr().unwrap().to_string(),
-                    origin_server_name: None,
-                    tls_mode: TlsMode::Passthrough,
-                    proxy_protocol: Some(ProxyProtocol::None),
-                }],
-                &[],
-                &[],
-            )
-            .await
-            .unwrap(),
-        );
+        let (origin, services) = origin_and_services(HOST).await;
         let endpoint = Endpoint::builder(Minimal)
             .relay_mode(iroh::RelayMode::Disabled)
             .clear_ip_transports()
@@ -857,6 +851,10 @@ mod tests {
 
         assert_eq!(metrics.active_edge_sessions(), 1);
         assert!(memory.quic_recently_failed());
+        assert!(
+            !has_quic_metrics(&metrics),
+            "TLS sessions have no QUIC stats"
+        );
 
         edge_conn.close(0, b"done");
         timeout(SETUP, session).await.unwrap().unwrap().unwrap();
@@ -1052,6 +1050,10 @@ mod tests {
         assert!(!memory.quic_recently_failed());
         assert_eq!(metrics.active_edge_sessions(), 1);
         let label = edge_key.public().fmt_short().to_string();
+        assert!(
+            has_quic_metrics(&metrics),
+            "migration must expose QUIC stats"
+        );
         assert_eq!(
             metrics.edge_path.with_label_values(&[&label, "tls"]).get(),
             0,
@@ -1061,6 +1063,7 @@ mod tests {
         quic_conn.close(0u32.into(), b"done");
         timeout(SETUP, session).await.unwrap().unwrap().unwrap();
         assert_eq!(metrics.active_edge_sessions(), 0);
+        assert!(!has_quic_metrics(&metrics));
     }
 
     async fn cancellation_fixture(
@@ -1178,6 +1181,7 @@ mod tests {
         assert_eq!(&reply, b"ping");
         assert_eq!(metrics.active_edge_sessions(), 1);
         assert_eq!(metrics.streams_active.get(), 1);
+        assert!(has_quic_metrics(&metrics));
 
         pool.reconcile(&[]);
         timeout(SETUP, pool.tasks.join_next())
@@ -1189,6 +1193,10 @@ mod tests {
         timeout(SETUP, peer.closed())
             .await
             .expect("session still open after cancellation");
+        assert!(
+            !has_quic_metrics(&metrics),
+            "cancellation must remove QUIC stats"
+        );
         let _closed = peer
             .open_bi()
             .await
