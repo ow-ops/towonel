@@ -614,7 +614,7 @@ async fn tls_accept_loop(
                         .sessions_rejected_total
                         .with_label_values(&[session_reject_reason::HANDSHAKE_ERROR])
                         .inc();
-                    debug!(%peer_addr, error = %e, "TLS tunnel handshake failed");
+                    warn!(%peer_addr, error = %e, "TLS tunnel handshake failed");
                     return;
                 }
             };
@@ -644,6 +644,7 @@ async fn handle_inbound_agent(
     metrics: EdgeMetrics,
     hub_client: Option<Arc<dyn HubClient>>,
 ) -> anyhow::Result<()> {
+    let peer_addr = incoming.remote_addr();
     let conn = match incoming.await {
         Ok(c) => TunnelConn::Iroh(c),
         Err(e) => {
@@ -651,6 +652,7 @@ async fn handle_inbound_agent(
                 .sessions_rejected_total
                 .with_label_values(&[session_reject_reason::HANDSHAKE_ERROR])
                 .inc();
+            warn!(?peer_addr, error = %e, "iroh handshake failed");
             return Err(anyhow::anyhow!("iroh handshake failed: {e}"));
         }
     };

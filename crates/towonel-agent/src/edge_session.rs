@@ -26,6 +26,7 @@ use crate::tunnel::{self, ServiceMap};
 const PRESENT_CRED_TIMEOUT: Duration = Duration::from_secs(5);
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const REBUILD_AFTER_TIMEOUTS: u32 = 3;
 const DNS_TIMEOUT: Duration = Duration::from_secs(5);
 
 const REDIAL_DELAY: Duration = Duration::from_secs(5);
@@ -102,6 +103,13 @@ pub struct SupervisorPool {
     shutdown: CancellationToken,
     active: std::collections::HashMap<iroh::EndpointId, ActiveSupervisor>,
     tasks: JoinSet<()>,
+    events: tokio::sync::mpsc::UnboundedReceiver<SessionEvent>,
+    event_tx: tokio::sync::mpsc::UnboundedSender<SessionEvent>,
+}
+
+pub enum SessionEvent {
+    Connected,
+    ConnectTimeouts,
 }
 
 impl SupervisorPool {
@@ -114,6 +122,7 @@ impl SupervisorPool {
         tls: TlsDialer,
         shutdown: &CancellationToken,
     ) -> Self {
+        let (event_tx, events) = tokio::sync::mpsc::unbounded_channel();
         Self {
             endpoint: endpoint.clone(),
             service_map: Arc::clone(service_map),
@@ -124,7 +133,13 @@ impl SupervisorPool {
             shutdown: shutdown.clone(),
             active: std::collections::HashMap::new(),
             tasks: JoinSet::new(),
+            events,
+            event_tx,
         }
+    }
+
+    pub async fn next_event(&mut self) -> Option<SessionEvent> {
+        self.events.recv().await
     }
 
     /// Match running supervisors to `contacts`: stop supervisors whose edge is
@@ -188,6 +203,7 @@ impl SupervisorPool {
                 Arc::clone(&self.edge_cred),
                 Arc::clone(&self.relay_urls),
                 self.tls.clone(),
+                self.event_tx.clone(),
             ));
             self.active.insert(
                 id,
@@ -230,14 +246,27 @@ async fn supervise(
     edge_cred: Arc<arc_swap::ArcSwapOption<CachedEdgeCred>>,
     relay_urls: Arc<Vec<RelayUrl>>,
     tls: TlsDialer,
+    events: tokio::sync::mpsc::UnboundedSender<SessionEvent>,
 ) {
     let edge_label = contact.id.fmt_short().to_string();
     let memory = TransportMemory::new(QUIC_RETRY_AFTER);
+    let timeouts = std::sync::atomic::AtomicU32::new(0);
     let span = info_span!("edge_supervisor", edge = %edge_label);
     // A permanently-gone edge is cancelled by reconcile, so this just redials a
     // transiently-down one until it returns. Backoff escalates while dials keep
     // failing fast and resets once a session has held for a while.
-    let (endpoint, contact, service_map, metrics, edge_cred, relay_urls, tls, memory) = (
+    let (
+        endpoint,
+        contact,
+        service_map,
+        metrics,
+        edge_cred,
+        relay_urls,
+        tls,
+        memory,
+        events,
+        timeouts,
+    ) = (
         &endpoint,
         &contact,
         &service_map,
@@ -246,6 +275,8 @@ async fn supervise(
         &relay_urls,
         &tls,
         &memory,
+        &events,
+        &timeouts,
     );
     crate::retry::supervise(
         &format!("edge:{edge_label}"),
@@ -262,6 +293,8 @@ async fn supervise(
                 relay_urls,
                 tls,
                 memory,
+                events,
+                timeouts,
             )
             .await
             {
@@ -312,6 +345,25 @@ fn is_identity_mismatch(err: &anyhow::Error) -> bool {
 enum Transport {
     Quic,
     Tls,
+}
+
+fn record_dial_failure(
+    error: &anyhow::Error,
+    timeouts: &std::sync::atomic::AtomicU32,
+    events: &tokio::sync::mpsc::UnboundedSender<SessionEvent>,
+) {
+    use std::sync::atomic::Ordering;
+
+    if error
+        .chain()
+        .any(|cause| cause.is::<tokio::time::error::Elapsed>())
+    {
+        if timeouts.fetch_add(1, Ordering::Relaxed) + 1 >= REBUILD_AFTER_TIMEOUTS {
+            let _ = events.send(SessionEvent::ConnectTimeouts);
+        }
+    } else {
+        timeouts.store(0, Ordering::Relaxed);
+    }
 }
 
 /// Transports to try for this redial, in order. QUIC leads unless it failed
@@ -485,12 +537,22 @@ async fn dial_and_serve(
     relay_urls: &[RelayUrl],
     tls: &TlsDialer,
     memory: &TransportMemory,
+    events: &tokio::sync::mpsc::UnboundedSender<SessionEvent>,
+    timeouts: &std::sync::atomic::AtomicU32,
 ) -> anyhow::Result<Duration> {
+    let dialed = match dial(endpoint, contact, relay_urls, tls, memory).await {
+        Ok(dialed) => dialed,
+        Err(error) => {
+            record_dial_failure(&error, timeouts, events);
+            return Err(error);
+        }
+    };
     let Dialed {
         mut conn,
         quic,
         mut transport,
-    } = dial(endpoint, contact, relay_urls, tls, memory).await?;
+    } = dialed;
+    timeouts.store(0, std::sync::atomic::Ordering::Relaxed);
 
     let edge_label = contact.id.fmt_short().to_string();
 
@@ -510,6 +572,7 @@ async fn dial_and_serve(
     // Marks the session live; resets the gauge and aborts the path watcher on
     // Drop, surviving a mid-session cancellation (see `EdgeSessionGuard`).
     let mut guard = EdgeSessionGuard::live(Arc::clone(metrics), edge_label.clone(), conn.clone());
+    let _ = events.send(SessionEvent::Connected);
     guard.path_watcher = quic.map(|quic| watch_path(&quic, &edge_label, metrics));
     if transport == Transport::Tls {
         metrics.set_edge_path(&edge_label, "tls");
@@ -734,6 +797,99 @@ fn is_routable(addr: &SocketAddr) -> bool {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn repeated_connect_timeouts_request_rebuild() {
+        let (events, mut received) = tokio::sync::mpsc::unbounded_channel();
+        let timeouts = std::sync::atomic::AtomicU32::new(0);
+        let elapsed = tokio::time::timeout(Duration::ZERO, std::future::pending::<()>())
+            .await
+            .unwrap_err();
+        let error = anyhow::Error::new(elapsed).context("connect to edge timed out");
+
+        for _ in 0..REBUILD_AFTER_TIMEOUTS - 1 {
+            record_dial_failure(&error, &timeouts, &events);
+            assert!(received.try_recv().is_err());
+        }
+        record_dial_failure(&error, &timeouts, &events);
+        assert!(matches!(
+            received.try_recv(),
+            Ok(SessionEvent::ConnectTimeouts)
+        ));
+
+        record_dial_failure(&anyhow::anyhow!("connection refused"), &timeouts, &events);
+        record_dial_failure(&error, &timeouts, &events);
+        assert!(received.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn a_new_endpoint_recovers_a_one_way_udp_blackhole() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tokio::net::UdpSocket;
+
+        drop(rustls::crypto::ring::default_provider().install_default());
+        let edge = quic_endpoint(None, true).await;
+        let agent = quic_endpoint(None, false).await;
+        let edge_addr = edge.bound_sockets()[0];
+        let old_addr = agent.bound_sockets()[0];
+        let proxy = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let contact = EdgeContact {
+            id: edge.id(),
+            addrs: vec![proxy.local_addr().unwrap().to_string()],
+            tls_addrs: vec![],
+        };
+        let blocked = Arc::new(AtomicBool::new(false));
+        let proxy_task = tokio::spawn({
+            let blocked = Arc::clone(&blocked);
+            async move {
+                let mut client = None;
+                let mut buf = [0; 65536];
+                loop {
+                    let (len, source) = proxy.recv_from(&mut buf).await.unwrap();
+                    if source == edge_addr {
+                        if let Some(target) = client
+                            && !(target == old_addr && blocked.load(Ordering::Relaxed))
+                        {
+                            proxy.send_to(&buf[..len], target).await.unwrap();
+                        }
+                    } else {
+                        client = Some(source);
+                        proxy.send_to(&buf[..len], edge_addr).await.unwrap();
+                    }
+                }
+            }
+        });
+        let accept_task = tokio::spawn({
+            let edge = edge.clone();
+            async move {
+                while let Some(incoming) = edge.accept().await {
+                    tokio::spawn(async move {
+                        let _ = incoming.await;
+                    });
+                }
+            }
+        });
+
+        let connection = connect_quic(&agent, &contact, &[]).await.unwrap();
+        connection.close(0u32.into(), b"test");
+        blocked.store(true, Ordering::Relaxed);
+        let error = connect_quic(&agent, &contact, &[]).await.unwrap_err();
+        assert!(
+            error
+                .chain()
+                .any(|cause| cause.is::<tokio::time::error::Elapsed>())
+        );
+
+        let replacement = quic_endpoint(None, false).await;
+        assert_ne!(replacement.bound_sockets()[0], old_addr);
+        let connection = connect_quic(&replacement, &contact, &[]).await.unwrap();
+        connection.close(0u32.into(), b"test");
+        replacement.close().await;
+        agent.close().await;
+        edge.close().await;
+        proxy_task.abort();
+        accept_task.abort();
+    }
+
     fn has_quic_metrics(metrics: &AgentMetrics) -> bool {
         metrics
             .registry()
@@ -815,6 +971,8 @@ mod tests {
                     &[],
                     &dialer,
                     &memory,
+                    &tokio::sync::mpsc::unbounded_channel().0,
+                    &std::sync::atomic::AtomicU32::new(0),
                 )
                 .await
             }
@@ -933,6 +1091,8 @@ mod tests {
             &[],
             &dialer,
             &memory,
+            &tokio::sync::mpsc::unbounded_channel().0,
+            &std::sync::atomic::AtomicU32::new(0),
         )
         .await
         .unwrap_err();
@@ -978,6 +1138,8 @@ mod tests {
             &[],
             &dialer,
             &memory,
+            &tokio::sync::mpsc::unbounded_channel().0,
+            &std::sync::atomic::AtomicU32::new(0),
         )
         .await
         .unwrap_err();
@@ -1026,6 +1188,8 @@ mod tests {
                     &[],
                     &dialer,
                     &memory,
+                    &tokio::sync::mpsc::unbounded_channel().0,
+                    &std::sync::atomic::AtomicU32::new(0),
                 )
                 .await
             }

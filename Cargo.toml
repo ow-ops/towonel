@@ -112,8 +112,8 @@ tokio = { workspace = true }
 
 
 [workspace.dependencies]
-iroh = { version = "1.1" }
-noq-proto = { version = "1.2", default-features = false }
+iroh = { version = "1.4.1" }
+noq-proto = { version = "1.4", default-features = false }
 ed25519-dalek = { version = "3.0", features = ["serde", "rand_core"] }
 ciborium = "0.2"
 sea-orm = { version = "1", features = [
@@ -247,9 +247,8 @@ tracing-opentelemetry = "0.33"
 webauthn-rs = { version = "0.5" }
 uuid = { version = "1", features = ["v5"] }
 
-# BBRv3 fixes: app-limited pacing (n0-computer/noq#802) and idle keepalives
-# collapsing max_bw (n0-computer/noq#852). Drop once both ship.
+# BBRv3 pacing, idle bandwidth, and receive-buffer fixes.
 [patch.crates-io]
-noq = { git = "https://github.com/eleboucher/noq", rev = "77b0c5c21b51800e9bf60362bc913894d52c49e1" }
-noq-proto = { git = "https://github.com/eleboucher/noq", rev = "77b0c5c21b51800e9bf60362bc913894d52c49e1" }
-noq-udp = { git = "https://github.com/eleboucher/noq", rev = "77b0c5c21b51800e9bf60362bc913894d52c49e1" }
+noq = { git = "https://github.com/eleboucher/noq", rev = "a08331f5178d7da08bb08726bd3a5e6f3bb3b328" }
+noq-proto = { git = "https://github.com/eleboucher/noq", rev = "a08331f5178d7da08bb08726bd3a5e6f3bb3b328" }
+noq-udp = { git = "https://github.com/eleboucher/noq", rev = "a08331f5178d7da08bb08726bd3a5e6f3bb3b328" }

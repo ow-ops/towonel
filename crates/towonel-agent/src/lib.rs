@@ -275,6 +275,16 @@ async fn serve(
     loop {
         tokio::select! {
             () = shutdown.cancelled() => return Ok(()),
+            Some(event) = pool.next_event() => match event {
+                edge_session::SessionEvent::Connected => {
+                    armed = true;
+                    dark_since = None;
+                }
+                edge_session::SessionEvent::ConnectTimeouts if armed && metrics.active_edge_sessions() == 0 => {
+                    return Err(anyhow!("repeated edge connection timeouts with no active sessions; rebuilding endpoint"));
+                }
+                edge_session::SessionEvent::ConnectTimeouts => {}
+            },
             () = tokio::time::sleep(TOPOLOGY_REFRESH_INTERVAL) => {
                 match stateless::refresh_edge_contacts(token, ctx).await {
                     Ok(contacts) => pool.reconcile(&contacts),
