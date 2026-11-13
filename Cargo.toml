@@ -248,8 +248,8 @@ webauthn-rs = { version = "0.5" }
 uuid = { version = "1", features = ["v5"] }
 tikv-jemallocator = "0.7"
 
-# BBRv3 pacing, idle bandwidth, and receive-buffer fixes.
+# BBRv3 pacing, idle bandwidth, receive-buffer, and assembler coalescing fixes.
 [patch.crates-io]
-noq = { git = "https://github.com/eleboucher/noq", rev = "a08331f5178d7da08bb08726bd3a5e6f3bb3b328" }
-noq-proto = { git = "https://github.com/eleboucher/noq", rev = "a08331f5178d7da08bb08726bd3a5e6f3bb3b328" }
-noq-udp = { git = "https://github.com/eleboucher/noq", rev = "a08331f5178d7da08bb08726bd3a5e6f3bb3b328" }
+noq = { git = "https://github.com/eleboucher/noq", rev = "5eb27882a92dc8d4a4fdda1f1ebd7f927506515d" }
+noq-proto = { git = "https://github.com/eleboucher/noq", rev = "5eb27882a92dc8d4a4fdda1f1ebd7f927506515d" }
+noq-udp = { git = "https://github.com/eleboucher/noq", rev = "5eb27882a92dc8d4a4fdda1f1ebd7f927506515d" }
