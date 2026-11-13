@@ -246,6 +246,7 @@ opentelemetry-http = { version = "0.32", default-features = false }
 tracing-opentelemetry = "0.33"
 webauthn-rs = { version = "0.5" }
 uuid = { version = "1", features = ["v5"] }
+tikv-jemallocator = "0.7"
 
 # BBRv3 pacing, idle bandwidth, and receive-buffer fixes.
 [patch.crates-io]
