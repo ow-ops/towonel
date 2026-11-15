@@ -105,10 +105,7 @@ async fn run(state: &StateDir, hub_url: &str, exit: Exit) -> anyhow::Result<()> 
     result
 }
 
-#[cfg(target_os = "linux")]
 type ExitGuard = Option<Box<dyn Send>>;
-#[cfg(not(target_os = "linux"))]
-type ExitGuard = ();
 
 /// Returns what undoes the host changes on drop.
 #[cfg(target_os = "linux")]
@@ -167,7 +164,7 @@ async fn setup_exit(
     if exit.advertise || exit.via.is_some() {
         bail!("exit nodes are only supported on Linux");
     }
-    Ok(())
+    Ok(None)
 }
 
 #[cfg(target_os = "linux")]

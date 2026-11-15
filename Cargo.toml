@@ -253,3 +253,5 @@ tikv-jemallocator = "0.7"
 noq = { git = "https://github.com/eleboucher/noq", rev = "5eb27882a92dc8d4a4fdda1f1ebd7f927506515d" }
 noq-proto = { git = "https://github.com/eleboucher/noq", rev = "5eb27882a92dc8d4a4fdda1f1ebd7f927506515d" }
 noq-udp = { git = "https://github.com/eleboucher/noq", rev = "5eb27882a92dc8d4a4fdda1f1ebd7f927506515d" }
+# Fix the private proc_macro re-export: https://github.com/GnomedDev/proc-macro-error-2/pull/14
+proc-macro-error2 = { git = "https://github.com/GnomedDev/proc-macro-error-2", rev = "53ff94b61c678593158db1a3d50269c6f0de0db7" }
