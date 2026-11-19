@@ -62,8 +62,14 @@ pub struct PendingOidcFlow {
 
 #[derive(Clone)]
 pub enum OidcFlowKind {
-    LoginOrSignup { signup_code: Option<String> },
-    Link { user_id: String },
+    LoginOrSignup {
+        signup_code: Option<String>,
+        /// Started from the console signup page, after the terms were accepted.
+        signup: bool,
+    },
+    Link {
+        user_id: String,
+    },
 }
 
 #[derive(Default, Clone)]
@@ -360,6 +366,9 @@ async fn refresh_provider_metadata(
 pub(super) struct StartParams {
     #[serde(default)]
     signup_code: Option<String>,
+    /// `true` when started from the signup page; open hubs only create accounts then.
+    #[serde(default)]
+    signup: bool,
     #[serde(default)]
     next: Option<String>,
 }
@@ -371,6 +380,7 @@ pub(super) struct StartParams {
     params(
         ("provider" = String, Path, description = "OIDC provider id (e.g. `codeberg`)"),
         ("signup_code" = Option<String>, Query, description = "Signup invite code, for first-time OIDC signup"),
+        ("signup" = Option<bool>, Query, description = "Set by the signup page; open hubs only create accounts when true"),
         ("next" = Option<String>, Query, description = "Relative path to return to after login"),
     ),
     responses((status = 302, description = "Redirect to the provider's authorization endpoint")),
@@ -389,7 +399,10 @@ pub(super) async fn start(
     begin_flow(
         &state,
         &provider,
-        OidcFlowKind::LoginOrSignup { signup_code },
+        OidcFlowKind::LoginOrSignup {
+            signup_code,
+            signup: params.signup,
+        },
         params.next.as_deref(),
     )
     .await
@@ -569,7 +582,10 @@ pub(super) async fn callback(
 
     let next = sanitize_next(Some(&flow.next));
     match flow.kind {
-        OidcFlowKind::LoginOrSignup { signup_code } => {
+        OidcFlowKind::LoginOrSignup {
+            signup_code,
+            signup,
+        } => {
             let user_id = if let Some(ident) = existing {
                 let resolved_id = match state.db.find_user_by_id(&ident.user_id).await {
                     Ok(Some(u)) if u.disabled_at_ms.is_none() => u.id,
@@ -615,7 +631,7 @@ pub(super) async fn callback(
                     AutoLink::Linked(id) => id,
                     AutoLink::Failed(why) => return error_redirect(&provider, why),
                     AutoLink::NoMatch => {
-                        if signup_code.is_none() && !state.signup_open {
+                        if !oidc_signup_allowed(signup_code.is_some(), state.signup_open, signup) {
                             return error_redirect(&provider, "signup_required");
                         }
                         let Some(email_val) = email else {
@@ -1063,6 +1079,16 @@ pub(in crate::hub) async fn maybe_auto_link(
     }
 
     AutoLink::Linked(user.id)
+}
+
+/// An unknown identity becomes an account with an invite code, or on an open
+/// hub when the flow started from the signup page.
+pub(in crate::hub) const fn oidc_signup_allowed(
+    has_code: bool,
+    signup_open: bool,
+    from_signup_page: bool,
+) -> bool {
+    has_code || (signup_open && from_signup_page)
 }
 
 #[expect(clippy::too_many_lines, reason = "linear signup with rollback arms")]

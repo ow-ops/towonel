@@ -3396,6 +3396,18 @@ async fn user_id_from_me(hub: &TestHub, client: &reqwest::Client, cookie: &str) 
     body["id"].as_str().unwrap().to_string()
 }
 
+#[test]
+fn oidc_signup_requires_code_or_open_signup_page() {
+    use super::api::oidc::oidc_signup_allowed;
+    assert!(oidc_signup_allowed(true, false, false));
+    assert!(oidc_signup_allowed(false, true, true));
+    assert!(
+        !oidc_signup_allowed(false, true, false),
+        "login page must not create accounts"
+    );
+    assert!(!oidc_signup_allowed(false, false, true));
+}
+
 #[tokio::test]
 async fn oidc_auto_link_merges_into_verified_password_account() {
     use super::api::oidc::{AutoLink, maybe_auto_link};
