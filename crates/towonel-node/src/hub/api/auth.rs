@@ -29,7 +29,8 @@ const PASSWORD_MAX_LEN: usize = 128;
 
 #[derive(Debug, Deserialize, ToSchema)]
 pub(super) struct SignupRequest {
-    /// Single-use signup invite code.
+    /// Single-use signup invite code; optional when the hub has open signup.
+    #[serde(default)]
     code: String,
     email: String,
     password: String,
@@ -55,6 +56,8 @@ struct MeResponse {
     role: String,
     twofa_enabled: bool,
     passkeys_enabled: bool,
+    /// Port reservations this user may hold; `null` means unlimited.
+    port_quota: Option<i64>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -85,22 +88,29 @@ pub(super) async fn post_signup(
     if let Err(msg) = validate_password(&body.password) {
         return invalid_request(msg);
     }
-    if body.code.is_empty() {
+    if body.code.is_empty() && !state.signup_open {
         return invalid_request("code is required");
     }
 
     let now_ms_i = now_ms_i64();
 
-    let claimed = match state.db.claim_signup_invite(&body.code, now_ms_i).await {
-        Ok(Some(c)) => c,
-        Ok(None) => return invalid_request("invalid or expired invite code"),
-        Err(e) => {
-            warn!(error = %e, "claim_signup_invite failed");
-            return internal_error();
+    let claimed = if body.code.is_empty() {
+        None
+    } else {
+        match state.db.claim_signup_invite(&body.code, now_ms_i).await {
+            Ok(Some(c)) => Some(c),
+            Ok(None) => return invalid_request("invalid or expired invite code"),
+            Err(e) => {
+                warn!(error = %e, "claim_signup_invite failed");
+                return internal_error();
+            }
         }
     };
+    let role = claimed.as_ref().map_or("user", |c| c.role.as_str());
 
-    if let Some(expected) = claimed.recipient_email.as_deref() {
+    if let Some(claimed) = &claimed
+        && let Some(expected) = claimed.recipient_email.as_deref()
+    {
         let supplied = db::users::normalize_email(&body.email);
         if supplied != expected {
             if let Err(rel_err) = state.db.release_signup_invite(&claimed.code).await {
@@ -119,7 +129,9 @@ pub(super) async fn post_signup(
         Ok(h) => h,
         Err(e) => {
             warn!(error = %e, "password hash failed");
-            if let Err(rel_err) = state.db.release_signup_invite(&claimed.code).await {
+            if let Some(claimed) = &claimed
+                && let Err(rel_err) = state.db.release_signup_invite(&claimed.code).await
+            {
                 warn!(error = %rel_err, "release_signup_invite after failure");
             }
             return internal_error();
@@ -132,8 +144,9 @@ pub(super) async fn post_signup(
             id: &user_id,
             email: &body.email,
             password_hash: &pw_hash,
-            role: &claimed.role,
+            role,
             email_verified_at_ms: None,
+            port_quota: state.new_user_port_quota,
             now_ms: now_ms_i,
         })
         .await
@@ -142,7 +155,9 @@ pub(super) async fn post_signup(
         if !is_dup {
             warn!(error = %e, "insert_user failed");
         }
-        if let Err(rel_err) = state.db.release_signup_invite(&claimed.code).await {
+        if let Some(claimed) = &claimed
+            && let Err(rel_err) = state.db.release_signup_invite(&claimed.code).await
+        {
             warn!(error = %rel_err, "release_signup_invite after insert_user failure");
         }
         return if is_dup {
@@ -152,10 +167,11 @@ pub(super) async fn post_signup(
         };
     }
 
-    if let Err(e) = state
-        .db
-        .finalize_signup_invite(&claimed.code, &user_id)
-        .await
+    if let Some(claimed) = &claimed
+        && let Err(e) = state
+            .db
+            .finalize_signup_invite(&claimed.code, &user_id)
+            .await
     {
         warn!(error = %e, "finalize_signup_invite failed");
         if let Err(del_err) = state.db.delete_user(&user_id).await {
@@ -178,8 +194,8 @@ pub(super) async fn post_signup(
             target_id: Some(&user_id),
             metadata: Some(serde_json::json!({
                 "email": db::users::normalize_email(&body.email),
-                "role": claimed.role,
-                "signup_invite_code": claimed.code,
+                "role": role,
+                "signup_invite_code": claimed.as_ref().map(|c| &c.code),
             })),
             now_ms: now_ms_i,
         })
@@ -589,12 +605,18 @@ pub(super) async fn get_me(State(state): State<Arc<AppState>>, principal: Princi
                 .flatten()
                 .is_some_and(|r| r.confirmed_at_ms.is_some());
             let passkeys_enabled = state.db.count_passkeys_for_user(&u.id).await.unwrap_or(0) > 0;
+            let port_quota = if state.ports_require_reservation && u.role != "operator" {
+                super::ports::effective_port_quota(&state, &u)
+            } else {
+                None
+            };
             json_ok(MeResponse {
                 id: u.id,
                 email: Some(u.email),
                 role: u.role,
                 twofa_enabled,
                 passkeys_enabled,
+                port_quota,
             })
         }
         Principal::OperatorKey => json_with_status(
@@ -605,6 +627,7 @@ pub(super) async fn get_me(State(state): State<Arc<AppState>>, principal: Princi
                 "role": "operator",
                 "twofa_enabled": true,
                 "passkeys_enabled": false,
+                "port_quota": null,
             }),
         ),
     }

@@ -266,6 +266,8 @@ pub struct HubParams {
     pub mesh_exit_nodes_enabled: bool,
     pub ports_require_reservation: bool,
     pub user_port_quota: i64,
+    pub new_user_port_quota: Option<i64>,
+    pub signup_open: bool,
     pub max_udp_port_range: u16,
     /// Enable active/passive leader election (Postgres only).
     pub leader_election: bool,
@@ -439,6 +441,8 @@ impl Hub {
             mailer: self.p.mailer.clone(),
             ports_require_reservation: self.p.ports_require_reservation,
             user_port_quota: self.p.user_port_quota,
+            new_user_port_quota: self.p.new_user_port_quota,
+            signup_open: self.p.signup_open,
             max_udp_port_range: self.p.max_udp_port_range,
             port_index: arc_swap::ArcSwap::from_pointee(api::PortIndex::default()),
             port_reservations: arc_swap::ArcSwap::from_pointee(Vec::new()),

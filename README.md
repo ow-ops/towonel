@@ -292,6 +292,15 @@ curl -X POST "$HUB/v1/tenants/$TENANT/ports" \
 Any port inside the block releases it: `DELETE
 /v1/tenants/$TENANT/ports/udp/49200` frees the whole reservation.
 
+With reservations required, each user may hold
+`TOWONEL_HUB_USER_PORT_QUOTA` reservations across their tunnels (`0`:
+unlimited). An operator gives a user their own quota from the console or
+with `PUT /v1/users/{id}/port-quota` (`{"port_quota": 5}`, where `0`
+means no ports; `null` goes back to the hub quota).
+`TOWONEL_HUB_NEW_USER_PORT_QUOTA` sets that per-user quota on every account
+created afterwards, so `0` keeps ports off for new users until an
+operator raises it. Operators are not limited.
+
 ### TURN behind towonel (coturn)
 
 A TURN relay needs both its control port and its relay port range

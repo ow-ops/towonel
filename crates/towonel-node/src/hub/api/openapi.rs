@@ -140,6 +140,7 @@ pub struct UserApiDoc;
         super::users::list_users,
         super::users::get_user,
         super::users::post_user_disable,
+        super::users::put_user_port_quota,
         super::mesh::post_auth_key,
         super::mesh::list_auth_keys,
         super::mesh::delete_auth_key,

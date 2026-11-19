@@ -445,6 +445,7 @@ mod tests {
                 password_hash: "x",
                 role: "user",
                 email_verified_at_ms: Some(1),
+                port_quota: None,
                 now_ms: 1,
             })
             .await
@@ -575,6 +576,7 @@ mod tests {
             password_hash: "x",
             role: "user",
             email_verified_at_ms: Some(now_ms_i),
+            port_quota: None,
             now_ms: now_ms_i,
         })
         .await

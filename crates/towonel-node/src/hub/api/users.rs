@@ -2,12 +2,13 @@ use std::sync::Arc;
 
 use axum::extract::{Path, Query, State};
 use axum::response::Response;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tracing::warn;
 use utoipa::ToSchema;
 
 use crate::hub::auth::middleware::{OperatorPrincipal, Principal};
 use crate::hub::db::admin_actions::NewAdminAction;
+use crate::hub::db::users::UserRow;
 
 use super::signup_invites::{now_ms_i64, principal_actor, random_code};
 use super::{
@@ -22,6 +23,21 @@ struct UserEntry {
     role: String,
     disabled_at_ms: Option<i64>,
     created_at_ms: i64,
+    /// Own port quota; `null` means the hub default applies.
+    port_quota: Option<i64>,
+}
+
+impl From<UserRow> for UserEntry {
+    fn from(u: UserRow) -> Self {
+        Self {
+            id: u.id,
+            email: u.email,
+            role: u.role,
+            disabled_at_ms: u.disabled_at_ms,
+            created_at_ms: u.created_at_ms,
+            port_quota: u.port_quota,
+        }
+    }
 }
 
 #[utoipa::path(
@@ -47,16 +63,7 @@ pub(super) async fn list_users(
             return internal_error();
         }
     };
-    let entries: Vec<UserEntry> = rows
-        .into_iter()
-        .map(|u| UserEntry {
-            id: u.id,
-            email: u.email,
-            role: u.role,
-            disabled_at_ms: u.disabled_at_ms,
-            created_at_ms: u.created_at_ms,
-        })
-        .collect();
+    let entries: Vec<UserEntry> = rows.into_iter().map(UserEntry::from).collect();
     let (entries, total) = paginate(entries, &page);
     json_ok_paged(entries, total)
 }
@@ -78,13 +85,7 @@ pub(super) async fn get_user(
     Path(id): Path<String>,
 ) -> Response {
     match state.db.find_user_by_id(&id).await {
-        Ok(Some(u)) => json_ok(UserEntry {
-            id: u.id,
-            email: u.email,
-            role: u.role,
-            disabled_at_ms: u.disabled_at_ms,
-            created_at_ms: u.created_at_ms,
-        }),
+        Ok(Some(u)) => json_ok(UserEntry::from(u)),
         Ok(None) => not_found("user not found"),
         Err(e) => {
             warn!(error = %e, "find_user_by_id failed");
@@ -143,4 +144,75 @@ pub(super) async fn post_user_disable(
     }
 
     json_ok(serde_json::json!({"ok": true}))
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub(super) struct SetPortQuotaRequest {
+    /// Max port reservations across the user's tenants; `null` restores the hub default.
+    port_quota: Option<i64>,
+}
+
+#[utoipa::path(
+    put,
+    path = "/v1/users/{id}/port-quota",
+    tag = "users",
+    params(("id" = String, Path, description = "User id")),
+    request_body = SetPortQuotaRequest,
+    responses(
+        (status = 200, description = "Quota updated", body = UserEntry),
+        (status = 400, description = "Negative quota"),
+        (status = 404, description = "User not found"),
+    ),
+    security(("operator_key" = [])),
+)]
+pub(super) async fn put_user_port_quota(
+    State(state): State<Arc<AppState>>,
+    OperatorPrincipal(actor): OperatorPrincipal,
+    Path(id): Path<String>,
+    axum::Json(body): axum::Json<SetPortQuotaRequest>,
+) -> Response {
+    if body.port_quota.is_some_and(|q| q < 0) {
+        return invalid_request("port_quota must be 0 or greater");
+    }
+
+    let now = now_ms_i64();
+    match state
+        .db
+        .set_user_port_quota(&id, body.port_quota, now)
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => return not_found("user not found"),
+        Err(e) => {
+            warn!(error = %e, "set_user_port_quota failed");
+            return internal_error();
+        }
+    }
+
+    let (actor_kind, actor_user_id) = principal_actor(&actor);
+    if let Err(e) = state
+        .db
+        .insert_admin_action(NewAdminAction {
+            id: &random_code(16),
+            actor_user_id: actor_user_id.as_deref(),
+            actor_kind,
+            action: "user.port_quota.set",
+            target_kind: "user",
+            target_id: Some(&id),
+            metadata: Some(serde_json::json!({"port_quota": body.port_quota})),
+            now_ms: now,
+        })
+        .await
+    {
+        warn!(error = %e, "insert_admin_action failed");
+    }
+
+    match state.db.find_user_by_id(&id).await {
+        Ok(Some(u)) => json_ok(UserEntry::from(u)),
+        Ok(None) => not_found("user not found"),
+        Err(e) => {
+            warn!(error = %e, "find_user_by_id failed");
+            internal_error()
+        }
+    }
 }

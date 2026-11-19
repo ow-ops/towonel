@@ -19,6 +19,7 @@ pub struct NewUser<'a> {
     pub role: &'a str,
     pub email_verified_at_ms: Option<i64>,
     pub now_ms: i64,
+    pub port_quota: Option<i64>,
 }
 
 #[derive(Debug, Clone)]
@@ -30,6 +31,8 @@ pub struct UserRow {
     pub disabled_at_ms: Option<i64>,
     pub email_verified_at_ms: Option<i64>,
     pub created_at_ms: i64,
+    /// Max port reservations across the user's tenants; `None` uses the hub default.
+    pub port_quota: Option<i64>,
 }
 
 impl From<users::Model> for UserRow {
@@ -42,6 +45,7 @@ impl From<users::Model> for UserRow {
             disabled_at_ms: m.disabled_at_ms,
             email_verified_at_ms: m.email_verified_at_ms,
             created_at_ms: m.created_at_ms,
+            port_quota: m.port_quota,
         }
     }
 }
@@ -57,6 +61,7 @@ impl Db {
             email_verified_at_ms: ActiveValue::Set(u.email_verified_at_ms),
             created_at_ms: ActiveValue::Set(u.now_ms),
             updated_at_ms: ActiveValue::Set(u.now_ms),
+            port_quota: ActiveValue::Set(u.port_quota),
         };
         users::Entity::insert(model).exec(&self.conn).await?;
         Ok(())
@@ -96,6 +101,28 @@ impl Db {
             .exec(&self.conn)
             .await?;
         Ok(())
+    }
+
+    /// Returns `false` when no user has this id.
+    pub async fn set_user_port_quota(
+        &self,
+        id: &str,
+        quota: Option<i64>,
+        now_ms: i64,
+    ) -> anyhow::Result<bool> {
+        let result = users::Entity::update_many()
+            .col_expr(
+                users::Column::PortQuota,
+                sea_orm::sea_query::Expr::value(quota),
+            )
+            .col_expr(
+                users::Column::UpdatedAtMs,
+                sea_orm::sea_query::Expr::value(now_ms),
+            )
+            .filter(users::Column::Id.eq(id))
+            .exec(&self.conn)
+            .await?;
+        Ok(result.rows_affected == 1)
     }
 
     pub async fn disable_user(&self, id: &str, now_ms: i64) -> anyhow::Result<()> {

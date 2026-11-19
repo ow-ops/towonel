@@ -1041,6 +1041,8 @@ async fn build_hub_params(
         mesh_exit_nodes_enabled: config.hub.mesh_exit_nodes_enabled,
         ports_require_reservation: config.hub.ports_require_reservation,
         user_port_quota: config.hub.user_port_quota,
+        new_user_port_quota: config.hub.new_user_port_quota,
+        signup_open: config.hub.signup_open,
         max_udp_port_range: config.hub.max_udp_port_range,
         leader_election: config.hub.leader_election,
         leader_db_dsn: config.hub.leader_db_dsn.clone(),

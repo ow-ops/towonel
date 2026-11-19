@@ -236,6 +236,9 @@ pub struct AppState {
     pub ports_require_reservation: bool,
     /// Per-user port reservation quota. `0` means unlimited.
     pub user_port_quota: i64,
+    /// Quota stored on new accounts; `None` leaves them on `user_port_quota`.
+    pub new_user_port_quota: Option<i64>,
+    pub signup_open: bool,
     /// Largest UDP port range a tenant may claim in one `UpsertUdpServiceRange`.
     pub max_udp_port_range: u16,
     /// Port → (tenant, service) index, computed without the liveness filter
@@ -731,6 +734,7 @@ fn web_admin_routes(web_enabled: bool) -> Router<Arc<AppState>> {
         .route("/v1/users/{id}", get(users::get_user))
         .route("/v1/users/{id}/invites", get(invites::list_user_invites))
         .route("/v1/users/{id}/disable", post(users::post_user_disable))
+        .route("/v1/users/{id}/port-quota", put(users::put_user_port_quota))
 }
 
 fn signed_public_routes() -> Router<Arc<AppState>> {

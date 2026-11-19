@@ -166,6 +166,7 @@ mod tests {
             password_hash: "argon2-placeholder",
             role: "user",
             email_verified_at_ms: Some(1000),
+            port_quota: None,
             now_ms: 1000,
         })
         .await
