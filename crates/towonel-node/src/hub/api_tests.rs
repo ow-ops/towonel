@@ -3474,6 +3474,7 @@ async fn oidc_auto_link_declines_unverified_local_account() {
             password_hash: "argon2-placeholder",
             role: "user",
             email_verified_at_ms: None,
+            port_quota: None,
             now_ms: 1_700_000_000_000,
         })
         .await
@@ -3564,6 +3565,7 @@ async fn oidc_auto_link_refuses_disabled_account() {
             password_hash: "argon2-placeholder",
             role: "user",
             email_verified_at_ms: Some(1_700_000_000_000),
+            port_quota: None,
             now_ms: 1_700_000_000_000,
         })
         .await
@@ -3607,6 +3609,7 @@ async fn oidc_only_user_can_set_password_via_reset() {
             password_hash: "",
             role: "user",
             email_verified_at_ms: Some(1_700_000_000_000),
+            port_quota: None,
             now_ms: 1_700_000_000_000,
         })
         .await
@@ -3926,6 +3929,152 @@ async fn user_port_quota_enforced() {
     assert_eq!(resp.status(), 403);
     let body: Value = resp.json().await.unwrap();
     assert_eq!(body["error"]["code"], "port_quota_exceeded");
+}
+
+#[tokio::test]
+async fn new_user_port_quota_and_per_user_override() {
+    let hub = TestHub::start_with_new_user_quota(0).await;
+    let client = reqwest::Client::new();
+
+    let cookie = signup_and_login_user(&hub, &client, "donor@example.test", "hunter22!").await;
+    let user_id = user_id_by_email(&hub, "donor@example.test").await;
+
+    let token = create_invite(&hub, &client, "tenant-donor", &["a.donor.test"]).await;
+    let tenant = tenant_from_token(&token);
+    hub.state
+        .db
+        .insert_tenant_ownership(super::db::tenant_ownership::NewTenantOwnership {
+            user_id: &user_id,
+            tenant_id: tenant.id().as_bytes(),
+            invite_id: &[2u8; 16],
+            display_name: "test",
+            now_ms: 1,
+        })
+        .await
+        .unwrap();
+
+    let reserve = |port: u16| {
+        client
+            .post(hub.url(&format!("/v1/tenants/{}/ports", tenant.id())))
+            .header(reqwest::header::COOKIE, &cookie)
+            .json(&json!({"protocol": "tcp", "preferred": port}))
+            .send()
+    };
+    let me = || {
+        client
+            .get(hub.url("/v1/auth/me"))
+            .header(reqwest::header::COOKIE, &cookie)
+            .send()
+    };
+    let set_quota = |quota: Value| {
+        client
+            .put(hub.url(&format!("/v1/users/{user_id}/port-quota")))
+            .bearer_auth(OPERATOR_KEY)
+            .json(&json!({"port_quota": quota}))
+            .send()
+    };
+
+    let resp = reserve(22500).await.unwrap();
+    assert_eq!(resp.status(), 403, "new accounts start with no ports");
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "port_quota_exceeded");
+    let body: Value = me().await.unwrap().json().await.unwrap();
+    assert_eq!(body["port_quota"], 0);
+
+    let resp = set_quota(json!(1)).await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["port_quota"], 1);
+    let body: Value = me().await.unwrap().json().await.unwrap();
+    assert_eq!(body["port_quota"], 1);
+
+    assert_eq!(reserve(22500).await.unwrap().status(), 201);
+    assert_eq!(reserve(22501).await.unwrap().status(), 403);
+
+    let resp = set_quota(Value::Null).await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert!(body["port_quota"].is_null());
+    let body: Value = me().await.unwrap().json().await.unwrap();
+    assert!(
+        body["port_quota"].is_null(),
+        "null falls back to the hub quota, where 0 still means unlimited"
+    );
+    assert_eq!(reserve(22501).await.unwrap().status(), 201);
+}
+
+#[tokio::test]
+async fn put_user_port_quota_validates_input_and_caller() {
+    let hub = TestHub::start_with_quota(true, 0).await;
+    let client = reqwest::Client::new();
+
+    let cookie = signup_and_login_user(&hub, &client, "self@example.test", "hunter22!").await;
+    let user_id = user_id_by_email(&hub, "self@example.test").await;
+    let url = hub.url(&format!("/v1/users/{user_id}/port-quota"));
+
+    let resp = client
+        .put(&url)
+        .header(reqwest::header::COOKIE, &cookie)
+        .json(&json!({"port_quota": 10}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        404,
+        "admin routes are hidden from users, who cannot raise their own quota"
+    );
+
+    let resp = client
+        .put(&url)
+        .bearer_auth(OPERATOR_KEY)
+        .json(&json!({"port_quota": -1}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+
+    let resp = client
+        .put(hub.url("/v1/users/does-not-exist/port-quota"))
+        .bearer_auth(OPERATOR_KEY)
+        .json(&json!({"port_quota": 1}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+}
+
+#[tokio::test]
+async fn signup_without_code_requires_open_signup() {
+    let client = reqwest::Client::new();
+    let body = json!({"email": "open@example.test", "password": "hunter22!"});
+
+    let closed = TestHub::start().await;
+    let (s, _) = post_json(&client, &closed.url("/v1/auth/signup"), body.clone(), None).await;
+    assert_eq!(s, 400, "invite-only hub must require a code");
+
+    let open = TestHub::start_with_open_signup().await;
+    let (s, resp) = post_json(&client, &open.url("/v1/auth/signup"), body, None).await;
+    assert_eq!(s, 200, "open hub must accept signup without a code: {resp}");
+    let user_id = user_id_by_email(&open, "open@example.test").await;
+    let user = open
+        .state
+        .db
+        .find_user_by_id(&user_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(user.role, "user");
+
+    let providers: Value = client
+        .get(open.url("/v1/auth/providers"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(providers["signup_open"], true);
 }
 
 #[tokio::test]

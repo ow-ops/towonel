@@ -59,6 +59,7 @@ pub async fn cmd_user_create(
         password_hash: &hash,
         role: &role,
         email_verified_at_ms: Some(now_ms),
+        port_quota: None,
         now_ms,
     })
     .await

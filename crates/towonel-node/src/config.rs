@@ -209,6 +209,11 @@ pub struct HubConfig {
     pub ports_require_reservation: bool,
     /// Per-user port reservation quota. `0` means unlimited. `TOWONEL_HUB_USER_PORT_QUOTA`.
     pub user_port_quota: i64,
+    /// Quota written onto accounts created from now on; `0` means no ports.
+    /// Unset leaves new accounts on `user_port_quota`. `TOWONEL_HUB_NEW_USER_PORT_QUOTA`.
+    pub new_user_port_quota: Option<i64>,
+    /// Lets web signup proceed without an invite code. `TOWONEL_HUB_SIGNUP_OPEN`.
+    pub signup_open: bool,
     /// Largest UDP port range (inclusive port count) a tenant may claim in one
     /// `UpsertUdpServiceRange`. `TOWONEL_HUB_MAX_UDP_PORT_RANGE`.
     pub max_udp_port_range: u16,
@@ -452,6 +457,8 @@ struct RawEnv {
     hub_web_enabled: Option<bool>,
     hub_ports_require_reservation: Option<bool>,
     hub_user_port_quota: Option<i64>,
+    hub_new_user_port_quota: Option<i64>,
+    hub_signup_open: Option<bool>,
     hub_max_udp_port_range: Option<u16>,
     hub_trusted_proxies: Option<String>,
     hub_rate_limit_per_sec: Option<u32>,
@@ -542,6 +549,8 @@ impl NodeConfig {
             hub_web_enabled,
             hub_ports_require_reservation,
             hub_user_port_quota,
+            hub_new_user_port_quota,
+            hub_signup_open,
             hub_max_udp_port_range,
             hub_trusted_proxies,
             hub_rate_limit_per_sec,
@@ -656,6 +665,8 @@ impl NodeConfig {
             web_enabled: hub_web_enabled,
             ports_require_reservation: hub_ports_require_reservation,
             user_port_quota: hub_user_port_quota,
+            new_user_port_quota: hub_new_user_port_quota,
+            signup_open: hub_signup_open,
             max_udp_port_range: hub_max_udp_port_range,
             trusted_proxies: hub_trusted_proxies,
             rate_limit_per_sec: hub_rate_limit_per_sec,
@@ -793,6 +804,8 @@ struct HubInputs<'a> {
     web_enabled: Option<bool>,
     ports_require_reservation: Option<bool>,
     user_port_quota: Option<i64>,
+    new_user_port_quota: Option<i64>,
+    signup_open: Option<bool>,
     max_udp_port_range: Option<u16>,
     trusted_proxies: Option<String>,
     rate_limit_per_sec: Option<u32>,
@@ -834,6 +847,8 @@ fn build_hub_config(inputs: HubInputs<'_>) -> anyhow::Result<HubConfig> {
         web_enabled,
         ports_require_reservation,
         user_port_quota,
+        new_user_port_quota,
+        signup_open,
         max_udp_port_range,
         trusted_proxies,
         rate_limit_per_sec,
@@ -916,6 +931,10 @@ fn build_hub_config(inputs: HubInputs<'_>) -> anyhow::Result<HubConfig> {
         );
     }
 
+    if new_user_port_quota.is_some_and(|q| q < 0) {
+        anyhow::bail!("TOWONEL_HUB_NEW_USER_PORT_QUOTA must be 0 or greater");
+    }
+
     Ok(HubConfig {
         enabled: hub_enabled,
         database: DatabaseConfig {
@@ -945,6 +964,8 @@ fn build_hub_config(inputs: HubInputs<'_>) -> anyhow::Result<HubConfig> {
         web_enabled: web_enabled.unwrap_or(false),
         ports_require_reservation: ports_require_reservation.unwrap_or(false),
         user_port_quota: user_port_quota.unwrap_or(0),
+        new_user_port_quota,
+        signup_open: signup_open.unwrap_or(false),
         max_udp_port_range: max_udp_port_range.unwrap_or(512),
         trusted_proxies: trusted_proxies
             .as_deref()

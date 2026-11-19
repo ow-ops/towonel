@@ -13,6 +13,7 @@ use utoipa::ToSchema;
 
 use crate::hub::auth::middleware::Principal;
 use crate::hub::db::port_reservations::{NewPortReservation, PortProtocol, PortReservationRow};
+use crate::hub::db::users::UserRow;
 
 use super::{
     AppState, Pagination, conflict, error_response, internal_error, invalid_request, json_ok,
@@ -176,9 +177,10 @@ pub(super) async fn post_port(
         }
     };
 
-    if let Some(user_id) = owner_user_id.as_deref()
+    if let Principal::User(user) = &principal
+        && owner_user_id.is_some()
         && state.ports_require_reservation
-        && let Err(resp) = enforce_user_port_quota(&state, user_id).await
+        && let Err(resp) = enforce_user_port_quota(&state, user).await
     {
         return resp;
     }
@@ -430,23 +432,39 @@ pub(super) async fn authorize_tenant(
     }
 }
 
-async fn enforce_user_port_quota(state: &Arc<AppState>, user_id: &str) -> Result<(), Response> {
-    let quota = state.user_port_quota;
-    if quota == 0 {
-        return Ok(());
+/// `None` means unlimited. A user's own quota is a hard cap (`0` = no ports);
+/// the hub-wide quota keeps its `0` = unlimited meaning.
+pub(super) const fn effective_port_quota(state: &AppState, user: &UserRow) -> Option<i64> {
+    match user.port_quota {
+        Some(q) => Some(q),
+        None if state.user_port_quota == 0 => None,
+        None => Some(state.user_port_quota),
     }
-    let used = match state.db.count_port_reservations_for_user(user_id).await {
+}
+
+async fn enforce_user_port_quota(state: &Arc<AppState>, user: &UserRow) -> Result<(), Response> {
+    let Some(quota) = effective_port_quota(state, user) else {
+        return Ok(());
+    };
+    if quota == 0 {
+        return Err(error_response(
+            StatusCode::FORBIDDEN,
+            "port_quota_exceeded",
+            "port forwarding is not enabled for this account",
+        ));
+    }
+    let held = match state.db.count_port_reservations_for_user(&user.id).await {
         Ok(n) => n,
         Err(e) => {
             warn!(error = %e, "count_port_reservations_for_user failed");
             return Err(internal_error());
         }
     };
-    if used >= quota {
+    if held >= quota {
         return Err(error_response(
             StatusCode::FORBIDDEN,
             "port_quota_exceeded",
-            format!("user already holds {used} of {quota} allowed port reservations"),
+            format!("user already holds {held} of {quota} allowed port reservations"),
         ));
     }
     Ok(())

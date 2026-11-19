@@ -615,9 +615,9 @@ pub(super) async fn callback(
                     AutoLink::Linked(id) => id,
                     AutoLink::Failed(why) => return error_redirect(&provider, why),
                     AutoLink::NoMatch => {
-                        let Some(code) = signup_code.as_deref() else {
+                        if signup_code.is_none() && !state.signup_open {
                             return error_redirect(&provider, "signup_required");
-                        };
+                        }
                         let Some(email_val) = email else {
                             return error_redirect(&provider, "no_email");
                         };
@@ -633,7 +633,7 @@ pub(super) async fn callback(
                             &subject,
                             &email_val,
                             email_verified,
-                            code,
+                            signup_code.as_deref(),
                         )
                         .await
                         {
@@ -843,7 +843,7 @@ pub(super) async fn list_providers(State(state): State<Arc<AppState>>) -> Respon
     }
     json_with_status(
         StatusCode::OK,
-        serde_json::json!({ "providers": providers }),
+        serde_json::json!({ "providers": providers, "signup_open": state.signup_open }),
     )
 }
 
@@ -1065,27 +1065,33 @@ pub(in crate::hub) async fn maybe_auto_link(
     AutoLink::Linked(user.id)
 }
 
+#[expect(clippy::too_many_lines, reason = "linear signup with rollback arms")]
 async fn signup_via_oidc(
     state: &Arc<AppState>,
     provider: &str,
     subject: &str,
     email: &str,
     email_verified: Option<bool>,
-    code: &str,
+    code: Option<&str>,
 ) -> Result<String, &'static str> {
     let now_ms_i = now_ms_i64();
 
-    let claimed = match state.db.claim_signup_invite(code, now_ms_i).await {
-        Ok(Some(c)) => c,
-        Ok(None) => return Err("invite_invalid"),
-        Err(e) => {
-            warn!(error = %e, "claim_signup_invite failed (oidc)");
-            return Err("internal_error");
-        }
+    let claimed = match code {
+        None => None,
+        Some(code) => match state.db.claim_signup_invite(code, now_ms_i).await {
+            Ok(Some(c)) => Some(c),
+            Ok(None) => return Err("invite_invalid"),
+            Err(e) => {
+                warn!(error = %e, "claim_signup_invite failed (oidc)");
+                return Err("internal_error");
+            }
+        },
     };
+    let role = claimed.as_ref().map_or("user", |c| c.role.as_str());
 
     let normalized_email = crate::hub::db::users::normalize_email(email);
-    if let Some(expected) = claimed.recipient_email.as_deref()
+    if let Some(claimed) = &claimed
+        && let Some(expected) = claimed.recipient_email.as_deref()
         && normalized_email != expected
     {
         if let Err(rel_err) = state.db.release_signup_invite(&claimed.code).await {
@@ -1104,8 +1110,9 @@ async fn signup_via_oidc(
             id: &user_id,
             email,
             password_hash: "",
-            role: &claimed.role,
+            role,
             email_verified_at_ms: Some(now_ms_i),
+            port_quota: state.new_user_port_quota,
             now_ms: now_ms_i,
         })
         .await
@@ -1114,7 +1121,9 @@ async fn signup_via_oidc(
         if !dup {
             warn!(error = %e, "insert_user (oidc) failed");
         }
-        if let Err(rel_err) = state.db.release_signup_invite(&claimed.code).await {
+        if let Some(claimed) = &claimed
+            && let Err(rel_err) = state.db.release_signup_invite(&claimed.code).await
+        {
             warn!(error = %rel_err, "release_signup_invite after oidc insert_user failure");
         }
         return Err(if dup { "email_taken" } else { "internal_error" });
@@ -1122,10 +1131,11 @@ async fn signup_via_oidc(
 
     // Rollback arms must release the invite too — orphaned-claim
     // blocks the legitimate recipient from retrying.
-    if let Err(e) = state
-        .db
-        .finalize_signup_invite(&claimed.code, &user_id)
-        .await
+    if let Some(claimed) = &claimed
+        && let Err(e) = state
+            .db
+            .finalize_signup_invite(&claimed.code, &user_id)
+            .await
     {
         warn!(error = %e, "finalize_signup_invite failed (oidc)");
         if let Err(del_err) = state.db.delete_user(&user_id).await {
@@ -1152,7 +1162,9 @@ async fn signup_via_oidc(
         if let Err(del_err) = state.db.delete_user(&user_id).await {
             warn!(error = %del_err, "delete_user rollback (oidc link)");
         }
-        if let Err(rel_err) = state.db.release_signup_invite(&claimed.code).await {
+        if let Some(claimed) = &claimed
+            && let Err(rel_err) = state.db.release_signup_invite(&claimed.code).await
+        {
             warn!(error = %rel_err, "release_signup_invite after oidc identity insert failure");
         }
         return Err("internal_error");
@@ -1172,8 +1184,8 @@ async fn signup_via_oidc(
                 "subject": subject,
                 "email_claim": email,
                 "email_verified": email_verified,
-                "role": claimed.role,
-                "signup_invite_code": claimed.code,
+                "role": role,
+                "signup_invite_code": claimed.as_ref().map(|c| &c.code),
             })),
             now_ms: now_ms_i,
         })
