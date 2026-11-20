@@ -6,8 +6,6 @@ no-default-features = false
 version = 2
 yanked = "deny"
 ignore = [
-  # Transitive via netdev/netwatch → netlink-packet-*. No safe upgrade.
-  "RUSTSEC-2024-0436", # paste unmaintained
   # Transitive via sqlx, sea-orm, oauth2/openidconnect. No replacement upstream yet.
   "RUSTSEC-2026-0543", # chrono unmaintained
 ]
@@ -93,6 +91,13 @@ skip = [
   { crate = "windows_x86_64_gnu" },
   { crate = "windows_x86_64_gnullvm" },
   { crate = "windows_x86_64_msvc" },
+  # loom (via n0-future → cordyceps) pulls the windows 0.100 family alongside
+  # the 0.62 one netwatch and iana-time-zone use.
+  { crate = "windows-core" },
+  { crate = "windows-implement" },
+  { crate = "windows-interface" },
+  { crate = "windows-result" },
+  { crate = "windows-strings" },
   # wasip2/wasip3 pull different wit-bindgen versions via getrandom.
   { crate = "wit-bindgen" },
   { crate = "r-efi" },
