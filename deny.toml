@@ -8,6 +8,8 @@ yanked = "deny"
 ignore = [
   # Transitive via netdev/netwatch → netlink-packet-*. No safe upgrade.
   "RUSTSEC-2024-0436", # paste unmaintained
+  # Transitive via sqlx, sea-orm, oauth2/openidconnect. No replacement upstream yet.
+  "RUSTSEC-2026-0543", # chrono unmaintained
 ]
 
 [licenses]
