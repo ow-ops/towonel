@@ -54,9 +54,9 @@ if [ "$ENABLE_SCCACHE" = "1" ]; then
            SCCACHE_IGNORE_SERVER_IO_ERROR=1 \
            SCCACHE_SERVER_PORT \
            SCCACHE_IDLE_TIMEOUT=0 \
-           SCCACHE_BUCKET=sccache \
-           SCCACHE_ENDPOINT=https://s3.erwanleboucher.dev \
-           SCCACHE_REGION=us-east-1 \
+           SCCACHE_BUCKET=ow-oops-sccache \
+           SCCACHE_ENDPOINT=https://s3.gra.io.cloud.ovh.net \
+           SCCACHE_REGION=gra \
            SCCACHE_S3_USE_SSL=true \
            AWS_ACCESS_KEY_ID="$(cat /run/secrets/SCCACHE_AWS_ACCESS_KEY_ID)" \
            AWS_SECRET_ACCESS_KEY="$(cat /run/secrets/SCCACHE_AWS_SECRET_ACCESS_KEY)"
