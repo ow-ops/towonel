@@ -19,7 +19,7 @@ RUN apt-get update \
 
 RUN case "${BUILDARCH}" in \
         amd64) HOST_TARGET=x86_64-unknown-linux-musl; ZIG_ARCH=x86_64; SCCACHE_ARCH=x86_64 ;; \
-        arm64) HOST_TARGET=aarch64-unknown-linux-musl; ZIG_ARCH=aarch64; SCCACHE_ARCH=aarch64 ;; \
+        arm64) HOST_TARGET=aarch64-unknown-linux-gnu; ZIG_ARCH=aarch64; SCCACHE_ARCH=aarch64 ;; \
         *) echo "Unsupported BUILDARCH: ${BUILDARCH}" >&2; exit 1 ;; \
     esac \
     && curl -fsSL "https://ziglang.org/download/${ZIG_VERSION}/zig-${ZIG_ARCH}-linux-${ZIG_VERSION}.tar.xz" \

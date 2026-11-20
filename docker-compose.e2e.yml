@@ -25,6 +25,13 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.node
+      # CI sets these to reuse the sccache bucket the image builds fill; unset
+      # locally, the build runs uncached as before.
+      args:
+        ENABLE_SCCACHE: ${ENABLE_SCCACHE:-0}
+      secrets:
+        - SCCACHE_AWS_ACCESS_KEY_ID
+        - SCCACHE_AWS_SECRET_ACCESS_KEY
     container_name: towonel-e2e-hub
     environment:
       RUST_LOG: info
@@ -162,7 +169,13 @@ services:
   agent:
     build:
       context: .
-      dockerfile: Dockerfile.e2e-agent
+      dockerfile: Dockerfile.agent
+      target: e2e
+      args:
+        ENABLE_SCCACHE: ${ENABLE_SCCACHE:-0}
+      secrets:
+        - SCCACHE_AWS_ACCESS_KEY_ID
+        - SCCACHE_AWS_SECRET_ACCESS_KEY
     container_name: towonel-e2e-agent
     depends_on:
       test-runner:
@@ -186,6 +199,12 @@ services:
 
 volumes:
   hub-data:
+
+secrets:
+  SCCACHE_AWS_ACCESS_KEY_ID:
+    environment: SCCACHE_AWS_ACCESS_KEY_ID
+  SCCACHE_AWS_SECRET_ACCESS_KEY:
+    environment: SCCACHE_AWS_SECRET_ACCESS_KEY
 
 # Fixed subnet so `edge-vip` can pin a second edge address the runner knows.
 networks:
