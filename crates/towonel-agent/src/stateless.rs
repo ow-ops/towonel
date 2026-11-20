@@ -3,7 +3,7 @@
     reason = "TryInto length-mismatch errors carry no info beyond our custom message"
 )]
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -17,8 +17,10 @@ use tokio::task::JoinHandle;
 use towonel_common::CBOR_CONTENT_TYPE;
 use towonel_common::auth::sign_auth_header;
 use towonel_common::config_entry::{ConfigOp, ConfigPayload, SignedConfigEntry};
-use towonel_common::identity::{AgentId, AgentKeypair, TenantId, TenantKeypair};
+use towonel_common::edge_cred::Kid;
+use towonel_common::identity::{AgentId, AgentKeypair, PqPublicKey, TenantId, TenantKeypair};
 use towonel_common::invite::InviteToken;
+use towonel_common::topology::{Topology, TopologyEdge};
 use tracing::{info, warn};
 
 use crate::hub_client::{
@@ -44,6 +46,27 @@ pub struct EdgeContact {
     pub tls_addrs: Vec<String>,
 }
 
+impl From<&TopologyEdge> for EdgeContact {
+    fn from(edge: &TopologyEdge) -> Self {
+        Self {
+            id: edge.id,
+            addrs: edge.addresses.clone(),
+            tls_addrs: edge.tls_addresses.clone(),
+        }
+    }
+}
+
+/// The hub's edges and the regions this agent's invite allows, in preference
+/// order. Empty `regions` means no limit.
+#[derive(Clone, Debug, Default)]
+pub struct EdgeSet {
+    pub topology: Topology,
+    pub regions: Vec<String>,
+    /// The hub's signing keys. A set pushed by an edge is taken only if one
+    /// of them signed it.
+    pub keys: HashMap<Kid, PqPublicKey>,
+}
+
 /// Held under `ArcSwap` so the refresh task can replace it atomically
 /// while edge supervisors read it.
 #[derive(Clone, Debug)]
@@ -65,8 +88,9 @@ pub struct BootstrapContext {
     pub agent_kp: AgentKeypair,
     pub hub_url: String,
     pub tenant_id: TenantId,
-    pub trusted_edges: HashSet<EndpointId>,
-    pub edge_contacts: Vec<EdgeContact>,
+    pub edges: EdgeSet,
+    /// Operator pin from [`TRUSTED_EDGES_ENV`]; replaces the hub's choice.
+    pub pinned_edges: Option<HashSet<EndpointId>>,
     pub client: reqwest::Client,
     pub hostnames: Vec<String>,
     /// Relay URL advertised by the hub.
@@ -115,15 +139,15 @@ pub async fn bootstrap(token_str: &str) -> anyhow::Result<BootstrapContext> {
         );
     }
 
-    let (trusted_edges, edge_contacts) = resolve_edge_contacts(&resp)?;
+    let pinned_edges = trusted_edges_pin()?;
+    let edges = edge_set(&resp);
 
     info!(
         %tenant_id,
         agent_id = %agent_kp.id(),
         hub_url = %token.hub_url,
-        edges = trusted_edges.len(),
-        iroh_endpoints = resp.iroh_endpoints.len(),
-        dialable_edges = edge_contacts.iter().filter(|c| !c.addrs.is_empty()).count(),
+        edges = edges.topology.edges.len(),
+        dialable_edges = edges.topology.edges.iter().filter(|e| e.is_dialable()).count(),
         "bootstrap complete"
     );
 
@@ -140,8 +164,8 @@ pub async fn bootstrap(token_str: &str) -> anyhow::Result<BootstrapContext> {
         agent_kp,
         hub_url: token.hub_url.clone(),
         tenant_id,
-        trusted_edges,
-        edge_contacts,
+        edges,
+        pinned_edges,
         client,
         hostnames: resp.hostnames,
         relay_url: resp.relay_url,
@@ -762,6 +786,18 @@ struct BootstrapResponse {
     relay_url: Option<String>,
     #[serde(flatten, default)]
     edge_cred: Option<EdgeCredWire>,
+    #[serde(default)]
+    regions: Vec<String>,
+    #[serde(default)]
+    topology: Option<Topology>,
+    #[serde(default)]
+    signing_keys: Vec<SigningKeyWire>,
+}
+
+#[derive(Deserialize)]
+struct SigningKeyWire {
+    kid: Kid,
+    public_key_b64: String,
 }
 
 #[derive(Deserialize)]
@@ -780,59 +816,69 @@ impl BootstrapResponse {
     }
 }
 
-/// Resolve the trusted-edge set — an operator pin (`TRUSTED_EDGES_ENV`) or the
-/// hub's advertised set — and pair each edge with its advertised iroh addresses.
-/// An empty operator pin fails closed rather than silently trusting the hub.
-fn resolve_edge_contacts(
-    resp: &BootstrapResponse,
-) -> anyhow::Result<(HashSet<EndpointId>, Vec<EdgeContact>)> {
-    let trusted_edges = if let Some(pinned) = parse_trusted_edges_env() {
-        if pinned.is_empty() {
-            bail!(
-                "{TRUSTED_EDGES_ENV} is set but yielded no valid edge endpoint ids; \
-                 refusing to fall back to hub-advertised edges"
-            );
-        }
-        pinned
+/// The edge set a bootstrap response describes. A hub that predates
+/// `topology` lists only the edges it already picked for this agent's regions.
+fn edge_set(resp: &BootstrapResponse) -> EdgeSet {
+    if let Some(topology) = resp.topology.clone() {
+        let keys = resp.signing_keys.iter().filter_map(|key| {
+            let decoded = B64.decode(&key.public_key_b64).ok();
+            let public = decoded.and_then(|bytes| PqPublicKey::from_slice(&bytes).ok());
+            if public.is_none() {
+                warn!(kid = key.kid, "hub sent a signing key that does not decode");
+            }
+            public.map(|public| (key.kid, public))
+        });
+        return EdgeSet {
+            topology,
+            regions: resp.regions.clone(),
+            keys: keys.collect(),
+        };
+    }
+    let ids: Vec<EndpointId> = if resp.trusted_edges.is_empty() {
+        resp.edge_node_id.into_iter().collect()
     } else {
-        let mut edges = HashSet::new();
-        if resp.trusted_edges.is_empty() {
-            edges.extend(resp.edge_node_id);
-        } else {
-            edges.extend(resp.trusted_edges.iter().copied());
-        }
-        edges
+        resp.trusted_edges.clone()
     };
-
-    // Addresses only belong to the edge that owns them; an edge without an
-    // advertised endpoint gets empty addrs (the supervisor skips it).
-    let edge_contacts: Vec<EdgeContact> = trusted_edges
-        .iter()
+    let edges = ids
+        .into_iter()
         .map(|id| {
-            let endpoint = resp.iroh_endpoints.iter().find(|e| e.node_id == *id);
-            EdgeContact {
-                id: *id,
-                addrs: endpoint.map(|e| e.addresses.clone()).unwrap_or_default(),
-                tls_addrs: endpoint
+            let endpoint = resp.iroh_endpoints.iter().find(|e| e.node_id == id);
+            TopologyEdge {
+                id,
+                addresses: endpoint.map(|e| e.addresses.clone()).unwrap_or_default(),
+                tls_addresses: endpoint
                     .map(|e| e.tls_addresses.clone())
                     .unwrap_or_default(),
+                region: None,
             }
         })
         .collect();
-    Ok((trusted_edges, edge_contacts))
+    EdgeSet {
+        topology: Topology { version: 0, edges },
+        regions: Vec::new(),
+        keys: HashMap::new(),
+    }
 }
 
-/// Re-query the hub for the current trusted-edge set, reusing the existing
-/// identity. The topology-refresh loop calls this to pick up edges that came or
-/// went after startup.
-pub async fn refresh_edge_contacts(
-    token_str: &str,
-    ctx: &BootstrapContext,
-) -> anyhow::Result<Vec<EdgeContact>> {
+/// The operator pin, if set. An empty one fails closed rather than silently
+/// trusting the hub.
+fn trusted_edges_pin() -> anyhow::Result<Option<HashSet<EndpointId>>> {
+    let pinned = parse_trusted_edges_env();
+    if pinned.as_ref().is_some_and(HashSet::is_empty) {
+        bail!(
+            "{TRUSTED_EDGES_ENV} is set but yielded no valid edge endpoint ids; \
+             refusing to fall back to hub-advertised edges"
+        );
+    }
+    Ok(pinned)
+}
+
+/// Ask the hub for the current edge set, reusing the existing identity. Only
+/// needed while no edge is pushing it (see [`crate::edge_session`]).
+pub async fn fetch_edge_set(token_str: &str, ctx: &BootstrapContext) -> anyhow::Result<EdgeSet> {
     let token = InviteToken::decode(token_str).context("invalid invite token")?;
     let resp = post_bootstrap(&ctx.client, &token, &ctx.agent_id()).await?;
-    let (_trusted, contacts) = resolve_edge_contacts(&resp)?;
-    Ok(contacts)
+    Ok(edge_set(&resp))
 }
 
 #[tracing::instrument(skip_all, fields(otel.kind = "client"))]
@@ -943,9 +989,9 @@ mod tests {
             }),
             &edge,
         );
-        let (_, contacts) = resolve_edge_contacts(&resp).unwrap();
-        assert_eq!(contacts[0].addrs, ["1.2.3.4:51820"]);
-        assert_eq!(contacts[0].tls_addrs, ["1.2.3.4:51821"]);
+        let contact = EdgeContact::from(&edge_set(&resp).topology.edges[0]);
+        assert_eq!(contact.addrs, ["1.2.3.4:51820"]);
+        assert_eq!(contact.tls_addrs, ["1.2.3.4:51821"]);
     }
 
     #[test]
@@ -958,8 +1004,34 @@ mod tests {
             }),
             &edge,
         );
-        let (_, contacts) = resolve_edge_contacts(&resp).unwrap();
-        assert!(contacts[0].tls_addrs.is_empty());
+        let edges = edge_set(&resp);
+        assert_eq!(edges.topology.edges[0].tls_addresses, Vec::<String>::new());
+        assert_eq!(edges.topology.version, 0);
+        assert_eq!(edges.regions, Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_response_with_topology_uses_it_and_the_invites_regions() {
+        let listed = iroh::SecretKey::generate().public();
+        let other = iroh::SecretKey::generate().public();
+        let resp: BootstrapResponse = serde_json::from_value(serde_json::json!({
+            "tenant_id": "t",
+            "trusted_edges": [listed.to_string()],
+            "regions": ["EU", "CA"],
+            "topology": {
+                "version": 42,
+                "edges": [
+                    {"id": listed.to_string(), "addresses": ["1.2.3.4:51820"], "region": "EU"},
+                    {"id": other.to_string(), "addresses": ["5.6.7.8:51820"], "region": "NA"},
+                ],
+            },
+        }))
+        .unwrap();
+        let edges = edge_set(&resp);
+        assert_eq!(edges.topology.version, 42);
+        assert_eq!(edges.topology.edges.len(), 2);
+        assert_eq!(edges.regions, ["EU", "CA"]);
+        assert_eq!(edges.keys.len(), 0);
     }
 
     #[test]

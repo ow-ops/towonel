@@ -504,6 +504,14 @@ pub(super) async fn post_entry(State(state): State<Arc<AppState>>, body: Bytes) 
         }
     }
 
+    // A hub that was a standby until now has a config cache and port index
+    // from before the writes it missed; catch up before judging this one.
+    if let Err(e) = super::sync_config(&state).await {
+        state.metrics.record_reject(reject_reason::INTERNAL);
+        warn!(error = %e, "failed to sync config before insert");
+        return internal_error();
+    }
+
     // Validation + reservation lookup run outside the port lock; they don't
     // race other upserts.
     if let Err(resp) = validate_service_op(&state, &payload).await {
@@ -513,26 +521,19 @@ pub(super) async fn post_entry(State(state): State<Arc<AppState>>, body: Bytes) 
     // Idempotency check for UpsertAgent: if this agent is already registered,
     // return success without inserting a duplicate entry. This eliminates
     // sequence conflicts when multiple agent replicas boot simultaneously.
-    if let ConfigOp::UpsertAgent { agent_id } = &payload.op {
-        match state
-            .db
-            .is_agent_registered(&payload.tenant_id, agent_id, pq_pubkey)
+    if let ConfigOp::UpsertAgent { agent_id } = &payload.op
+        && state
+            .config
+            .read()
             .await
-        {
-            Ok(true) => {
-                state.metrics.entries_accepted.inc();
-                return cbor_response(&PostEntryResponse {
-                    status: "ok",
-                    sequence: payload.sequence,
-                });
-            }
-            Ok(false) => {}
-            Err(e) => {
-                state.metrics.record_reject(reject_reason::INTERNAL);
-                warn!(error = %e, "failed to check agent registration status");
-                return internal_error();
-            }
-        }
+            .state
+            .is_agent_signed(&payload.tenant_id, agent_id)
+    {
+        state.metrics.entries_accepted.inc();
+        return cbor_response(&PostEntryResponse {
+            status: "ok",
+            sequence: payload.sequence,
+        });
     }
 
     // Lock only the conflict-check → insert → index-update window so the
@@ -551,6 +552,21 @@ pub(super) async fn post_entry(State(state): State<Arc<AppState>>, body: Bytes) 
 
     let sequence = payload.sequence;
 
+    // Held across the insert so the cache folds entries in the order the DB
+    // took them, and a concurrent `sync_config` sees both or neither.
+    let mut cached = state.config.write().await;
+    // The log is replayed in sequence order, so an entry below the tenant's
+    // newest would change history that routes were already built from.
+    if cached
+        .state
+        .last_sequence(&payload.tenant_id)
+        .is_some_and(|newest| sequence <= newest)
+    {
+        state
+            .metrics
+            .record_reject(reject_reason::SEQUENCE_CONFLICT);
+        return sequence_conflict("sequence is not above the tenant's newest entry");
+    }
     if let Err(e) = state.db.insert(&entry, sequence).await {
         if super::db::is_unique_violation(&e) {
             state
@@ -562,6 +578,9 @@ pub(super) async fn post_entry(State(state): State<Arc<AppState>>, body: Bytes) 
         warn!(error = %e, "failed to insert entry");
         return internal_error();
     }
+    cached.state.apply(&payload);
+    cached.version = cached.version.saturating_add(1);
+    drop(cached);
 
     state.metrics.entries_accepted.inc();
 

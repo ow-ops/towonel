@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
-use crate::config_entry::{ConfigOp, SignedConfigEntry};
+use crate::config_entry::{ConfigOp, ConfigPayload};
 use crate::hostname::{ascii_lowercase_cow, wildcard_lookup_ascii_lower};
 use crate::identity::{AgentId, TenantId};
 use crate::ownership::OwnershipPolicy;
@@ -85,55 +85,23 @@ pub struct UdpListenerBinding {
 }
 
 impl RouteTable {
-    /// Materialize a route table by replaying signed config entries in order.
-    ///
-    /// Entries must be pre-sorted by (`tenant_id`, sequence). They are assumed
-    /// already signature-verified at the trust boundary before persistence, so
-    /// they're decoded without re-checking the signature (see
-    /// [`SignedConfigEntry::decode_trusted`]). The `policy` enforces which
-    /// tenants and hostnames are allowed; entries for tenants absent from it
-    /// are skipped.
+    /// Materialize a route table from already-replayed config. The `policy`
+    /// is applied here rather than during replay, so a [`ConfigState`] kept
+    /// across policy changes still yields what a fresh replay would.
     #[must_use]
-    pub fn from_entries(entries: &[SignedConfigEntry], policy: &OwnershipPolicy) -> Self {
-        Self::from_entries_with_liveness(entries, policy, None)
-    }
-
-    /// Same as [`Self::from_entries`] but intersects each tenant's agent set
-    /// with `live_agents` before materialization. Agents missing from
-    /// `live_agents` are treated as unreachable and their routes suppressed.
-    /// Pass `None` to disable liveness filtering.
-    #[must_use]
-    pub fn from_entries_with_liveness(
-        entries: &[SignedConfigEntry],
+    pub fn from_state(
+        state: &ConfigState,
         policy: &OwnershipPolicy,
         live_agents: Option<&HashSet<(TenantId, AgentId)>>,
     ) -> Self {
-        let mut tenant_state: HashMap<TenantId, TenantState> = HashMap::new();
-
-        for entry in entries {
-            if policy.pq_public_key(&entry.tenant_id).is_none() {
-                tracing::debug!(
-                    tenant = %entry.tenant_id,
-                    "skipping entry for tenant not in ownership policy"
-                );
-                continue;
-            }
-
-            let payload = match entry.decode_trusted() {
-                Ok(p) => p,
-                Err(e) => {
-                    tracing::warn!(
-                        tenant = %entry.tenant_id,
-                        error = %e,
-                        "skipping entry that failed to decode"
-                    );
-                    continue;
-                }
-            };
-
-            let state = tenant_state.entry(payload.tenant_id).or_default();
-            apply_op(state, &payload.op, &payload.tenant_id, policy);
-        }
+        // Sort tenants so cross-tenant port collisions resolve deterministically
+        // (lowest `tenant_id` wins). HashMap iteration is randomized.
+        let mut sorted_tenants: Vec<(&TenantId, &TenantState)> = state
+            .tenants
+            .iter()
+            .filter(|(tenant_id, _)| policy.pq_public_key(tenant_id).is_some())
+            .collect();
+        sorted_tenants.sort_by_key(|(t, _)| *t.as_bytes());
 
         let mut routes: HashMap<String, HashSet<AgentId>> = HashMap::new();
         let mut tls_policies = TlsPolicyTable::new();
@@ -144,23 +112,16 @@ impl RouteTable {
         // Not liveness-filtered: a fresh agent must pass the edge's
         // `is_known_agent` gate to establish the session that bumps its own
         // liveness. Per-hostname route sets below keep the liveness filter.
-        let signed_agents: HashSet<AgentId> = tenant_state
-            .values()
-            .flat_map(|s| s.agents.iter().cloned())
+        let signed_agents: HashSet<AgentId> = sorted_tenants
+            .iter()
+            .flat_map(|(_, s)| s.agents.iter().cloned())
             .collect();
 
-        // Sort tenants so cross-tenant port collisions resolve deterministically
-        // (lowest `tenant_id` wins). HashMap iteration is randomized.
-        let mut sorted_tenants: Vec<&TenantId> = tenant_state.keys().collect();
-        sorted_tenants.sort_by_key(|t| *t.as_bytes());
-
-        for tenant_id in sorted_tenants {
-            let Some(state) = tenant_state.get(tenant_id) else {
-                continue;
-            };
+        for (tenant_id, tenant) in sorted_tenants {
             materialize_tenant(
                 tenant_id,
-                state,
+                tenant,
+                policy,
                 live_agents,
                 &mut routes,
                 &mut tls_policies,
@@ -316,25 +277,11 @@ impl RouteTable {
 }
 
 /// Fold one signed-op into the per-tenant accumulator. Ownership-policy
-/// gates apply here so unauthorized hostname/TLS claims don't reach the
-/// materialized table.
-fn apply_op(
-    state: &mut TenantState,
-    op: &ConfigOp,
-    tenant_id: &TenantId,
-    policy: &OwnershipPolicy,
-) {
+/// gates are applied at materialization (see [`materialize_tenant`]).
+fn apply_op(state: &mut TenantState, op: &ConfigOp, tenant_id: &TenantId) {
     match op {
         ConfigOp::UpsertHostname { hostname } => {
-            if policy.is_hostname_allowed(tenant_id, hostname) {
-                state.hostnames.insert(hostname.to_lowercase());
-            } else {
-                tracing::warn!(
-                    tenant = %tenant_id,
-                    %hostname,
-                    "skipping unauthorized hostname claim"
-                );
-            }
+            state.hostnames.insert(hostname.to_lowercase());
         }
         ConfigOp::DeleteHostname { hostname } => {
             let key = hostname.to_lowercase();
@@ -348,15 +295,7 @@ fn apply_op(
             state.agents.remove(agent_id);
         }
         ConfigOp::SetHostnameTls { hostname, mode } => {
-            if policy.is_hostname_allowed(tenant_id, hostname) {
-                state.tls.insert(hostname.to_lowercase(), *mode);
-            } else {
-                tracing::warn!(
-                    tenant = %tenant_id,
-                    %hostname,
-                    "skipping unauthorized TLS policy"
-                );
-            }
+            state.tls.insert(hostname.to_lowercase(), *mode);
         }
         ConfigOp::UpsertTcpService {
             service,
@@ -425,6 +364,7 @@ fn apply_op(
 fn materialize_tenant(
     tenant_id: &TenantId,
     state: &TenantState,
+    policy: &OwnershipPolicy,
     live_agents: Option<&HashSet<(TenantId, AgentId)>>,
     routes: &mut HashMap<String, HashSet<AgentId>>,
     tls_policies: &mut TlsPolicyTable,
@@ -449,6 +389,14 @@ fn materialize_tenant(
         return;
     }
     for hostname in &state.hostnames {
+        if !policy.is_hostname_allowed(tenant_id, hostname) {
+            tracing::warn!(
+                tenant = %tenant_id,
+                %hostname,
+                "skipping unauthorized hostname claim"
+            );
+            continue;
+        }
         // A key already present means another (lower) tenant_id claimed this
         // hostname. Keep the first claimant (matches the listener tie-break)
         // rather than silently overwriting it.
@@ -507,8 +455,72 @@ fn materialize_tenant(
     }
 }
 
+/// Config replayed from signed entries, per tenant.
+///
+/// Independent of the ownership policy and of agent liveness, so the hub can
+/// keep one across rebuilds and fold new entries in with [`Self::apply`]
+/// instead of replaying the whole log.
+#[derive(Debug, Default)]
+pub struct ConfigState {
+    tenants: HashMap<TenantId, TenantState>,
+}
+
+impl ConfigState {
+    /// Fold one entry in. Entries must be applied in sequence order per tenant.
+    pub fn apply(&mut self, payload: &ConfigPayload) {
+        let tenant = self.tenants.entry(payload.tenant_id).or_default();
+        tenant.last_sequence = Some(payload.sequence);
+        apply_op(tenant, &payload.op, &payload.tenant_id);
+    }
+
+    /// Sequence of the tenant's newest entry.
+    #[must_use]
+    pub fn last_sequence(&self, tenant_id: &TenantId) -> Option<u64> {
+        self.tenants.get(tenant_id).and_then(|t| t.last_sequence)
+    }
+
+    /// Whether the tenant has an `UpsertAgent` for `agent_id` that was not
+    /// revoked since.
+    #[must_use]
+    pub fn is_agent_signed(&self, tenant_id: &TenantId, agent_id: &AgentId) -> bool {
+        self.tenants
+            .get(tenant_id)
+            .is_some_and(|t| t.agents.contains(agent_id))
+    }
+
+    /// `(has_tcp, has_udp)`: whether the tenant has any TCP / UDP service.
+    #[must_use]
+    pub fn service_bindings(&self, tenant_id: &TenantId) -> (bool, bool) {
+        self.tenants.get(tenant_id).map_or((false, false), |t| {
+            (!t.tcp_services.is_empty(), !t.udp_services.is_empty())
+        })
+    }
+
+    /// Every TCP service as `(tenant, service, listen_port)`.
+    pub fn tcp_services(&self) -> impl Iterator<Item = (&TenantId, &str, u16)> {
+        self.tenants.iter().flat_map(|(tenant, t)| {
+            t.tcp_services
+                .iter()
+                .map(move |(service, port)| (tenant, service.as_str(), *port))
+        })
+    }
+
+    /// Every UDP service as `(tenant, service, port_start, port_end)`, the
+    /// range inclusive.
+    pub fn udp_services(&self) -> impl Iterator<Item = (&TenantId, &str, u16, u16)> {
+        self.tenants.iter().flat_map(|(tenant, t)| {
+            t.udp_services.iter().map(move |(service, spec)| {
+                let end = spec
+                    .listen_port
+                    .saturating_add(spec.port_count.saturating_sub(1));
+                (tenant, service.as_str(), spec.listen_port, end)
+            })
+        })
+    }
+}
+
 /// Per-tenant state accumulated while replaying config entries.
-#[derive(Default)]
+#[derive(Debug, Default)]
 struct TenantState {
     hostnames: HashSet<String>,
     agents: HashSet<AgentId>,
@@ -521,12 +533,13 @@ struct TenantState {
     tcp_services: HashMap<String, u16>,
     /// `service_name -> spec`, last-write-wins per service.
     udp_services: HashMap<String, UdpServiceSpec>,
+    last_sequence: Option<u64>,
 }
 
 /// Accumulated UDP service binding for one tenant while replaying entries.
 /// A single-port service has `port_count == 1`; a range spans
 /// `listen_port ..= listen_port + port_count - 1`.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct UdpServiceSpec {
     listen_port: u16,
     port_count: u16,

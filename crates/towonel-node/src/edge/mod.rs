@@ -9,6 +9,7 @@ pub mod sessions;
 mod udp_source;
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use iroh::EndpointAddr;
@@ -24,14 +25,15 @@ use towonel_common::http_host::extract_host_header;
 use towonel_common::metrics::GaugeGuard;
 use towonel_common::sni::extract_sni;
 use towonel_common::tls_policy::TlsMode;
+use towonel_common::topology::{write_keepalive, write_topology};
 use towonel_common::transport::tls::TlsListener;
 use towonel_common::transport::{TunnelConn, TunnelRecv, TunnelSend};
 use towonel_common::tunnel::{
-    CONTROL_OPCODE_STREAM_ACK, CONTROL_STATUS_INTERNAL_ERROR, CONTROL_STATUS_INVALID,
-    CONTROL_STATUS_NOT_IMPLEMENTED, CONTROL_STATUS_OK, ClientAddrs, DatagramFrameReader,
-    MAX_UDP_DATAGRAM, STREAM_ACK_PREFIX, TCP_ROUTE_PREFIX, UDP_ROUTE_PREFIX, copy_tcp_counting,
-    read_control_prefix, read_control_status, write_control_status, write_datagram_frame,
-    write_handshake,
+    CONTROL_OPCODE_STREAM_ACK, CONTROL_OPCODE_TOPOLOGY, CONTROL_STATUS_INTERNAL_ERROR,
+    CONTROL_STATUS_INVALID, CONTROL_STATUS_NOT_IMPLEMENTED, CONTROL_STATUS_OK, ClientAddrs,
+    CountingWriter, DatagramFrameReader, MAX_UDP_DATAGRAM, STREAM_ACK_PREFIX, TCP_ROUTE_PREFIX,
+    UDP_ROUTE_PREFIX, copy_tcp_counting, join_or_abort, read_control_prefix, read_control_status,
+    write_control_status, write_datagram_frame, write_handshake,
 };
 
 use self::health::{EdgeMetrics, session_reject_reason};
@@ -747,11 +749,28 @@ async fn handle_agent_stream(
 ) {
     match tokio::time::timeout(
         CONTROL_STREAM_TIMEOUT,
-        run_control_stream(send, recv, conn, agent_id, hub_client, sessions),
+        run_control_stream(
+            send,
+            recv,
+            conn.clone(),
+            agent_id,
+            hub_client.clone(),
+            Arc::clone(&sessions),
+        ),
     )
     .await
     {
-        Ok(()) => {}
+        // A topology subscription lives as long as the session, so it runs
+        // outside the deadline.
+        Ok(Some(send)) => {
+            let Some(session) = sessions.get(&agent_id) else {
+                return;
+            };
+            let replaced = session.replace_topology_stream();
+            let keepalive = towonel_common::topology::KEEPALIVE;
+            stream_topology(send, &conn, agent_id, hub_client, keepalive, &replaced).await;
+        }
+        Ok(None) => {}
         Err(_) => {
             warn!(
                 agent = %agent_id.fmt_short(),
@@ -762,6 +781,76 @@ async fn handle_agent_stream(
     }
 }
 
+/// Writes the hub's edge set to `send` on every change, and a keepalive every
+/// `keepalive` in between, until the agent's connection closes, the edge
+/// loses its hub link, or the agent subscribes again (`replaced`).
+async fn stream_topology(
+    mut send: TunnelSend,
+    conn: &TunnelConn,
+    agent_id: iroh::EndpointId,
+    hub_client: Option<Arc<dyn HubClient>>,
+    keepalive: Duration,
+    replaced: &CancellationToken,
+) {
+    // `None` without a hub link, and for good from a hub that predates topology.
+    let mut topology = hub_client
+        .map(|c| c.topology())
+        .filter(|t| t.borrow().is_some());
+    let status = if topology.is_some() {
+        CONTROL_STATUS_OK
+    } else {
+        CONTROL_STATUS_NOT_IMPLEMENTED
+    };
+    if let Err(e) = write_control_status(&mut send, status).await {
+        debug!(agent = %agent_id.fmt_short(), error = %e, "writing topology status failed");
+        return;
+    }
+    let Some(topology) = topology.as_mut() else {
+        drop(send.finish().await);
+        return;
+    };
+    loop {
+        let current = topology.borrow_and_update().clone();
+        let Some(current) = current else {
+            drop(send.finish().await);
+            return;
+        };
+        let mut written = write_topology(&mut send, &current.signed).await;
+        loop {
+            if written.is_ok() {
+                written = send.flush().await;
+            }
+            if let Err(e) = written {
+                debug!(agent = %agent_id.fmt_short(), error = %e, "writing topology failed");
+                return;
+            }
+            tokio::select! {
+                changed = topology.changed() => {
+                    if changed.is_err() {
+                        return;
+                    }
+                    break;
+                }
+                _close = conn.closed() => return,
+                () = replaced.cancelled() => return,
+                () = tokio::time::sleep(keepalive) => {
+                    written = write_keepalive(&mut send).await;
+                }
+            }
+        }
+    }
+}
+
+async fn refuse_control(send: &mut TunnelSend, agent_id: iroh::EndpointId) {
+    if let Err(e) = write_control_status(send, CONTROL_STATUS_INVALID).await {
+        debug!(agent = %agent_id.fmt_short(), error = %e, "writing INVALID status failed");
+    }
+    if let Err(e) = send.finish().await {
+        debug!(agent = %agent_id.fmt_short(), error = %e, "finishing stream after INVALID failed");
+    }
+}
+
+/// Returns the send half when the agent subscribed to topology.
 async fn run_control_stream(
     mut send: TunnelSend,
     mut recv: TunnelRecv,
@@ -769,14 +858,14 @@ async fn run_control_stream(
     agent_id: iroh::EndpointId,
     hub_client: Option<Arc<dyn HubClient>>,
     sessions: Arc<SessionRegistry>,
-) {
+) -> Option<TunnelSend> {
     if let Err(e) = read_control_prefix(&mut recv).await {
         debug!(
             agent = %agent_id.fmt_short(),
             error = %e,
             "agent-initiated stream did not start with CONTROL_PREFIX; dropping"
         );
-        return;
+        return None;
     }
 
     // Agent half-closes its send to mark "request complete"; we read to EOF.
@@ -789,15 +878,19 @@ async fn run_control_stream(
                 cap_bytes = CONTROL_FRAME_MAX_BYTES,
                 "control frame exceeded cap or stream errored"
             );
-            if let Err(e) = write_control_status(&mut send, CONTROL_STATUS_INVALID).await {
-                debug!(agent = %agent_id.fmt_short(), error = %e, "writing INVALID status failed");
-            }
-            if let Err(e) = send.finish().await {
-                debug!(agent = %agent_id.fmt_short(), error = %e, "finishing stream after INVALID failed");
-            }
-            return;
+            refuse_control(&mut send, agent_id).await;
+            return None;
         }
     };
+
+    if frame == [CONTROL_OPCODE_TOPOLOGY] {
+        // Only for a session that presented a credential.
+        if sessions.tenant_for(&agent_id).is_some() {
+            return Some(send);
+        }
+        refuse_control(&mut send, agent_id).await;
+        return None;
+    }
 
     if frame == [CONTROL_OPCODE_STREAM_ACK] {
         if let Some(session) = sessions.get(&agent_id)
@@ -809,7 +902,7 @@ async fn run_control_stream(
             }
             drop(send.finish().await);
         }
-        return;
+        return None;
     }
 
     let (status, body) = match hub_client.as_deref() {
@@ -841,7 +934,7 @@ async fn run_control_stream(
                 "rejecting agent connection: credential agent_id does not match connection"
             );
             conn.close(403, b"credential agent_id mismatch");
-            return;
+            return None;
         }
         if sessions.record_tenant(agent_id, tenant_id) {
             client.record_session_added(tenant_id, cred_agent_id).await;
@@ -853,13 +946,13 @@ async fn run_control_stream(
             // Close our own connection, not a registry lookup that could hit
             // a superseding session for the same agent_id.
             conn.close(429, b"tenant connection limit reached");
-            return;
+            return None;
         }
     }
 
     if let Err(e) = write_control_status(&mut send, status).await {
         debug!(agent = %agent_id.fmt_short(), error = %e, "writing control status failed");
-        return;
+        return None;
     }
     if !body.is_empty()
         && let Err(e) = send.write_all(&body).await
@@ -869,11 +962,12 @@ async fn run_control_stream(
         if let Err(e) = send.reset(CONTROL_RESET_BODY_WRITE_FAILED) {
             debug!(agent = %agent_id.fmt_short(), error = %e, "resetting stream failed");
         }
-        return;
+        return None;
     }
     if let Err(e) = send.finish().await {
         debug!(agent = %agent_id.fmt_short(), error = %e, "finishing control stream failed");
     }
+    None
 }
 
 /// Routing path for accepted connections: TLS routes by SNI, HTTP by Host
@@ -1026,6 +1120,10 @@ const PICK_AGENT_BACKOFF: Duration = Duration::from_millis(200);
 /// `open_bi` blocks while the agent is at its concurrent-stream cap.
 const AGENT_STREAM_OPEN_TIMEOUT: Duration = Duration::from_secs(2);
 const AGENT_STREAM_ACCEPT_TIMEOUT: Duration = Duration::from_secs(5);
+/// A session is closed once its stream admissions have timed out for this long
+/// with none succeeding. One timeout is not enough: a brief stall on either
+/// side would drop every connection on a session that recovers by itself.
+const ADMISSION_FAILURE_GRACE: Duration = Duration::from_secs(15);
 
 /// What a stream will carry. Over TCP one lost segment stalls every stream on
 /// the session, so UDP stays off TLS sessions.
@@ -1238,7 +1336,14 @@ async fn handle_connection_inner(
         let tenant = ctx.sessions.tenant_for(&agent_addr.id);
         let (bytes_in, bytes_out) = match policy {
             TlsMode::Passthrough => {
-                pipe_tcp(tcp_stream, &hostname, send_stream, recv_stream).await?
+                pipe_tcp(
+                    tcp_stream,
+                    &hostname,
+                    send_stream,
+                    recv_stream,
+                    &ctx.metrics,
+                )
+                .await?
             }
         };
         ctx.metrics.total_bytes_in.inc_by(bytes_in);
@@ -1404,8 +1509,14 @@ async fn handle_http_connection_inner(
         // per-tenant byte counts.
         let tenant = ctx.sessions.tenant_for(&agent_addr.id);
 
-        let (bytes_in, bytes_out) =
-            pipe_tcp(tcp_stream, &hostname, send_stream, recv_stream).await?;
+        let (bytes_in, bytes_out) = pipe_tcp(
+            tcp_stream,
+            &hostname,
+            send_stream,
+            recv_stream,
+            &ctx.metrics,
+        )
+        .await?;
 
         ctx.metrics.total_bytes_in.inc_by(bytes_in);
         ctx.metrics.total_bytes_out.inc_by(bytes_out);
@@ -1498,6 +1609,8 @@ async fn open_agent_stream(
         );
     };
     let acknowledged = session.stream_acks_enabled();
+    let header_written = AtomicBool::new(false);
+    let before = session.path_counters();
     let handshake = async {
         let (mut send, mut recv) = opened?;
         let route_key = if acknowledged {
@@ -1506,6 +1619,7 @@ async fn open_agent_stream(
             route_key.to_owned()
         };
         write_handshake(&mut send, &route_key, client_addrs).await?;
+        header_written.store(true, Ordering::Relaxed);
         if acknowledged && read_control_status(&mut recv).await? != CONTROL_STATUS_OK {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -1523,24 +1637,66 @@ async fn open_agent_stream(
             ))
         });
     match result {
-        Ok(pair) => Ok(pair),
+        Ok(pair) => {
+            session.admission_succeeded();
+            Ok(pair)
+        }
         Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => Err(e.into()),
-        Err(e) => {
-            // Capture the tenant before removing so we can tell the hub the
-            // agent is gone — the `conn.closed()` cleanup path would otherwise
-            // see the entry already removed and skip the notification.
-            let tenant = ctx.sessions.tenant_for(&agent_id);
-            let removed = ctx.sessions.remove_if_current(&session);
-            session.close(504, b"agent stream admission failed");
-            if removed {
-                warn!(agent = %agent_id.fmt_short(), error = %e, "closed unusable agent session");
-                notify_session_removed(ctx, tenant, agent_id).await;
+        Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+            let failing_for = session.admission_timed_out(Instant::now(), ADMISSION_FAILURE_GRACE);
+            if failing_for >= ADMISSION_FAILURE_GRACE {
+                evict_session(ctx, &session, &e).await;
+            } else {
+                // Nothing received means the path or the agent is down; bytes
+                // received without an answer means our packets are not arriving.
+                let during = session.path_counters().zip(before);
+                let rx_bytes = during.map(|(now, then)| now.rx_bytes.saturating_sub(then.rx_bytes));
+                let lost_packets =
+                    during.map(|(now, then)| now.lost_packets.saturating_sub(then.lost_packets));
+                let waiting_for = if header_written.load(Ordering::Relaxed) {
+                    "acknowledgement"
+                } else {
+                    "header write"
+                };
+                // One line per run; a busy route would repeat it per connection.
+                if failing_for.is_zero() {
+                    warn!(
+                        agent = %agent_id.fmt_short(),
+                        waiting_for,
+                        rx_bytes,
+                        lost_packets,
+                        "agent stream admission timed out; keeping the session"
+                    );
+                } else {
+                    debug!(agent = %agent_id.fmt_short(), waiting_for, rx_bytes, lost_packets, "agent stream admission timed out again");
+                }
             }
+            Err(anyhow::anyhow!(
+                "stream admission on agent {} timed out",
+                agent_id.fmt_short()
+            ))
+        }
+        Err(e) => {
+            evict_session(ctx, &session, &e).await;
             Err(anyhow::anyhow!(
                 "stream admission on agent {} failed: {e}",
                 agent_id.fmt_short()
             ))
         }
+    }
+}
+
+/// Close a session that cannot take streams and tell the hub its agent is gone.
+async fn evict_session(ctx: &ConnCtx, session: &Arc<AgentSession>, error: &std::io::Error) {
+    let agent_id = session.agent_id;
+    // Capture the tenant before removing: the `conn.closed()` cleanup path
+    // would see the entry already gone and skip the notification.
+    let tenant = ctx.sessions.tenant_for(&agent_id);
+    let removed = ctx.sessions.remove_if_current(session);
+    session.close(504, b"agent stream admission failed");
+    if removed {
+        warn!(agent = %agent_id.fmt_short(), %error, "closed unusable agent session");
+        notify_session_removed(ctx, tenant, agent_id).await;
     }
 }
 
@@ -1590,6 +1746,7 @@ fn reconcile_tcp_listeners(
     active: &mut std::collections::HashMap<u16, ActiveListener>,
 ) {
     let desired = ctx.router.desired_tcp_listeners();
+    let (mut bound, mut unbound) = (0u32, 0u32);
 
     let stale_ports: Vec<u16> = active
         .iter()
@@ -1598,13 +1755,14 @@ fn reconcile_tcp_listeners(
         .collect();
     for port in stale_ports {
         if let Some(existing) = active.remove(&port) {
-            info!(
+            debug!(
                 port,
                 tenant = %existing.binding.tenant,
                 service = %existing.binding.service,
                 "unbinding tcp listener"
             );
             existing.handle.abort();
+            unbound += 1;
         }
     }
 
@@ -1615,12 +1773,13 @@ fn reconcile_tcp_listeners(
         let Some(listener) = bind_tcp_port(*port, binding) else {
             continue;
         };
-        info!(
+        debug!(
             port,
             tenant = %binding.tenant,
             service = %binding.service,
             "edge tcp listener bound"
         );
+        bound += 1;
         let handle = tokio::spawn(tcp_accept_loop(listener, binding.clone(), Arc::clone(ctx)));
         active.insert(
             *port,
@@ -1628,6 +1787,14 @@ fn reconcile_tcp_listeners(
                 binding: binding.clone(),
                 handle,
             },
+        );
+    }
+    if bound + unbound > 0 {
+        info!(
+            bound,
+            unbound,
+            listeners = active.len(),
+            "tcp listeners reconciled"
         );
     }
 }
@@ -1787,8 +1954,14 @@ async fn handle_tcp_connection(
         let agent_short = agent_addr.id.fmt_short();
         debug!(agent = %agent_short, "tcp agent selected, stream opened");
 
-        let (bytes_in, bytes_out) =
-            pipe_tcp(tcp_stream, &route_key, send_stream, recv_stream).await?;
+        let (bytes_in, bytes_out) = pipe_tcp(
+            tcp_stream,
+            &route_key,
+            send_stream,
+            recv_stream,
+            &ctx.metrics,
+        )
+        .await?;
 
         ctx.metrics.total_bytes_in.inc_by(bytes_in);
         ctx.metrics.total_bytes_out.inc_by(bytes_out);
@@ -1814,33 +1987,60 @@ async fn handle_tcp_connection(
     .await
 }
 
+/// Forwards both ways until both directions end, or one fails.
+///
+/// A failure ends the other direction at once. Dropping the agent's stream
+/// then tells the agent to stop, so the origin is not left working for a client
+/// that is gone. Nothing already accepted is discarded: the stream to the agent
+/// is always finished, never reset. A client hanging up is ordinary traffic,
+/// so failures are counted in `forward_errors` and logged at debug.
 async fn pipe_tcp(
     tcp_stream: TcpStream,
     route_key: &str,
     mut send_stream: TunnelSend,
     mut recv_stream: TunnelRecv,
+    metrics: &EdgeMetrics,
 ) -> anyhow::Result<(u64, u64)> {
     let (mut tcp_read, mut tcp_write) = tcp_stream.into_split();
+    let (bytes_in, bytes_out) = (AtomicU64::new(0), AtomicU64::new(0));
 
+    let agent_stopped = send_stream.stopped();
     let c2a = async {
-        let (n, res) = copy_tcp_counting(&mut tcp_read, &mut send_stream).await;
-        if let Err(ref e) = res {
-            warn!(%route_key, "client->agent forward: {e}");
-        }
+        let copy = async {
+            let mut counted = CountingWriter::new(&mut send_stream, &bytes_in);
+            copy_tcp_counting(&mut tcp_read, &mut counted).await.1
+        };
+        let res = tokio::select! {
+            res = copy => res,
+            // The origin is done with the request; its reply may still be on
+            // the way, so this must not end the other direction.
+            () = agent_stopped => Ok(()),
+        };
         drop(send_stream.finish().await);
-        n
+        res
     };
     let a2c = async {
-        let (n, res) = recv_stream.forward_to_writer(&mut tcp_write).await;
-        if let Err(ref e) = res {
-            warn!(%route_key, "agent->client forward: {e}");
+        let res = {
+            let mut counted = CountingWriter::new(&mut tcp_write, &bytes_out);
+            recv_stream.forward_to_writer(&mut counted).await.1
+        };
+        if res.is_ok() {
+            drop(tcp_write.shutdown().await);
         }
-        drop(tcp_write.shutdown().await);
-        n
+        res
     };
 
-    let (c2a, a2c) = tokio::join!(c2a, a2c);
-    Ok((c2a, a2c))
+    let (c2a, a2c) = join_or_abort(c2a, a2c).await;
+    for (direction, result) in [("client_to_agent", &c2a), ("agent_to_client", &a2c)] {
+        if let Some(Err(e)) = result {
+            metrics.forward_errors.with_label_values(&[direction]).inc();
+            debug!(%route_key, direction, "forward ended: {e}");
+        }
+    }
+    Ok((
+        bytes_in.load(Ordering::Relaxed),
+        bytes_out.load(Ordering::Relaxed),
+    ))
 }
 
 /// Idle window before an inactive UDP session is reaped. Picked to match
@@ -1882,6 +2082,7 @@ fn reconcile_udp_listeners(
     active: &mut std::collections::HashMap<u16, UdpActiveListener>,
 ) {
     let desired = ctx.router.desired_udp_listeners();
+    let (mut bound, mut unbound) = (0u32, 0u32);
 
     let stale_ports: Vec<u16> = active
         .iter()
@@ -1890,13 +2091,14 @@ fn reconcile_udp_listeners(
         .collect();
     for port in stale_ports {
         if let Some(existing) = active.remove(&port) {
-            info!(
+            debug!(
                 port,
                 tenant = %existing.binding.tenant,
                 service = %existing.binding.service,
                 "unbinding udp listener"
             );
             existing.handle.abort();
+            unbound += 1;
         }
     }
 
@@ -1907,7 +2109,7 @@ fn reconcile_udp_listeners(
         let Some(socket) = bind_udp_port(*port, binding) else {
             continue;
         };
-        info!(
+        debug!(
             port,
             tenant = %binding.tenant,
             service = %binding.service,
@@ -1931,6 +2133,15 @@ fn reconcile_udp_listeners(
                 binding: binding.clone(),
                 handle,
             },
+        );
+        bound += 1;
+    }
+    if bound + unbound > 0 {
+        info!(
+            bound,
+            unbound,
+            listeners = active.len(),
+            "udp listeners reconciled"
         );
     }
 }
@@ -2305,6 +2516,151 @@ mod tests {
             .unwrap()
             .unwrap()
             .unwrap();
+    }
+
+    fn published(version: u64) -> Arc<hub_client::PublishedTopology> {
+        let topology = towonel_common::topology::Topology {
+            version,
+            edges: Vec::new(),
+        };
+        let hub = crate::hub::signing::HubSigner::generate(1).unwrap();
+        let signed = hub.sign_topology(&topology).unwrap();
+        Arc::new(hub_client::PublishedTopology { topology, signed })
+    }
+
+    fn hub_with_topology(version: Option<u64>) -> (hub_client::TopologyTx, Arc<dyn HubClient>) {
+        let (tx, rx) = tokio::sync::watch::channel(version.map(published));
+        let client = hub_client::InProcessHubClient::new(
+            tokio::sync::broadcast::channel(1).0,
+            Arc::new(std::sync::OnceLock::new()),
+            Arc::new(std::sync::OnceLock::new()),
+            rx,
+        );
+        (tx, Arc::new(client))
+    }
+
+    /// Version of the next frame on a subscription; `None` for a keepalive.
+    async fn next_version(recv: &mut (impl tokio::io::AsyncRead + Unpin)) -> Option<u64> {
+        let frame = towonel_common::topology::read_topology(recv);
+        let frame = tokio::time::timeout(TLS_TEST_WAIT, frame).await;
+        let signed = frame.unwrap().unwrap()?;
+        Some(signed.decode_unverified().unwrap().version)
+    }
+
+    async fn subscribe_topology(agent: &TlsConn) -> (u8, TunnelRecv) {
+        let (mut send, mut recv) = TunnelConn::Tls(agent.clone()).open_bi().await.unwrap();
+        towonel_common::tunnel::write_control_prefix(&mut send)
+            .await
+            .unwrap();
+        send.write_all(&[CONTROL_OPCODE_TOPOLOGY]).await.unwrap();
+        send.finish().await.unwrap();
+        let status = tokio::time::timeout(TLS_TEST_WAIT, read_control_status(&mut recv))
+            .await
+            .unwrap()
+            .unwrap();
+        (status, recv)
+    }
+
+    #[tokio::test]
+    async fn a_subscribed_agent_is_sent_the_topology_and_every_change() {
+        let key = iroh::SecretKey::generate();
+        let id = key.public();
+        let (agent, edge) = tls_pair(&key).await;
+        let sessions = Arc::new(SessionRegistry::new(EdgeMetrics::new(), 10));
+        let (topology_tx, hub) = hub_with_topology(Some(1));
+        let _served = tokio::spawn(serve_agent_conn(
+            TunnelConn::Tls(edge),
+            Arc::clone(&sessions),
+            router_knowing(&id),
+            EdgeMetrics::new(),
+            Some(hub),
+        ));
+        wait_until(|| sessions.get(&id).is_some()).await;
+
+        // Refused until the session has presented a credential.
+        assert_eq!(subscribe_topology(&agent).await.0, CONTROL_STATUS_INVALID);
+        assert!(
+            sessions.record_tenant(id, towonel_common::identity::TenantId::from_bytes(&[1; 32]))
+        );
+
+        let (status, mut recv) = subscribe_topology(&agent).await;
+        assert_eq!(status, CONTROL_STATUS_OK);
+        assert_eq!(next_version(&mut recv).await, Some(1));
+        topology_tx.send_replace(Some(published(2)));
+        assert_eq!(next_version(&mut recv).await, Some(2));
+
+        // Subscribing again ends the stream before it.
+        let (status, mut newer) = subscribe_topology(&agent).await;
+        assert_eq!(status, CONTROL_STATUS_OK);
+        assert_eq!(next_version(&mut newer).await, Some(2));
+        let ended = towonel_common::topology::read_topology(&mut recv);
+        let ended = tokio::time::timeout(TLS_TEST_WAIT, ended).await;
+        ended.unwrap().unwrap_err();
+        let mut recv = newer;
+
+        // Losing the hub link ends the stream, so the agent asks the hub.
+        topology_tx.send_replace(None);
+        let ended = towonel_common::topology::read_topology(&mut recv);
+        let ended = tokio::time::timeout(TLS_TEST_WAIT, ended).await;
+        ended.unwrap().unwrap_err();
+    }
+
+    #[tokio::test]
+    async fn an_idle_stream_carries_keepalives() {
+        let key = iroh::SecretKey::generate();
+        let (agent, edge) = tls_pair(&key).await;
+        let (_topology_tx, hub) = hub_with_topology(Some(1));
+        let (mut request, mut recv) = agent.open_bi().await.unwrap();
+        request.write_all(b"x").await.unwrap();
+        let (send, _request) = edge.accept_bi().await.unwrap();
+        let conn = TunnelConn::Tls(edge);
+        let _streaming = tokio::spawn(async move {
+            let keepalive = Duration::from_millis(20);
+            stream_topology(
+                TunnelSend::Tls(send),
+                &conn,
+                key.public(),
+                Some(hub),
+                keepalive,
+                &CancellationToken::new(),
+            )
+            .await;
+        });
+
+        assert_eq!(
+            read_control_status(&mut recv).await.unwrap(),
+            CONTROL_STATUS_OK
+        );
+        let mut versions = Vec::new();
+        for _ in 0..4 {
+            versions.push(next_version(&mut recv).await);
+        }
+        // The set once, then keepalives while nothing changes.
+        assert_eq!(versions, [Some(1), None, None, None]);
+    }
+
+    #[tokio::test]
+    async fn a_hub_that_sends_no_topology_means_not_implemented() {
+        let key = iroh::SecretKey::generate();
+        let id = key.public();
+        let (agent, edge) = tls_pair(&key).await;
+        let sessions = Arc::new(SessionRegistry::new(EdgeMetrics::new(), 10));
+        let (_topology_tx, hub) = hub_with_topology(None);
+        let _served = tokio::spawn(serve_agent_conn(
+            TunnelConn::Tls(edge),
+            Arc::clone(&sessions),
+            router_knowing(&id),
+            EdgeMetrics::new(),
+            Some(hub),
+        ));
+        wait_until(|| sessions.get(&id).is_some()).await;
+        assert!(
+            sessions.record_tenant(id, towonel_common::identity::TenantId::from_bytes(&[1; 32]))
+        );
+        assert_eq!(
+            subscribe_topology(&agent).await.0,
+            CONTROL_STATUS_NOT_IMPLEMENTED
+        );
     }
 
     #[tokio::test]

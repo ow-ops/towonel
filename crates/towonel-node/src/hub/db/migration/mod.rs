@@ -39,6 +39,7 @@ mod m20260927_000000_mesh_exit_node;
 mod m20260927_000001_mesh_exit_node_unadvertised_at;
 mod m20260927_000002_mesh_device_services;
 mod m20261119_000000_user_port_quota;
+mod m20261120_000000_entry_log_version;
 
 pub struct Migrator;
 
@@ -88,6 +89,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260927_000001_mesh_exit_node_unadvertised_at::Migration),
             Box::new(m20260927_000002_mesh_device_services::Migration),
             Box::new(m20261119_000000_user_port_quota::Migration),
+            Box::new(m20261120_000000_entry_log_version::Migration),
         ]
     }
 }

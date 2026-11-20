@@ -82,13 +82,19 @@ pub(super) async fn post_refresh(
         return unauthorized("tenant is not registered with this hub");
     }
 
-    match agent_is_signed(&state, &req.tenant_id, &req.agent_id).await {
-        Ok(true) => {}
-        Ok(false) => return unauthorized("agent is not in signed_agents for this tenant"),
-        Err(e) => {
-            warn!(error = %e, "failed to check signed_agents");
-            return internal_error();
-        }
+    // A hub that was a standby until now has not folded the writes it missed.
+    if let Err(e) = super::sync_config(&state).await {
+        warn!(error = %e, "failed to sync config before agent refresh");
+        return internal_error();
+    }
+    if !state
+        .config
+        .read()
+        .await
+        .state
+        .is_agent_signed(&req.tenant_id, &req.agent_id)
+    {
+        return unauthorized("agent is not in signed_agents for this tenant");
     }
 
     let (kid, edge_cred_b64, edge_cred_sig_b64) =
@@ -103,21 +109,6 @@ pub(super) async fn post_refresh(
         edge_cred_b64,
         edge_cred_sig_b64,
     })
-}
-
-async fn agent_is_signed(
-    state: &AppState,
-    tenant_id: &TenantId,
-    agent_id: &AgentId,
-) -> anyhow::Result<bool> {
-    let policy = state.policy.load();
-    let Some(pq_pubkey) = policy.pq_public_key(tenant_id) else {
-        return Ok(false);
-    };
-    state
-        .db
-        .is_agent_registered(tenant_id, agent_id, pq_pubkey)
-        .await
 }
 
 async fn check_rate_limit(limiter: &super::RefreshLimiter, agent_id: [u8; 32]) -> bool {

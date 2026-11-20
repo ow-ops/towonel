@@ -4,7 +4,7 @@ use std::sync::atomic::Ordering;
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
-use tokio::sync::{broadcast, oneshot};
+use tokio::sync::{broadcast, oneshot, watch};
 use tokio_stream::Stream;
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::BroadcastStream;
@@ -13,6 +13,7 @@ use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
 use towonel_common::edge_link::EdgeToHub;
 use towonel_common::identity::{AgentId, TenantId};
 use towonel_common::routing::RouteTable;
+use towonel_common::topology::{SignedTopology, Topology};
 use towonel_common::tunnel::{CONTROL_STATUS_INTERNAL_ERROR, CONTROL_STATUS_NOT_IMPLEMENTED};
 
 use super::hub_link::HubLinkHandle;
@@ -43,9 +44,22 @@ pub trait LiveAgentSink: Send + Sync {
 
 pub type LiveAgentSinkCell = Arc<OnceLock<Arc<dyn LiveAgentSink>>>;
 
+/// An edge set with the hub's signature over it, which is what agents check.
+pub struct PublishedTopology {
+    pub topology: Topology,
+    pub signed: SignedTopology,
+}
+
+/// The hub's latest edge set; `None` until one arrives, and for good from a
+/// hub that predates it.
+pub type TopologyTx = watch::Sender<Option<Arc<PublishedTopology>>>;
+pub type TopologyRx = watch::Receiver<Option<Arc<PublishedTopology>>>;
+
 #[async_trait::async_trait]
 pub trait HubClient: Send + Sync {
     fn subscribe_routes(&self) -> RouteStream;
+
+    fn topology(&self) -> TopologyRx;
 
     /// Hub verifies the frame; the edge does not inspect it.
     async fn handle_control_frame(&self, frame: Vec<u8>) -> anyhow::Result<ControlResponse>;
@@ -59,6 +73,7 @@ pub struct InProcessHubClient {
     tx: broadcast::Sender<RouteTable>,
     control_handler: ControlHandlerCell,
     live_agents: LiveAgentSinkCell,
+    topology: TopologyRx,
 }
 
 impl InProcessHubClient {
@@ -66,6 +81,7 @@ impl InProcessHubClient {
         tx: broadcast::Sender<RouteTable>,
         control_handler: ControlHandlerCell,
         live_agents: LiveAgentSinkCell,
+        topology: TopologyRx,
     ) -> Self {
         let rx = tx.subscribe();
         Self {
@@ -73,6 +89,7 @@ impl InProcessHubClient {
             tx,
             control_handler,
             live_agents,
+            topology,
         }
     }
 }
@@ -95,6 +112,10 @@ impl HubClient for InProcessHubClient {
                 None
             }
         }))
+    }
+
+    fn topology(&self) -> TopologyRx {
+        self.topology.clone()
     }
 
     async fn handle_control_frame(&self, frame: Vec<u8>) -> anyhow::Result<ControlResponse> {
@@ -149,6 +170,10 @@ impl HubClient for RemoteHubClient {
                 None
             }
         }))
+    }
+
+    fn topology(&self) -> TopologyRx {
+        self.link.topology.subscribe()
     }
 
     async fn handle_control_frame(&self, frame: Vec<u8>) -> anyhow::Result<ControlResponse> {
@@ -223,6 +248,7 @@ mod tests {
             tx.clone(),
             Arc::new(OnceLock::new()),
             Arc::new(OnceLock::new()),
+            watch::channel(None).1,
         );
 
         tx.send(RouteTable::from_raw(std::collections::HashMap::new()))
@@ -238,8 +264,12 @@ mod tests {
     #[tokio::test]
     async fn handle_control_frame_returns_not_implemented_by_default() {
         let (tx, _) = broadcast::channel(8);
-        let client =
-            InProcessHubClient::new(tx, Arc::new(OnceLock::new()), Arc::new(OnceLock::new()));
+        let client = InProcessHubClient::new(
+            tx,
+            Arc::new(OnceLock::new()),
+            Arc::new(OnceLock::new()),
+            watch::channel(None).1,
+        );
         let (status, body) = client
             .handle_control_frame(b"anything".to_vec())
             .await
@@ -340,6 +370,7 @@ mod tests {
             tx.clone(),
             Arc::new(OnceLock::new()),
             Arc::new(OnceLock::new()),
+            watch::channel(None).1,
         );
 
         let _consumed = client.subscribe_routes();

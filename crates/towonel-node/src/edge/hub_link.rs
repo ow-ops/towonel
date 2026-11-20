@@ -73,6 +73,11 @@ pub struct HubLinkHandle {
     /// Set when a `SessionAdded`/`SessionRemoved` event is dropped (queue
     /// full); `run_loop` then reships a full snapshot so the hub re-converges.
     pub resync_needed: Arc<AtomicBool>,
+    /// `None` while the link is down: a set the hub can no longer update
+    /// must not keep agents from asking the hub themselves.
+    pub topology: super::hub_client::TopologyTx,
+    /// Newest topology version received, reported in `Hello`.
+    pub held_topology: Arc<AtomicU64>,
 }
 
 impl HubLinkHandle {
@@ -91,6 +96,8 @@ impl HubLinkHandle {
             pending_control: Arc::new(Mutex::new(HashMap::new())),
             sessions: None,
             resync_needed: Arc::new(AtomicBool::new(false)),
+            topology: tokio::sync::watch::channel(None).0,
+            held_topology: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -169,7 +176,8 @@ async fn run_once(
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = tokio::io::BufReader::new(read_half);
 
-    send_hello(&mut write_half, cfg).await?;
+    let held_topology = handle.held_topology.load(Ordering::Relaxed);
+    send_hello(&mut write_half, cfg, held_topology).await?;
     let welcome = read_hub_to_edge(&mut reader)
         .await
         .context("read Welcome")?;
@@ -216,6 +224,7 @@ async fn run_once(
     restore_rx(&handle.session_event_rx, session_rx);
     restore_rx(&handle.control_request_rx, control_rx);
     drain_pending_control(handle);
+    handle.topology.send_replace(None);
     result
 }
 
@@ -321,7 +330,11 @@ async fn recv_outbound(rx: Option<&mut mpsc::Receiver<EdgeToHub>>) -> Option<Edg
     }
 }
 
-async fn send_hello<W>(writer: &mut W, cfg: &HubLinkConfig) -> anyhow::Result<()>
+async fn send_hello<W>(
+    writer: &mut W,
+    cfg: &HubLinkConfig,
+    held_topology: u64,
+) -> anyhow::Result<()>
 where
     W: AsyncWrite + Unpin,
 {
@@ -334,6 +347,7 @@ where
         public_ips: cfg.public_ips.clone(),
         region: Some(cfg.region.clone()),
         tls_endpoints: cfg.tls_endpoints.clone(),
+        topology: Some(held_topology),
     };
     write_edge_to_hub(writer, &hello)
         .await
@@ -356,8 +370,24 @@ fn handle_frame(frame: HubToEdge, handle: &HubLinkHandle) {
             if handle.route_tx.send(*table).is_err() {
                 tracing::debug!(hostnames, "no route subscribers yet");
             } else {
-                tracing::info!(hostnames, "applied route table from hub");
+                tracing::debug!(hostnames, "route table received from hub");
             }
+        }
+        HubToEdge::Topology(signed) => {
+            let Some(topology) = signed.decode_unverified() else {
+                warn!("hub sent an edge set that does not decode; ignoring");
+                return;
+            };
+            tracing::info!(
+                version = topology.version,
+                edges = topology.edges.len(),
+                "applied topology from hub"
+            );
+            handle
+                .held_topology
+                .fetch_max(topology.version, Ordering::Relaxed);
+            let published = super::hub_client::PublishedTopology { topology, signed };
+            handle.topology.send_replace(Some(Arc::new(published)));
         }
         HubToEdge::KeyAdded(key) => {
             let mut guard = handle

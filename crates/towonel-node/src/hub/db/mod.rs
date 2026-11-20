@@ -29,7 +29,7 @@ use std::time::Duration;
 
 use sea_orm::{
     ActiveModelTrait, ActiveValue, ColumnTrait, ConnectOptions, ConnectionTrait, Database,
-    DatabaseConnection, DbErr, EntityTrait, QueryFilter, QueryOrder,
+    DatabaseConnection, DbErr, EntityTrait, QueryFilter, QueryOrder, QuerySelect,
 };
 use sea_orm_migration::MigratorTrait;
 use towonel_common::config_entry::SignedConfigEntry;
@@ -136,83 +136,6 @@ impl Db {
         rows.into_iter().map(model_to_entry).collect()
     }
 
-    /// Check if an agent is already registered for a tenant by replaying
-    /// UpsertAgent/RevokeAgent entries. Used for idempotent `UpsertAgent` handling.
-    pub async fn is_agent_registered(
-        &self,
-        tenant_id: &TenantId,
-        agent_id: &towonel_common::identity::AgentId,
-        pq_pubkey: &towonel_common::identity::PqPublicKey,
-    ) -> anyhow::Result<bool> {
-        use entities::entries::Column;
-        use towonel_common::config_entry::ConfigOp;
-
-        let entries = entities::entries::Entity::find()
-            .filter(Column::TenantId.eq(tenant_id.as_bytes().to_vec()))
-            .order_by_asc(Column::Sequence)
-            .all(&self.conn)
-            .await?;
-
-        let mut registered = false;
-        for entry in entries {
-            if let Ok(payload) = model_to_entry(entry)?.verify(pq_pubkey) {
-                match payload.op {
-                    ConfigOp::UpsertAgent { agent_id: id } if id == *agent_id => {
-                        registered = true;
-                    }
-                    ConfigOp::RevokeAgent { agent_id: id } if id == *agent_id => {
-                        registered = false;
-                    }
-                    _ => {}
-                }
-            }
-        }
-        Ok(registered)
-    }
-
-    /// Check if a tenant has any active TCP or UDP service bindings by replaying
-    /// their config entries. Returns `(has_tcp, has_udp)`.
-    pub async fn tenant_has_service_bindings(
-        &self,
-        tenant_id: &TenantId,
-        pq_pubkey: &towonel_common::identity::PqPublicKey,
-    ) -> anyhow::Result<(bool, bool)> {
-        use entities::entries::Column;
-        use towonel_common::config_entry::ConfigOp;
-
-        let entries = entities::entries::Entity::find()
-            .filter(Column::TenantId.eq(tenant_id.as_bytes().to_vec()))
-            .order_by_asc(Column::Sequence)
-            .all(&self.conn)
-            .await?;
-
-        let mut tcp_services = std::collections::HashSet::new();
-        let mut udp_services = std::collections::HashSet::new();
-
-        for entry in entries {
-            if let Ok(payload) = model_to_entry(entry)?.verify(pq_pubkey) {
-                match payload.op {
-                    ConfigOp::UpsertTcpService { service, .. } => {
-                        tcp_services.insert(service);
-                    }
-                    ConfigOp::DeleteTcpService { service } => {
-                        tcp_services.remove(&service);
-                    }
-                    ConfigOp::UpsertUdpService { service, .. }
-                    | ConfigOp::UpsertUdpServiceRange { service, .. } => {
-                        udp_services.insert(service);
-                    }
-                    ConfigOp::DeleteUdpService { service } => {
-                        udp_services.remove(&service);
-                    }
-                    _ => {}
-                }
-            }
-        }
-
-        Ok((!tcp_services.is_empty(), !udp_services.is_empty()))
-    }
-
     /// Boot-time canary check that the supplied KEK + invite-hash-key match
     /// the values used by the *first* hub to write to this DB. Without this,
     /// a multi-hub deployment that disagrees on either secret keeps working
@@ -303,14 +226,40 @@ impl Db {
         Ok(())
     }
 
-    /// Get all entries across all tenants, ordered by `tenant_id` and sequence ascending.
-    pub async fn get_all_entries(&self) -> anyhow::Result<Vec<SignedConfigEntry>> {
-        let rows = entities::entries::Entity::find()
+    /// Version of the entry log: a counter a trigger bumps on every insert,
+    /// whichever hub made it.
+    pub async fn entry_log_version(&self) -> anyhow::Result<u64> {
+        let stmt = sea_orm::Statement::from_string(
+            self.conn.get_database_backend(),
+            "SELECT version FROM entry_log WHERE id = 1",
+        );
+        let row = self
+            .conn
+            .query_one_raw(stmt)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("entry_log has no row"))?;
+        Ok(row.try_get::<i64>("", "version")?.cast_unsigned())
+    }
+
+    /// `(tenant_id, payload_cbor)` of every entry, ordered by tenant then
+    /// sequence. Leaves the signature column out: it is most of each row and
+    /// a trusted replay never reads it.
+    pub async fn get_all_payloads(&self) -> anyhow::Result<Vec<(TenantId, Vec<u8>)>> {
+        let rows: Vec<(Vec<u8>, Vec<u8>)> = entities::entries::Entity::find()
+            .select_only()
+            .column(entities::entries::Column::TenantId)
+            .column(entities::entries::Column::PayloadCbor)
             .order_by_asc(entities::entries::Column::TenantId)
             .order_by_asc(entities::entries::Column::Sequence)
+            .into_tuple()
             .all(&self.conn)
             .await?;
-        rows.into_iter().map(model_to_entry).collect()
+        rows.into_iter()
+            .map(|(tenant, payload)| {
+                let tenant: [u8; 32] = bytes_to_array(tenant, "entries.tenant_id")?;
+                Ok((TenantId::from_bytes(&tenant), payload))
+            })
+            .collect()
     }
 }
 
@@ -436,6 +385,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn every_insert_bumps_the_log_version() {
+        let db = temp_db().await;
+        let kp = TenantKeypair::generate();
+        assert_eq!(db.entry_log_version().await.unwrap(), 0);
+        for seq in 1..=3 {
+            db.insert(&make_signed_entry(&kp, seq), seq).await.unwrap();
+        }
+        assert_eq!(db.entry_log_version().await.unwrap(), 3);
+        // A rejected insert leaves it alone.
+        db.insert(&make_signed_entry(&kp, 3), 3).await.unwrap_err();
+        assert_eq!(db.entry_log_version().await.unwrap(), 3);
+    }
+
+    /// Run against a throwaway Postgres to cover its trigger:
+    /// `TOWONEL_TEST_POSTGRES_URL=postgres://... cargo test -- --ignored postgres`
+    #[tokio::test]
+    #[ignore = "needs TOWONEL_TEST_POSTGRES_URL"]
+    async fn postgres_bumps_the_log_version_on_insert() {
+        let url = std::env::var("TOWONEL_TEST_POSTGRES_URL").unwrap();
+        let db = Db::open(&url, 2, 1).await.unwrap();
+        let before = db.entry_log_version().await.unwrap();
+        let kp = TenantKeypair::generate();
+        db.insert(&make_signed_entry(&kp, 1), 1).await.unwrap();
+        db.insert(&make_signed_entry(&kp, 2), 2).await.unwrap();
+        assert_eq!(db.entry_log_version().await.unwrap(), before + 2);
+        db.insert(&make_signed_entry(&kp, 2), 2).await.unwrap_err();
+        assert_eq!(db.entry_log_version().await.unwrap(), before + 2);
+    }
+
+    #[tokio::test]
     async fn duplicate_sequence_rejected() {
         let db = temp_db().await;
         let kp = TenantKeypair::generate();
@@ -505,139 +484,5 @@ mod tests {
         assert_eq!(entries2.len(), 1);
         assert_eq!(entries1[0].tenant_id, kp1.id());
         assert_eq!(entries2[0].tenant_id, kp2.id());
-    }
-
-    #[tokio::test]
-    async fn is_agent_registered_upsert_agent() {
-        use towonel_common::identity::AgentKeypair;
-        let db = temp_db().await;
-        let tenant_kp = TenantKeypair::generate();
-        let agent_kp = AgentKeypair::generate();
-
-        let payload = ConfigPayload {
-            version: 1,
-            tenant_id: tenant_kp.id(),
-            sequence: 1,
-            timestamp: 1_700_000_000,
-            op: ConfigOp::UpsertAgent {
-                agent_id: agent_kp.id(),
-            },
-        };
-        let entry = SignedConfigEntry::sign(&payload, &tenant_kp).unwrap();
-        db.insert(&entry, 1).await.unwrap();
-
-        let registered = db
-            .is_agent_registered(&tenant_kp.id(), &agent_kp.id(), tenant_kp.public_key())
-            .await
-            .unwrap();
-        assert!(registered, "agent should be registered after UpsertAgent");
-    }
-
-    #[tokio::test]
-    async fn is_agent_registered_false_before_upsert() {
-        use towonel_common::identity::AgentKeypair;
-        let db = temp_db().await;
-        let tenant_kp = TenantKeypair::generate();
-        let agent_kp = AgentKeypair::generate();
-
-        let registered = db
-            .is_agent_registered(&tenant_kp.id(), &agent_kp.id(), tenant_kp.public_key())
-            .await
-            .unwrap();
-        assert!(
-            !registered,
-            "agent should not be registered before any entries"
-        );
-    }
-
-    #[tokio::test]
-    async fn is_agent_registered_false_after_revoke() {
-        use towonel_common::identity::AgentKeypair;
-        let db = temp_db().await;
-        let tenant_kp = TenantKeypair::generate();
-        let agent_kp = AgentKeypair::generate();
-
-        let upsert = ConfigPayload {
-            version: 1,
-            tenant_id: tenant_kp.id(),
-            sequence: 1,
-            timestamp: 1_700_000_000,
-            op: ConfigOp::UpsertAgent {
-                agent_id: agent_kp.id(),
-            },
-        };
-        let entry = SignedConfigEntry::sign(&upsert, &tenant_kp).unwrap();
-        db.insert(&entry, 1).await.unwrap();
-
-        let revoke = ConfigPayload {
-            version: 1,
-            tenant_id: tenant_kp.id(),
-            sequence: 2,
-            timestamp: 1_700_000_001,
-            op: ConfigOp::RevokeAgent {
-                agent_id: agent_kp.id(),
-            },
-        };
-        let entry = SignedConfigEntry::sign(&revoke, &tenant_kp).unwrap();
-        db.insert(&entry, 2).await.unwrap();
-
-        let registered = db
-            .is_agent_registered(&tenant_kp.id(), &agent_kp.id(), tenant_kp.public_key())
-            .await
-            .unwrap();
-        assert!(
-            !registered,
-            "agent should not be registered after RevokeAgent"
-        );
-    }
-
-    #[tokio::test]
-    async fn is_agent_registered_true_after_reregister() {
-        use towonel_common::identity::AgentKeypair;
-        let db = temp_db().await;
-        let tenant_kp = TenantKeypair::generate();
-        let agent_kp = AgentKeypair::generate();
-
-        let upsert = ConfigPayload {
-            version: 1,
-            tenant_id: tenant_kp.id(),
-            sequence: 1,
-            timestamp: 1_700_000_000,
-            op: ConfigOp::UpsertAgent {
-                agent_id: agent_kp.id(),
-            },
-        };
-        let entry = SignedConfigEntry::sign(&upsert, &tenant_kp).unwrap();
-        db.insert(&entry, 1).await.unwrap();
-
-        let revoke = ConfigPayload {
-            version: 1,
-            tenant_id: tenant_kp.id(),
-            sequence: 2,
-            timestamp: 1_700_000_001,
-            op: ConfigOp::RevokeAgent {
-                agent_id: agent_kp.id(),
-            },
-        };
-        let entry = SignedConfigEntry::sign(&revoke, &tenant_kp).unwrap();
-        db.insert(&entry, 2).await.unwrap();
-
-        let upsert2 = ConfigPayload {
-            version: 1,
-            tenant_id: tenant_kp.id(),
-            sequence: 3,
-            timestamp: 1_700_000_002,
-            op: ConfigOp::UpsertAgent {
-                agent_id: agent_kp.id(),
-            },
-        };
-        let entry = SignedConfigEntry::sign(&upsert2, &tenant_kp).unwrap();
-        db.insert(&entry, 3).await.unwrap();
-
-        let registered = db
-            .is_agent_registered(&tenant_kp.id(), &agent_kp.id(), tenant_kp.public_key())
-            .await
-            .unwrap();
-        assert!(registered, "agent should be registered after re-upsert");
     }
 }

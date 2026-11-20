@@ -13,6 +13,7 @@ use towonel_common::edge_cred::{EdgeCred, EdgeCredSig, Kid};
 use towonel_common::identity::{PQ_SEED_LEN, PqPublicKey};
 use towonel_common::kek::HubKek;
 use towonel_common::mesh::{MESH_CRED_SIGN_CONTEXT, MeshCred};
+use towonel_common::topology::{SignedTopology, Topology};
 
 use super::db::Db;
 
@@ -74,6 +75,10 @@ impl HubSigner {
             .try_sign(&bytes, b"")
             .map_err(|e| anyhow::anyhow!("ml-dsa-65 sign: {e}"))?;
         Ok((bytes, sig))
+    }
+
+    pub fn sign_topology(&self, topology: &Topology) -> anyhow::Result<SignedTopology> {
+        SignedTopology::sign(topology, self.kid, &self.priv_key)
     }
 
     pub fn sign_mesh_cred(&self, cred: &MeshCred) -> anyhow::Result<(Vec<u8>, EdgeCredSig)> {

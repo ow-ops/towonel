@@ -28,6 +28,10 @@ pub struct EdgeMetrics {
     pub sessions_total: IntCounter,
     pub sessions_rejected_total: IntCounterVec,
     pub route_no_session_total: IntCounter,
+    /// Proxied connections that ended on an I/O error, by direction. Mostly
+    /// clients hanging up; a jump in `agent_to_client` across many routes at
+    /// once means agent sessions are dying.
+    pub forward_errors: IntCounterVec,
     /// Connections / sessions dropped because an edge concurrency cap was
     /// saturated, split by which cap fired.
     pub connections_rejected_overload: OverloadRejectCounters,
@@ -171,6 +175,12 @@ impl EdgeMetrics {
                 "towonel_edge_route_no_session_total",
                 "Requests where no session was registered for the agent at lookup time \
                  (excludes the case where a session existed but its open_bi failed)",
+            ),
+            forward_errors: register_counter_vec(
+                &r,
+                "towonel_edge_forward_errors_total",
+                "Proxied connections that ended on an I/O error, by direction",
+                &["direction"],
             ),
             connections_rejected_overload: OverloadRejectCounters::register(&r),
             connections_rejected_prepare: PrepareRejectCounters::register(&r),

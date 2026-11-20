@@ -216,11 +216,22 @@ impl SignedConfigEntry {
     ///
     /// Never call this on entries arriving over the wire — use [`Self::verify`].
     pub fn decode_trusted(&self) -> Result<ConfigPayload, ConfigEntryError> {
-        let payload = from_canonical_cbor(&self.payload_cbor)?;
+        ConfigPayload::decode_trusted(&self.tenant_id, &self.payload_cbor)
+    }
+}
+
+impl ConfigPayload {
+    /// [`SignedConfigEntry::decode_trusted`] for a caller that only loaded the
+    /// payload column, not the signature.
+    pub fn decode_trusted(
+        tenant_id: &TenantId,
+        payload_cbor: &[u8],
+    ) -> Result<Self, ConfigEntryError> {
+        let payload = from_canonical_cbor(payload_cbor)?;
         if payload.version != CONFIG_PAYLOAD_VERSION {
             return Err(ConfigEntryError::UnsupportedVersion(payload.version));
         }
-        if payload.tenant_id != self.tenant_id {
+        if payload.tenant_id != *tenant_id {
             return Err(ConfigEntryError::TenantMismatch);
         }
         Ok(payload)

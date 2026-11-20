@@ -31,6 +31,7 @@ pub struct AgentMetrics {
     pub edge_session_state: IntGaugeVec,
     pub edge_identity_mismatches: IntCounterVec,
     pub edge_path: IntGaugeVec,
+    pub topology_streams: IntGauge,
     pub streams_accepted: IntCounter,
     pub streams_completed: IntCounter,
     pub stream_errors: IntCounterVec,
@@ -70,6 +71,11 @@ impl AgentMetrics {
                 "towonel_agent_edge_path",
                 "1 for the network path currently selected to the edge (direct|relay|custom), 0 otherwise",
                 &["edge", "path"],
+            ),
+            topology_streams: register_gauge(
+                &r,
+                "towonel_agent_topology_streams",
+                "Edge sessions pushing the edge set; at 0 the agent polls the hub for it",
             ),
             mesh_up: register_gauge(
                 &r,

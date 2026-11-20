@@ -22,6 +22,7 @@ pub mod sni;
 pub mod telemetry;
 pub mod time;
 pub mod tls_policy;
+pub mod topology;
 pub mod transport;
 pub mod tunnel;
 

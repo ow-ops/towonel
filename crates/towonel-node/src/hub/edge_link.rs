@@ -158,6 +158,7 @@ async fn handle_connection(
         public_ips,
         region,
         tls_endpoints,
+        held_topology,
     ) = match hello {
         EdgeToHub::Hello {
             edge_id,
@@ -168,6 +169,7 @@ async fn handle_connection(
             public_ips,
             region,
             tls_endpoints,
+            topology,
         } => {
             if expected_psk.ct_eq(&psk).into() {
                 (
@@ -178,6 +180,7 @@ async fn handle_connection(
                     public_ips,
                     region,
                     tls_endpoints,
+                    topology,
                 )
             } else {
                 anyhow::bail!("Hello PSK mismatch");
@@ -223,9 +226,12 @@ async fn handle_connection(
         now_ms(),
     );
     let source = SourceKey::Remote(edge_id, generation);
+    super::api::publish_topology(&state, held_topology.unwrap_or(0));
 
     let (writer_tx, writer_rx) = mpsc::channel::<HubToEdge>(64);
     let writer_task = tokio::spawn(run_writer(writer, writer_rx));
+    let topology_task = held_topology
+        .map(|_| tokio::spawn(push_topology(state.topology.subscribe(), writer_tx.clone())));
     // Gates push_routes' first send on the edge's SessionsSnapshot. Without
     // it the first table reflects an empty set for this edge and others
     // miss-route its hostnames until the snapshot lands.
@@ -262,8 +268,12 @@ async fn handle_connection(
 
     drop(writer_tx);
     pusher_task.abort();
+    if let Some(task) = topology_task {
+        task.abort();
+    }
     writer_task.abort();
     state.live_edges.remove_if_current(&edge_id, generation);
+    super::api::publish_topology(&state, 0);
     if state.live_agents.drop_source(source) {
         trigger_route_rebuild(&state);
     }
@@ -384,6 +394,26 @@ where
     Ok(())
 }
 
+async fn push_topology(
+    mut topology: crate::edge::hub_client::TopologyRx,
+    writer_tx: mpsc::Sender<HubToEdge>,
+) {
+    loop {
+        let current = topology.borrow_and_update().clone();
+        if let Some(current) = current
+            && writer_tx
+                .send(HubToEdge::Topology(current.signed.clone()))
+                .await
+                .is_err()
+        {
+            return;
+        }
+        if topology.changed().await.is_err() {
+            return;
+        }
+    }
+}
+
 async fn push_routes(
     mut route_rx: broadcast::Receiver<RouteTable>,
     writer_tx: mpsc::Sender<HubToEdge>,
@@ -395,7 +425,7 @@ async fn push_routes(
     // the snapshot_received comment in handle_link.
     snapshot_received.notified().await;
     // Initial snapshot so a fresh edge converges before the next mutation.
-    if let Ok(mut initial) = build_current_route_table(&state).await {
+    if let Ok(mut initial) = super::api::current_route_table(&state).await {
         filter_listeners_for_edge(&mut initial, &state, &public_ips);
         if writer_tx
             .send(HubToEdge::RouteSnapshot {
@@ -464,17 +494,6 @@ fn filter_listeners_for_edge(table: &mut RouteTable, state: &Arc<AppState>, publ
     });
 }
 
-async fn build_current_route_table(state: &Arc<AppState>) -> anyhow::Result<RouteTable> {
-    let entries = state.db.get_all_entries().await?;
-    let live = state.live_agents.snapshot();
-    let policy = state.policy.load();
-    Ok(RouteTable::from_entries_with_liveness(
-        &entries,
-        &policy,
-        Some(&live),
-    ))
-}
-
 fn current_signing_keys(state: &AppState) -> anyhow::Result<Vec<HubSigningKey>> {
     let signer = state.signer.as_ref();
     let pubkey = signer.public_key().as_bytes().to_vec();
@@ -486,6 +505,7 @@ mod tests {
     use super::*;
     use towonel_common::edge_link::{EdgeCapabilities, read_hub_to_edge, write_edge_to_hub};
     use towonel_common::identity::{AgentKeypair, TenantKeypair};
+    use towonel_common::topology::Topology;
 
     use crate::hub::test_helpers::TestHub;
 
@@ -501,6 +521,14 @@ mod tests {
     async fn connect_link(
         state: Arc<AppState>,
         edge_id: EdgeId,
+    ) -> (TcpStream, tokio::task::JoinHandle<anyhow::Result<()>>) {
+        connect_link_with(state, edge_id, None).await
+    }
+
+    async fn connect_link_with(
+        state: Arc<AppState>,
+        edge_id: EdgeId,
+        topology: Option<u64>,
     ) -> (TcpStream, tokio::task::JoinHandle<anyhow::Result<()>>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let mut client = TcpStream::connect(listener.local_addr().unwrap())
@@ -532,6 +560,7 @@ mod tests {
                 public_ips: vec!["127.0.0.1".into()],
                 region: None,
                 tls_endpoints: vec![],
+                topology,
             },
         )
         .await
@@ -567,6 +596,90 @@ mod tests {
                     assert_eq!(status, 0);
                     assert_eq!(body, b"still live");
                     break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    fn edge_id(seed: u8) -> EdgeId {
+        *iroh::SecretKey::from([seed; 32]).public().as_bytes()
+    }
+
+    /// The next edge set pushed on the link, checked against the hub's key.
+    async fn next_topology(hub: &TestHub, client: &mut TcpStream) -> Topology {
+        let signed = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let HubToEdge::Topology(signed) = read_hub_to_edge(client).await.unwrap() {
+                    break signed;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(signed.kid, hub.state.signer.kid());
+        signed
+            .verify(hub.state.signer.public_key())
+            .expect("edge set not signed by the hub's key")
+    }
+
+    fn remote_ids(hub: &TestHub, topology: &Topology) -> Vec<EdgeId> {
+        topology
+            .edges
+            .iter()
+            .filter(|e| Some(e.id) != hub.state.identity.edge_node_id)
+            .map(|e| *e.id.as_bytes())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn an_edge_that_asked_is_pushed_the_edge_set_and_its_changes() {
+        let hub = TestHub::start().await;
+        // An edge still holding a set from an earlier hub whose clock ran ahead.
+        let held = now_ms() + 3_600_000;
+        let (mut first, _first_handler) =
+            connect_link_with(Arc::clone(&hub.state), edge_id(21), Some(held)).await;
+        let alone = next_topology(&hub, &mut first).await;
+        assert_eq!(remote_ids(&hub, &alone), vec![edge_id(21)]);
+        assert_eq!(alone.version, held + 1);
+
+        let (second, second_handler) = connect_link(Arc::clone(&hub.state), edge_id(22)).await;
+        let both = next_topology(&hub, &mut first).await;
+        assert!(both.version > alone.version);
+        let mut ids = remote_ids(&hub, &both);
+        ids.sort_unstable();
+        let mut expected = vec![edge_id(21), edge_id(22)];
+        expected.sort_unstable();
+        assert_eq!(ids, expected);
+
+        drop(second);
+        drop(second_handler.await.unwrap());
+        let after = next_topology(&hub, &mut first).await;
+        assert!(after.version > both.version);
+        assert_eq!(remote_ids(&hub, &after), vec![edge_id(21)]);
+    }
+
+    #[tokio::test]
+    async fn an_edge_that_did_not_ask_is_never_sent_topology() {
+        let hub = TestHub::start().await;
+        let (mut old, _handler) = connect_link(Arc::clone(&hub.state), edge_id(21)).await;
+        let (_other, _other_handler) = connect_link(Arc::clone(&hub.state), edge_id(22)).await;
+        write_edge_to_hub(
+            &mut old,
+            &EdgeToHub::ControlRequest {
+                request_id: 1,
+                frame: b"ping".to_vec(),
+            },
+        )
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                match read_hub_to_edge(&mut old).await.unwrap() {
+                    HubToEdge::ControlResponse { .. } => break,
+                    HubToEdge::Topology(_) => panic!("topology sent to an edge that predates it"),
+                    _ => {}
                 }
             }
         })

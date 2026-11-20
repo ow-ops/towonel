@@ -37,10 +37,14 @@ use tower_http::ServiceBuilderExt;
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::request_id::MakeRequestUuid;
 use tower_http::trace::{DefaultOnResponse, TraceLayer};
+use towonel_common::config_entry::ConfigPayload;
 use towonel_common::invite::{INVITE_ID_LEN, InviteHashKey};
 use towonel_common::kek::HubKek;
 use towonel_common::ownership::OwnershipPolicy;
-use towonel_common::routing::RouteTable;
+use towonel_common::routing::{ConfigState, RouteTable};
+use towonel_common::topology::{Topology, TopologyEdge};
+
+use crate::edge::hub_client::PublishedTopology;
 use tracing::Level;
 
 use super::auth::middleware::OperatorPrincipal;
@@ -222,6 +226,9 @@ pub struct AppState {
     pub login_sentinel_hash: String,
     pub twofa_attempt_limiter: TwoFaAttemptLimiter,
     pub live_edges: Arc<super::live_edges::LiveEdges>,
+    /// The edge set pushed to edges and on to their agents. See
+    /// [`publish_topology`].
+    pub topology: crate::edge::hub_client::TopologyTx,
     pub live_agents: Arc<super::live_agents::LiveAgents>,
     /// Fed via [`trigger_route_rebuild`]; drained by the coalescer task.
     pub route_rebuild_notify: Arc<tokio::sync::Notify>,
@@ -246,6 +253,9 @@ pub struct AppState {
     /// claiming the port. Read by `find_port_conflict` under the
     /// per-protocol locks; refreshed by `rebuild_and_broadcast_routes`.
     pub port_index: ArcSwap<PortIndex>,
+    /// The entry log, replayed once and then kept current by the write path.
+    /// See [`sync_config`].
+    pub config: tokio::sync::RwLock<CachedConfig>,
     /// Cached port reservations for per-edge listener filtering. Refreshed on
     /// each route rebuild so the per-edge broadcast fan-out reads this snapshot
     /// instead of querying the DB once per edge per broadcast.
@@ -272,91 +282,31 @@ pub struct PortIndex {
         std::collections::BTreeMap<u16, (towonel_common::identity::TenantId, std::string::String)>,
 }
 
-/// Walk all signed entries and materialize the per-protocol
-/// `listen_port → (tenant, service)` map. Independent of agent liveness so a
-/// reconnecting agent's port reservation persists across blips.
-fn build_port_index(
-    entries: &[towonel_common::config_entry::SignedConfigEntry],
-    policy: &towonel_common::ownership::OwnershipPolicy,
-) -> PortIndex {
-    use towonel_common::config_entry::ConfigOp;
-    use towonel_common::identity::TenantId;
-    let mut per_tenant_tcp: std::collections::HashMap<
-        TenantId,
-        std::collections::HashMap<String, u16>,
-    > = std::collections::HashMap::new();
-    // UDP value is the inclusive `(port_start, port_end)`; a single-port
-    // service is `(p, p)`.
-    let mut per_tenant_udp: std::collections::HashMap<
-        TenantId,
-        std::collections::HashMap<String, (u16, u16)>,
-    > = std::collections::HashMap::new();
-    for entry in entries {
-        if policy.pq_public_key(&entry.tenant_id).is_none() {
-            continue;
-        }
-        // Trusted DB replay: verified at the `/v1/entries` boundary already.
-        let Ok(payload) = entry.decode_trusted() else {
-            continue;
-        };
-        match payload.op {
-            ConfigOp::UpsertTcpService {
-                service,
-                listen_port,
-            } => {
-                per_tenant_tcp
-                    .entry(payload.tenant_id)
-                    .or_default()
-                    .insert(service, listen_port);
-            }
-            ConfigOp::DeleteTcpService { service } => {
-                per_tenant_tcp
-                    .entry(payload.tenant_id)
-                    .or_default()
-                    .remove(&service);
-            }
-            ConfigOp::UpsertUdpService {
-                service,
-                listen_port,
-                ..
-            } => {
-                per_tenant_udp
-                    .entry(payload.tenant_id)
-                    .or_default()
-                    .insert(service, (listen_port, listen_port));
-            }
-            ConfigOp::UpsertUdpServiceRange {
-                service,
-                port_start,
-                port_end,
-                ..
-            } => {
-                per_tenant_udp
-                    .entry(payload.tenant_id)
-                    .or_default()
-                    .insert(service, (port_start, port_end));
-            }
-            ConfigOp::DeleteUdpService { service } => {
-                per_tenant_udp
-                    .entry(payload.tenant_id)
-                    .or_default()
-                    .remove(&service);
-            }
-            _ => {}
-        }
-    }
+/// [`ConfigState`] plus the entry-log version it reflects.
+#[derive(Default)]
+pub struct CachedConfig {
+    pub state: ConfigState,
+    pub version: u64,
+}
+
+/// Materialize the per-protocol `listen_port → (tenant, service)` map.
+/// Independent of agent liveness so a reconnecting agent's port reservation
+/// persists across blips.
+fn build_port_index(config: &ConfigState, policy: &OwnershipPolicy) -> PortIndex {
     let mut idx = PortIndex::default();
-    for (tenant, services) in per_tenant_tcp {
-        for (service, port) in services {
-            idx.tcp.entry(port).or_insert((tenant, service));
+    for (tenant, service, port) in config.tcp_services() {
+        if policy.pq_public_key(tenant).is_some() {
+            idx.tcp
+                .entry(port)
+                .or_insert_with(|| (*tenant, service.to_string()));
         }
     }
-    for (tenant, services) in per_tenant_udp {
-        for (service, (start, end)) in services {
+    for (tenant, service, start, end) in config.udp_services() {
+        if policy.pq_public_key(tenant).is_some() {
             for port in start..=end {
                 idx.udp
                     .entry(port)
-                    .or_insert_with(|| (tenant, service.clone()));
+                    .or_insert_with(|| (*tenant, service.to_string()));
             }
         }
     }
@@ -376,20 +326,128 @@ impl AppState {
     }
 }
 
+/// Publish the current edge set if it changed: the colocated edge plus every
+/// edge with a live link. Call after any change to `live_edges`.
+///
+/// `held` is the newest version an edge that just connected reported. The
+/// version published is above it, so receivers that compare versions take
+/// this hub's set over one from an earlier hub.
+pub fn publish_topology(state: &AppState, held: u64) {
+    /// Versions track the clock, so one further ahead than this is not real.
+    const MAX_HELD_VERSION_LEAD_MS: u64 = 24 * 60 * 60 * 1000;
+
+    state.topology.send_if_modified(|current| {
+        // Read inside the closure: two edges connecting at once would
+        // otherwise each publish the set as it was before the other.
+        let edges = topology_edges(state);
+        if current.as_ref().is_some_and(|p| p.topology.edges == edges) {
+            return false;
+        }
+        // An edge reporting a version from the far future must not pin ours.
+        let now = towonel_common::time::now_ms();
+        let held = held.min(now.saturating_add(MAX_HELD_VERSION_LEAD_MS));
+        // The clock is the floor: it is all that orders this hub's sets after
+        // an earlier hub's when every edge restarted with it and reported nothing.
+        let version = current
+            .as_ref()
+            .map_or(held, |p| p.topology.version.max(held))
+            .saturating_add(1)
+            .max(now);
+        let topology = Topology { version, edges };
+        match state.signer.sign_topology(&topology) {
+            Ok(signed) => {
+                *current = Some(Arc::new(PublishedTopology { topology, signed }));
+                true
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "signing the edge set failed; keeping the previous one");
+                false
+            }
+        }
+    });
+}
+
+fn topology_edges(state: &AppState) -> Vec<TopologyEdge> {
+    let mut edges: Vec<TopologyEdge> = state
+        .identity
+        .edge_node_id
+        .map(|id| TopologyEdge {
+            id,
+            addresses: state.identity.edge_iroh_addresses.clone(),
+            tls_addresses: state.identity.edge_tls_addresses.clone(),
+            region: state.identity.edge_region.clone(),
+        })
+        .into_iter()
+        .collect();
+    for (edge_id, addresses, _, _, region) in state.live_edges.snapshot() {
+        if let Ok(id) = iroh::EndpointId::from_bytes(&edge_id)
+            && !edges.iter().any(|e| e.id == id)
+        {
+            edges.push(TopologyEdge {
+                id,
+                addresses,
+                tls_addresses: state.live_edges.tls_endpoints(&edge_id),
+                region,
+            });
+        }
+    }
+    edges.sort_by_key(|e| *e.id.as_bytes());
+    edges
+}
+
 /// Wake the rebuild coalescer. Bursts collapse into a single rebuild.
 pub fn trigger_route_rebuild(state: &AppState) {
     state.route_rebuild_notify.notify_one();
 }
 
-/// Full rebuild of the port index from the DB. Seeds the index at startup;
-/// thereafter it's maintained incrementally on the write path (see
-/// [`apply_port_index_delta`]) so `find_port_conflict` never costs a full scan.
-pub async fn refresh_port_index(state: &Arc<AppState>) -> anyhow::Result<()> {
-    let policy_snapshot = state.policy.load_full();
-    let entries = state.db.get_all_entries().await?;
-    let idx = build_port_index(&entries, &policy_snapshot);
-    state.port_index.store(Arc::new(idx));
+/// Reload [`AppState::config`] and the port index if the entry log changed
+/// underneath them: at startup, or after writes that went through another hub
+/// replica.
+pub async fn sync_config(state: &AppState) -> anyhow::Result<()> {
+    // Shared lock for the common case; callers are on request paths.
+    if state.db.entry_log_version().await? == state.config.read().await.version {
+        return Ok(());
+    }
+    let mut cached = state.config.write().await;
+    // Read before the rows: an insert landing in between leaves the version
+    // behind, and the next sync reloads again.
+    let version = state.db.entry_log_version().await?;
+    if version == cached.version {
+        return Ok(());
+    }
+    let rows = state.db.get_all_payloads().await?;
+    let mut config = ConfigState::default();
+    for (tenant_id, payload_cbor) in &rows {
+        match ConfigPayload::decode_trusted(tenant_id, payload_cbor) {
+            Ok(payload) => config.apply(&payload),
+            Err(e) => tracing::warn!(
+                tenant = %tenant_id,
+                error = %e,
+                "skipping entry that failed to decode"
+            ),
+        }
+    }
+    // Under the policy lock, so a tenant deleted meanwhile is not put back.
+    let policy_guard = state.invite_lock.lock().await;
+    state
+        .port_index
+        .store(Arc::new(build_port_index(&config, &state.policy.load())));
+    drop(policy_guard);
+    *cached = CachedConfig {
+        state: config,
+        version,
+    };
+    drop(cached);
     Ok(())
+}
+
+/// The route table for the current config, policy and live agents.
+pub async fn current_route_table(state: &AppState) -> anyhow::Result<RouteTable> {
+    sync_config(state).await?;
+    let policy = state.policy.load();
+    let live = state.live_agents.snapshot();
+    let cached = state.config.read().await;
+    Ok(RouteTable::from_state(&cached.state, &policy, Some(&live)))
 }
 
 /// Refresh the cached port-reservation snapshot read by per-edge listener
@@ -470,9 +528,7 @@ pub fn remove_tenant_from_port_index(
 /// [`trigger_route_rebuild`]. The port index is maintained incrementally on
 /// the write path, not here, so it has a single writer.
 pub async fn rebuild_and_broadcast_routes(state: &Arc<AppState>) -> anyhow::Result<()> {
-    let policy_snapshot = state.policy.load_full();
-    let entries = state.db.get_all_entries().await?;
-    let live = state.live_agents.snapshot();
+    let table = current_route_table(state).await?;
 
     // Refresh the reservation snapshot before fan-out so every edge's
     // listener filtering reads it instead of querying the DB per broadcast.
@@ -480,7 +536,6 @@ pub async fn rebuild_and_broadcast_routes(state: &Arc<AppState>) -> anyhow::Resu
         tracing::warn!(error = %e, "failed to refresh port reservations before broadcast");
     }
 
-    let table = RouteTable::from_entries_with_liveness(&entries, &policy_snapshot, Some(&live));
     if state.route_tx.send(table).is_err() {
         tracing::debug!("route broadcast: no active subscribers");
     }

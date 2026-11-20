@@ -55,8 +55,12 @@ pub struct AgentArgs {
     health_listen_addr: SocketAddr,
 }
 
-/// How often the agent re-queries the hub for the current trusted-edge set.
+/// How often the agent asks the hub for the edge set while no edge pushes it.
 const TOPOLOGY_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
+/// With edges pushing the edge set, the hub is still asked this often. Its
+/// answer replaces whatever was pushed, which bounds how long a wrong pushed
+/// set can last.
+const HUB_AUDIT_INTERVAL: Duration = Duration::from_mins(10);
 /// Base delay between agent-lifecycle attempts (bring-up + serve). A hub that
 /// stays unreachable escalates this up to [`LIFECYCLE_MAX_DELAY`].
 const LIFECYCLE_BASE_DELAY: Duration = Duration::from_secs(10);
@@ -272,6 +276,10 @@ async fn serve(
     // come online is never torn down — only a regression from connected to dark.
     let mut armed = false;
     let mut dark_since: Option<Instant> = None;
+    let mut hub_asked = Instant::now();
+    // Pinned outside the loop: pool events must not restart it.
+    let refresh = tokio::time::sleep(retry::jitter(TOPOLOGY_REFRESH_INTERVAL));
+    tokio::pin!(refresh);
     loop {
         tokio::select! {
             () = shutdown.cancelled() => return Ok(()),
@@ -279,16 +287,29 @@ async fn serve(
                 edge_session::SessionEvent::Connected => {
                     armed = true;
                     dark_since = None;
+                    pool.reconcile();
                 }
+                edge_session::SessionEvent::Topology(signed, _slot) => pool.apply_topology(&signed),
                 edge_session::SessionEvent::ConnectTimeouts if armed && metrics.active_edge_sessions() == 0 => {
                     return Err(anyhow!("repeated edge connection timeouts with no active sessions; rebuilding endpoint"));
                 }
                 edge_session::SessionEvent::ConnectTimeouts => {}
             },
-            () = tokio::time::sleep(TOPOLOGY_REFRESH_INTERVAL) => {
-                match stateless::refresh_edge_contacts(token, ctx).await {
-                    Ok(contacts) => pool.reconcile(&contacts),
-                    Err(e) => warn!(error = %e, "topology refresh failed; keeping current edge set"),
+            () = &mut refresh => {
+                let next = tokio::time::Instant::now() + retry::jitter(TOPOLOGY_REFRESH_INTERVAL);
+                refresh.as_mut().reset(next);
+                let check = pool.wants_hub_check() || hub_asked.elapsed() >= HUB_AUDIT_INTERVAL;
+                if check || !pool.has_topology_stream() {
+                    match stateless::fetch_edge_set(token, ctx).await {
+                        Ok(edges) => {
+                            hub_asked = Instant::now();
+                            pool.apply(edges);
+                        }
+                        Err(e) => warn!(error = %e, "topology refresh failed; keeping current edge set"),
+                    }
+                } else {
+                    // A session may have ended since the last edge set.
+                    pool.reconcile();
                 }
 
                 if metrics.active_edge_sessions() > 0 {
@@ -353,10 +374,12 @@ async fn try_bring_up(
         .unwrap_or_default();
 
     if relay_urls.is_empty()
-        && ctx
-            .edge_contacts
+        && !ctx
+            .edges
+            .topology
+            .edges
             .iter()
-            .all(|c| c.addrs.is_empty() && c.tls_addrs.is_empty())
+            .any(towonel_common::topology::TopologyEdge::is_dialable)
     {
         warn!(
             "no edge advertised an iroh address and no relay is configured; waiting for \
@@ -367,8 +390,8 @@ async fn try_bring_up(
     // Seed an empty lookup with the known edge ids so iroh's RemoteStateActor
     // doesn't warn "No address lookup configured" — addrs come from connect().
     let edge_lookup = MemoryLookup::new();
-    for contact in &ctx.edge_contacts {
-        edge_lookup.add_endpoint_info(EndpointAddr::new(contact.id));
+    for edge in &ctx.edges.topology.edges {
+        edge_lookup.add_endpoint_info(EndpointAddr::new(edge.id));
     }
 
     let mut endpoint_builder = Endpoint::builder(Minimal)
@@ -439,8 +462,8 @@ async fn try_bring_up(
         return Err(e);
     }
 
-    if ctx.trusted_edges.is_empty() {
-        warn!("no trusted edges yet; the topology-refresh loop will dial them once provisioned");
+    if ctx.edges.topology.edges.is_empty() {
+        warn!("no edges yet; the topology-refresh loop will dial them once provisioned");
     }
 
     if !agent_config.services.is_empty() {
@@ -468,10 +491,10 @@ async fn try_bring_up(
         &ctx.edge_cred,
         relay_urls,
         tls_dialer,
+        ctx.pinned_edges.clone(),
         shutdown,
     );
-    info!(edges = ctx.edge_contacts.len(), "starting edge supervisors");
-    pool.reconcile(&ctx.edge_contacts);
+    pool.apply(ctx.edges.clone());
 
     Ok(BroughtUp {
         ctx,

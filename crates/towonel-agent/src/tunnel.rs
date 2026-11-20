@@ -1,6 +1,8 @@
 use std::collections::HashMap;
+use std::future::Future;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
@@ -15,9 +17,9 @@ use towonel_common::metrics::GaugeGuard;
 use towonel_common::transport::{TunnelConn, TunnelRecv, TunnelSend};
 use towonel_common::tunnel::{
     CONTROL_OPCODE_STREAM_ACK, CONTROL_STATUS_NOT_IMPLEMENTED, CONTROL_STATUS_OK, COPY_BUF_SIZE,
-    ClientAddrs, DatagramFrameReader, MAX_UDP_DATAGRAM, STREAM_ACK_PREFIX, TCP_ROUTE_PREFIX,
-    UDP_ROUTE_PREFIX, copy_buf_counting, copy_tcp_counting, read_control_status, read_handshake,
-    write_control_prefix, write_control_status, write_datagram_frame,
+    ClientAddrs, CountingWriter, DatagramFrameReader, MAX_UDP_DATAGRAM, STREAM_ACK_PREFIX,
+    TCP_ROUTE_PREFIX, UDP_ROUTE_PREFIX, copy_buf_counting, copy_tcp_counting, read_control_status,
+    read_handshake, write_control_prefix, write_control_status, write_datagram_frame,
 };
 
 use crate::config::{ProxyProtocol, ServiceConfig, TcpServiceConfig, UdpServiceConfig};
@@ -500,7 +502,11 @@ async fn handle_connection_with_stream_limit(
         tasks.spawn(async move {
             let _permit = permit;
             if let Err(e) = handle_stream(send, recv, &map, remote_id, &m).await {
-                warn!("stream error: {e}");
+                if e.is::<CopyError>() {
+                    debug!("stream error: {e}");
+                } else {
+                    warn!("stream error: {e}");
+                }
             }
         });
     }
@@ -682,31 +688,69 @@ async fn handle_stream(
     .await
 }
 
-/// Record byte counts from a finished bidirectional copy, warning on either
-/// direction's error. Each half reports its total alongside its result, so
-/// bytes sent before an abnormal close are still counted. `e2o_label`/`o2e_label`
-/// scope the warning to the caller. Returns `true` if either direction errored
-/// (an abnormal termination) so the caller can flag it as a forward error
-/// rather than count it a clean completion.
+/// A forward that ended on an I/O error in either direction: usually the
+/// client or the origin hanging up. Counted in `stream_errors`, logged at debug.
+#[derive(Debug)]
+struct CopyError(&'static str);
+
+impl std::fmt::Display for CopyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} ended with a copy error", self.0)
+    }
+}
+
+impl std::error::Error for CopyError {}
+
+/// Runs a stream's two directions: `request` from the edge to the origin and
+/// `reply` back.
+///
+/// A reply that fails means the origin is gone, so the request is cut short
+/// (`None`). A request that fails does not end the reply: an origin may answer
+/// and close while the client is still sending, and that answer must arrive.
+async fn run_forward<Q, R>(request: Q, reply: R) -> (Option<io::Result<()>>, io::Result<()>)
+where
+    Q: Future<Output = io::Result<()>>,
+    R: Future<Output = io::Result<()>>,
+{
+    tokio::pin!(request, reply);
+    tokio::select! {
+        replied = &mut reply => match replied {
+            Ok(()) => (Some(request.await), Ok(())),
+            Err(e) => (None, Err(e)),
+        },
+        requested = &mut request => (Some(requested), reply.await),
+    }
+}
+
+/// Record byte counts from [`run_forward`], logging either direction's error.
+/// The counters hold what was sent before an abnormal close. `e2o_label` and
+/// `o2e_label` scope the log line to the caller. Returns `true` unless both
+/// directions ended cleanly.
 #[must_use]
 fn record_copy_results(
     metrics: &AgentMetrics,
-    edge_to_origin: (u64, io::Result<()>),
-    origin_to_edge: (u64, io::Result<()>),
+    edge_to_origin: (&AtomicU64, Option<io::Result<()>>),
+    origin_to_edge: (&AtomicU64, io::Result<()>),
     e2o_label: &str,
     o2e_label: &str,
 ) -> bool {
     let (e2o_bytes, e2o_res) = edge_to_origin;
-    metrics.add_bytes(metrics::direction::EDGE_TO_ORIGIN, e2o_bytes);
-    if let Err(e) = &e2o_res {
-        warn!("{e2o_label}: {e}");
+    metrics.add_bytes(
+        metrics::direction::EDGE_TO_ORIGIN,
+        e2o_bytes.load(Ordering::Relaxed),
+    );
+    if let Some(Err(e)) = &e2o_res {
+        debug!("{e2o_label}: {e}");
     }
     let (o2e_bytes, o2e_res) = origin_to_edge;
-    metrics.add_bytes(metrics::direction::ORIGIN_TO_EDGE, o2e_bytes);
+    metrics.add_bytes(
+        metrics::direction::ORIGIN_TO_EDGE,
+        o2e_bytes.load(Ordering::Relaxed),
+    );
     if let Err(e) = &o2e_res {
-        warn!("{o2e_label}: {e}");
+        debug!("{o2e_label}: {e}");
     }
-    e2o_res.is_err() || o2e_res.is_err()
+    !matches!((e2o_res, o2e_res), (Some(Ok(())), Ok(())))
 }
 
 async fn forward_plain(
@@ -724,20 +768,40 @@ async fn forward_plain(
 
     let (mut origin_read, mut origin_write) = origin.into_split();
 
+    let (e2o, o2e) = (AtomicU64::new(0), AtomicU64::new(0));
     let q2o = async {
-        let res = quic_recv.forward_to_writer(&mut origin_write).await;
+        let res = {
+            let mut counted = CountingWriter::new(&mut origin_write, &e2o);
+            quic_recv.forward_to_writer(&mut counted).await.1
+        };
         drop(origin_write.shutdown().await);
         res
     };
+    let edge_stopped = quic_send.stopped();
     let o2q = async {
-        let res = copy_tcp_counting(&mut origin_read, quic_send).await;
+        let copy = async {
+            let mut counted = CountingWriter::new(&mut *quic_send, &o2e);
+            copy_tcp_counting(&mut origin_read, &mut counted).await.1
+        };
+        let res = tokio::select! {
+            res = copy => res,
+            // The edge's client is gone: there is no one to answer.
+            () = edge_stopped => Ok(()),
+        };
+        // Finished, never reset: what the origin sent is delivered.
         drop(quic_send.finish().await);
         res
     };
 
-    let (r1, r2) = tokio::join!(q2o, o2q);
-    if record_copy_results(metrics, r1, r2, "edge->origin", "origin->edge") {
-        anyhow::bail!("forwarding ended with a copy error");
+    let (r1, r2) = run_forward(q2o, o2q).await;
+    if record_copy_results(
+        metrics,
+        (&e2o, r1),
+        (&o2e, r2),
+        "edge->origin",
+        "origin->edge",
+    ) {
+        return Err(CopyError("forwarding").into());
     }
     Ok(())
 }
@@ -772,7 +836,7 @@ async fn handle_tcp_stream(
 
     async {
         debug!("forwarding tcp service to origin");
-        let mut origin = match target.connect().await {
+        let origin = match target.connect().await {
             Ok(s) => s,
             Err(e) => {
                 metrics.record_stream_error(metrics::stream_error::ORIGIN_CONNECT);
@@ -780,28 +844,18 @@ async fn handle_tcp_stream(
             }
         };
 
-        if let Err(e) = write_proxy_header(&mut origin, target.proxy_protocol, client_addrs).await {
+        let forwarded = forward_plain(
+            origin,
+            target.proxy_protocol,
+            client_addrs,
+            &mut quic_recv,
+            &mut quic_send,
+            metrics,
+        )
+        .await;
+        if let Err(e) = forwarded {
             metrics.record_stream_error(metrics::stream_error::FORWARD_ERROR);
             return Err(e);
-        }
-
-        let (mut origin_read, mut origin_write) = origin.into_split();
-
-        let q2o = async {
-            let res = quic_recv.forward_to_writer(&mut origin_write).await;
-            drop(origin_write.shutdown().await);
-            res
-        };
-        let o2q = async {
-            let res = copy_tcp_counting(&mut origin_read, &mut quic_send).await;
-            drop(quic_send.finish().await);
-            res
-        };
-
-        let (r1, r2) = tokio::join!(q2o, o2q);
-        if record_copy_results(metrics, r1, r2, "edge->tcp-origin", "tcp-origin->edge") {
-            metrics.record_stream_error(metrics::stream_error::FORWARD_ERROR);
-            return Err(anyhow::anyhow!("tcp forwarding ended with a copy error"));
         }
 
         metrics.streams_completed.inc();
@@ -972,20 +1026,39 @@ async fn forward_tls(
     let (tls_read, mut tls_write) = tokio::io::split(tls_stream);
     let mut tls_read = io::BufReader::with_capacity(COPY_BUF_SIZE, tls_read);
 
+    let (e2o, o2e) = (AtomicU64::new(0), AtomicU64::new(0));
     let q2o = async {
-        let res = quic_recv.forward_to_writer(&mut tls_write).await;
+        let res = {
+            let mut counted = CountingWriter::new(&mut tls_write, &e2o);
+            quic_recv.forward_to_writer(&mut counted).await.1
+        };
         drop(tls_write.shutdown().await);
         res
     };
+    let edge_stopped = quic_send.stopped();
     let o2q = async {
-        let res = copy_buf_counting(&mut tls_read, quic_send).await;
+        let copy = async {
+            let mut counted = CountingWriter::new(&mut *quic_send, &o2e);
+            copy_buf_counting(&mut tls_read, &mut counted).await.1
+        };
+        let res = tokio::select! {
+            res = copy => res,
+            () = edge_stopped => Ok(()),
+        };
         drop(quic_send.finish().await);
         res
     };
 
-    let (r1, r2) = tokio::join!(q2o, o2q);
-    if record_copy_results(metrics, r1, r2, "edge->origin(tls)", "origin(tls)->edge") {
-        anyhow::bail!("tls forwarding ended with a copy error");
+    let (r1, r2) = run_forward(q2o, o2q).await;
+    let failed = record_copy_results(
+        metrics,
+        (&e2o, r1),
+        (&o2e, r2),
+        "edge->origin(tls)",
+        "origin(tls)->edge",
+    );
+    if failed {
+        return Err(CopyError("tls forwarding").into());
     }
     Ok(())
 }
@@ -1133,6 +1206,127 @@ mod tests {
             .unwrap();
         forwarding_released.expect("forwarding tasks still active after peer closed");
         assert_eq!(stream_limit.available_permits(), 1);
+    }
+
+    async fn origin_and_edge(
+        host: &str,
+    ) -> (
+        tokio::net::TcpListener,
+        iroh::Endpoint,
+        iroh::Endpoint,
+        iroh::endpoint::Connection,
+        Arc<AgentMetrics>,
+    ) {
+        use towonel_common::tls_policy::TlsMode;
+
+        drop(rustls::crypto::ring::default_provider().install_default());
+        let origin = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let services = Arc::new(
+            ServiceMap::from_config(
+                &[ServiceConfig {
+                    hostname: host.to_string(),
+                    origin: origin.local_addr().unwrap().to_string(),
+                    origin_server_name: None,
+                    tls_mode: TlsMode::Passthrough,
+                    proxy_protocol: Some(ProxyProtocol::None),
+                }],
+                &[],
+                &[],
+            )
+            .await
+            .unwrap(),
+        );
+        let (edge, agent, conn, peer) = local_connection().await;
+        let metrics = Arc::new(AgentMetrics::new());
+        tokio::spawn(handle_connection(
+            TunnelConn::Iroh(conn),
+            edge.id(),
+            services,
+            Arc::clone(&metrics),
+        ));
+        (origin, edge, agent, peer, metrics)
+    }
+
+    #[tokio::test]
+    async fn an_edge_that_stops_reading_releases_the_origin() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::time::timeout;
+        use towonel_common::tunnel::write_handshake;
+
+        const SETUP: Duration = Duration::from_secs(3);
+        const HOST: &str = "gone.test";
+
+        let (origin, edge, agent, peer, metrics) = origin_and_edge(HOST).await;
+        let (mut send, recv) = peer.open_bi().await.unwrap();
+        write_handshake(&mut send, HOST, v4_addrs()).await.unwrap();
+        send.write_all(b"ping").await.unwrap();
+        let (mut socket, _) = timeout(SETUP, origin.accept()).await.unwrap().unwrap();
+
+        // What the edge does when its client resets: the request is finished,
+        // not discarded, and the reply is no longer read.
+        send.finish().unwrap();
+        drop(recv);
+
+        let mut request = Vec::new();
+        timeout(SETUP, socket.read_to_end(&mut request))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(request, b"ping");
+        // A half-close would leave the origin free to keep writing; a closed
+        // connection refuses it.
+        let refused = timeout(SETUP, async {
+            while socket.write_all(&[0; 1024]).await.is_ok() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        refused.expect("origin connection still open after the edge stopped reading");
+        timeout(SETUP, async {
+            while metrics.streams_active.get() != 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("stream still counted active");
+        agent.close().await;
+        edge.close().await;
+    }
+
+    #[tokio::test]
+    async fn a_reply_sent_before_the_origin_hangs_up_on_an_upload_is_delivered() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::time::timeout;
+        use towonel_common::tunnel::write_handshake;
+
+        const SETUP: Duration = Duration::from_secs(5);
+        const HOST: &str = "early.test";
+
+        let (origin, edge, agent, peer, _metrics) = origin_and_edge(HOST).await;
+        let (mut send, mut recv) = peer.open_bi().await.unwrap();
+        write_handshake(&mut send, HOST, v4_addrs()).await.unwrap();
+        send.write_all(b"POST").await.unwrap();
+        let (mut socket, _) = timeout(SETUP, origin.accept()).await.unwrap().unwrap();
+        let mut head = [0; 4];
+        timeout(SETUP, socket.read_exact(&mut head))
+            .await
+            .unwrap()
+            .unwrap();
+
+        // The origin refuses the upload and closes without reading it.
+        socket.write_all(b"413 too large").await.unwrap();
+        drop(socket);
+        let upload = tokio::spawn(async move {
+            while send.write_all(&[0; 16 * 1024]).await.is_ok() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        });
+
+        let reply = timeout(SETUP, recv.read_to_end(64)).await.unwrap();
+        assert_eq!(reply.unwrap(), b"413 too large");
+        timeout(SETUP, upload).await.unwrap().unwrap();
+        agent.close().await;
+        edge.close().await;
     }
 
     fn v4_addrs() -> ClientAddrs {

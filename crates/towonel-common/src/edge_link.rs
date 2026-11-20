@@ -3,6 +3,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::identity::{AgentId, PQ_PUB_KEY_LEN, TenantId};
 use crate::routing::RouteTable;
+use crate::topology::SignedTopology;
 
 pub const EDGE_LINK_VERSION: u16 = 5;
 
@@ -61,6 +62,11 @@ pub enum EdgeToHub {
         /// an edge without one, and ignored by a hub that predates it.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         tls_endpoints: Vec<String>,
+        /// Set by an edge that understands [`HubToEdge::Topology`]; the hub must
+        /// not send it otherwise. Carries the newest version the edge holds (0
+        /// for none) so the hub's next one is higher, whatever hub sent it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        topology: Option<u64>,
     },
     SessionAdded {
         agent_id: AgentId,
@@ -104,6 +110,8 @@ pub enum HubToEdge {
         #[serde(with = "serde_bytes")]
         body: Vec<u8>,
     },
+    /// Sent after `Welcome` and on every change, to edges that asked in `Hello`.
+    Topology(SignedTopology),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -318,6 +326,7 @@ mod tests {
             public_ips: vec!["1.2.3.4".into(), "2001:db8::1".into()],
             region: Some("EU".into()),
             tls_endpoints: vec!["edge.example:51821".into()],
+            topology: Some(3),
         };
         let mut buf = Vec::new();
         write_edge_to_hub(&mut buf, &msg).await.unwrap();
@@ -338,6 +347,7 @@ mod tests {
             public_ips: vec![],
             region: None,
             tls_endpoints: vec![],
+            topology: None,
         };
         let mut buf = Vec::new();
         write_edge_to_hub(&mut buf, &msg).await.unwrap();
@@ -379,6 +389,7 @@ mod tests {
         let EdgeToHub::Hello {
             tls_endpoints,
             region,
+            topology,
             ..
         } = got
         else {
@@ -386,6 +397,7 @@ mod tests {
         };
         assert!(tls_endpoints.is_empty());
         assert_eq!(region.as_deref(), Some("EU"));
+        assert_eq!(topology, None);
     }
 
     #[test]
@@ -408,6 +420,7 @@ mod tests {
             public_ips: vec!["1.2.3.4".into()],
             region: Some("EU".into()),
             tls_endpoints: vec![],
+            topology: None,
         };
         let (mut old_bytes, mut new_bytes) = (Vec::new(), Vec::new());
         ciborium::into_writer(&old, &mut old_bytes).unwrap();
@@ -426,6 +439,7 @@ mod tests {
             public_ips: vec![],
             region: None,
             tls_endpoints: vec!["edge.example:51821".into()],
+            topology: Some(3),
         };
         let mut bytes = Vec::new();
         ciborium::into_writer(&new, &mut bytes).unwrap();

@@ -821,10 +821,12 @@ async fn run_node() -> anyhow::Result<()> {
                 Arc::new(std::sync::OnceLock::new());
             let live_agents_sink: edge::hub_client::LiveAgentSinkCell =
                 Arc::new(std::sync::OnceLock::new());
+            let (topology_tx, topology_rx) = tokio::sync::watch::channel(None);
             let hub_client = Arc::new(edge::hub_client::InProcessHubClient::new(
                 route_tx.clone(),
                 Arc::clone(&control_handler),
                 Arc::clone(&live_agents_sink),
+                topology_rx,
             ));
             let BuiltEdge {
                 edge,
@@ -855,9 +857,10 @@ async fn run_node() -> anyhow::Result<()> {
                     .filter(|v| !v.is_empty()),
                 software_version: SOFTWARE_VERSION,
             };
-            let hub = hub::Hub::new(build_hub_params(&config, identity, route_tx).await?)
-                .with_control_handler_cell(control_handler)
-                .with_live_agents_sink_cell(live_agents_sink);
+            let hub =
+                hub::Hub::new(build_hub_params(&config, identity, route_tx, topology_tx).await?)
+                    .with_control_handler_cell(control_handler)
+                    .with_live_agents_sink_cell(live_agents_sink);
 
             // edge.run() runs as a task so it always drains: on SIGTERM or a
             // hub exit we cancel the token and await it, rather than dropping
@@ -900,7 +903,9 @@ async fn run_node() -> anyhow::Result<()> {
                 software_version: SOFTWARE_VERSION,
             };
             drop(secret_key);
-            let hub = hub::Hub::new(build_hub_params(&config, identity, route_tx).await?);
+            let topology_tx = tokio::sync::watch::channel(None).0;
+            let hub =
+                hub::Hub::new(build_hub_params(&config, identity, route_tx, topology_tx).await?);
             tokio::select! {
                 res = hub.run() => {
                     if let Err(e) = res { error!("hub error: {e}"); }
@@ -1002,6 +1007,7 @@ async fn build_hub_params(
     config: &config::NodeConfig,
     identity: HubIdentity,
     route_tx: broadcast::Sender<RouteTable>,
+    topology_tx: edge::hub_client::TopologyTx,
 ) -> anyhow::Result<hub::HubParams> {
     let policy = build_ownership_policy(&config.tenants)?;
     let operator_api_key = hub::load_or_generate_operator_key(
@@ -1026,6 +1032,7 @@ async fn build_hub_params(
         health_listen_addr: config.hub.health_listen_addr.clone(),
         database: config.hub.database.clone(),
         route_tx,
+        topology_tx,
         static_policy: policy,
         identity,
         operator_api_key,

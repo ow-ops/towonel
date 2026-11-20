@@ -5,6 +5,7 @@
 
 pub mod tls;
 
+use std::future::Future;
 use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -104,6 +105,26 @@ impl TunnelSend {
         match self {
             Self::Iroh(s) => s.finish().map_err(io::Error::other),
             Self::Tls(s) => s.finish().await,
+        }
+    }
+
+    /// Resolves once the peer has stopped reading this stream, which a proxy
+    /// takes to mean that whoever it was writing for has gone. Never resolves
+    /// over TLS, where a peer's two halves close together.
+    pub fn stopped(&self) -> impl Future<Output = ()> + Send + 'static {
+        let stopped = match self {
+            Self::Iroh(s) => Some(s.stopped()),
+            Self::Tls(_) => None,
+        };
+        async move {
+            let stopped = match stopped {
+                Some(stopped) => matches!(stopped.await, Ok(Some(_))),
+                None => false,
+            };
+            if !stopped {
+                // Finished or lost: the copy this races against ends by itself.
+                std::future::pending::<()>().await;
+            }
         }
     }
 

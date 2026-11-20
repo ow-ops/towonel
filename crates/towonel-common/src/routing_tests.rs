@@ -5,7 +5,7 @@
 )]
 
 use super::*;
-use crate::config_entry::ConfigPayload;
+use crate::config_entry::{ConfigPayload, SignedConfigEntry};
 use crate::identity::{AgentKeypair, TenantKeypair};
 
 /// Build a policy that allows the given tenant all specified hostnames.
@@ -38,10 +38,28 @@ fn sign_entry(kp: &TenantKeypair, seq: u64, op: ConfigOp) -> SignedConfigEntry {
     SignedConfigEntry::sign(&payload, kp).unwrap()
 }
 
+/// Replays signed entries, which must be sorted by (`tenant_id`, sequence),
+/// then materializes: the hub's two steps in one.
+fn from_entries(entries: &[SignedConfigEntry], policy: &OwnershipPolicy) -> RouteTable {
+    from_entries_with_liveness(entries, policy, None)
+}
+
+fn from_entries_with_liveness(
+    entries: &[SignedConfigEntry],
+    policy: &OwnershipPolicy,
+    live_agents: Option<&HashSet<(TenantId, AgentId)>>,
+) -> RouteTable {
+    let mut state = ConfigState::default();
+    for entry in entries {
+        state.apply(&entry.decode_trusted().unwrap());
+    }
+    RouteTable::from_state(&state, policy, live_agents)
+}
+
 #[test]
 fn empty_entries_produce_empty_table() {
     let policy = OwnershipPolicy::new();
-    let table = RouteTable::from_entries(&[], &policy);
+    let table = from_entries(&[], &policy);
     assert!(table.is_empty());
 }
 
@@ -56,7 +74,7 @@ fn hostname_without_agent_produces_no_route() {
             hostname: "app.example.eu".into(),
         },
     )];
-    let table = RouteTable::from_entries(&entries, &policy);
+    let table = from_entries(&entries, &policy);
     assert!(table.is_empty());
 }
 
@@ -81,7 +99,7 @@ fn hostname_plus_agent_produces_route() {
             },
         ),
     ];
-    let table = RouteTable::from_entries(&entries, &policy);
+    let table = from_entries(&entries, &policy);
     assert_eq!(table.len(), 1);
     let agents = table.lookup("app.example.eu").unwrap();
     assert!(agents.contains(&agent.id()));
@@ -108,7 +126,7 @@ fn wildcard_lookup() {
             },
         ),
     ];
-    let table = RouteTable::from_entries(&entries, &policy);
+    let table = from_entries(&entries, &policy);
     assert!(table.lookup("app.example.eu").is_some());
     assert!(table.lookup("other.example.eu").is_some());
     assert!(table.lookup("example.eu").is_none());
@@ -142,7 +160,7 @@ fn delete_hostname_removes_route() {
             },
         ),
     ];
-    let table = RouteTable::from_entries(&entries, &policy);
+    let table = from_entries(&entries, &policy);
     assert!(table.is_empty());
 }
 
@@ -180,7 +198,7 @@ fn live_agents_filter_hides_offline_agents() {
     let mut live = HashSet::new();
     live.insert((kp.id(), live_agent.id()));
 
-    let table = RouteTable::from_entries_with_liveness(&entries, &policy, Some(&live));
+    let table = from_entries_with_liveness(&entries, &policy, Some(&live));
     let agents = table.lookup("app.example.eu").unwrap();
     assert!(agents.contains(&live_agent.id()));
     assert!(
@@ -215,7 +233,7 @@ fn signed_agents_ignores_liveness_filter() {
 
     let mut live = HashSet::new();
     live.insert((kp.id(), live_agent.id()));
-    let table = RouteTable::from_entries_with_liveness(&entries, &policy, Some(&live));
+    let table = from_entries_with_liveness(&entries, &policy, Some(&live));
 
     assert!(table.signed_agents().contains(&live_agent.id()));
     assert!(table.signed_agents().contains(&dead_agent.id()));
@@ -244,7 +262,7 @@ fn live_agents_empty_hides_all_routes() {
     ];
 
     let empty = HashSet::new();
-    let table = RouteTable::from_entries_with_liveness(&entries, &policy, Some(&empty));
+    let table = from_entries_with_liveness(&entries, &policy, Some(&empty));
     assert!(table.is_empty());
 }
 
@@ -270,7 +288,7 @@ fn live_agents_none_preserves_legacy_behavior() {
         ),
     ];
 
-    let table = RouteTable::from_entries_with_liveness(&entries, &policy, None);
+    let table = from_entries_with_liveness(&entries, &policy, None);
     assert!(table.lookup("app.example.eu").is_some());
 }
 
@@ -302,7 +320,7 @@ fn revoke_agent_removes_from_routes() {
             },
         ),
     ];
-    let table = RouteTable::from_entries(&entries, &policy);
+    let table = from_entries(&entries, &policy);
     // Hostname exists but no agents -> no route
     assert!(table.is_empty());
 }
@@ -348,7 +366,7 @@ fn multiple_tenants_isolated() {
             },
         ),
     ];
-    let table = RouteTable::from_entries(&entries, &policy);
+    let table = from_entries(&entries, &policy);
 
     let alice_agents = table.lookup("alice.example.eu").unwrap();
     assert!(alice_agents.contains(&agent1.id()));
@@ -402,7 +420,7 @@ fn two_tenants_same_hostname_second_rejected() {
             },
         ),
     ];
-    let table = RouteTable::from_entries(&entries, &policy);
+    let table = from_entries(&entries, &policy);
 
     // kp1's route should be intact
     let agents = table.lookup("shared.example.eu").unwrap();
@@ -456,7 +474,7 @@ fn policy_gap_same_hostname_resolves_to_lowest_tenant() {
             },
         ),
     ];
-    let table = RouteTable::from_entries(&entries, &policy);
+    let table = from_entries(&entries, &policy);
 
     // Lowest tenant_id wins; the loser's agent must not serve the hostname.
     let (winner, loser) = if kp1.id().as_bytes() <= kp2.id().as_bytes() {
@@ -509,7 +527,7 @@ fn unknown_tenant_entries_skipped() {
             },
         ),
     ];
-    let table = RouteTable::from_entries(&entries, &policy);
+    let table = from_entries(&entries, &policy);
 
     assert!(table.lookup("app.example.eu").is_some());
     assert!(table.lookup("evil.example.eu").is_none());
@@ -546,7 +564,7 @@ fn hostname_outside_policy_rejected() {
             },
         ),
     ];
-    let table = RouteTable::from_entries(&entries, &policy);
+    let table = from_entries(&entries, &policy);
 
     assert!(table.lookup("allowed.example.eu").is_some());
     assert!(table.lookup("sneaky.example.eu").is_none());
@@ -575,7 +593,7 @@ fn wildcard_is_single_level() {
             },
         ),
     ];
-    let table = RouteTable::from_entries(&entries, &policy);
+    let table = from_entries(&entries, &policy);
 
     assert!(table.lookup("app.example.eu").is_some());
     assert!(
@@ -614,7 +632,7 @@ fn lookup_with_tls_matches_lookup_plus_tls_mode() {
             },
         ),
     ];
-    let table = RouteTable::from_entries(&entries, &policy);
+    let table = from_entries(&entries, &policy);
 
     let (agents, tls) = table.lookup_with_tls("APP.example.eu").unwrap();
     assert_eq!(agents, table.lookup("app.example.eu").unwrap());
@@ -650,7 +668,7 @@ fn lookup_bare_tld_does_not_match_wildcard() {
             },
         ),
     ];
-    let table = RouteTable::from_entries(&entries, &policy);
+    let table = from_entries(&entries, &policy);
 
     assert!(table.lookup("example.eu").is_some());
     assert!(
@@ -681,7 +699,7 @@ fn tcp_service_plus_agent_produces_route() {
             },
         ),
     ];
-    let table = RouteTable::from_entries(&entries, &policy);
+    let table = from_entries(&entries, &policy);
     let agents = table.lookup_tcp_service(&kp.id(), "forgejo-ssh").unwrap();
     assert!(agents.contains(&agent.id()));
 }
@@ -708,7 +726,7 @@ fn tcp_service_unknown_name_returns_none() {
             },
         ),
     ];
-    let table = RouteTable::from_entries(&entries, &policy);
+    let table = from_entries(&entries, &policy);
     assert!(table.lookup_tcp_service(&kp.id(), "missing").is_none());
 }
 
@@ -741,7 +759,7 @@ fn tcp_service_delete_removes_route() {
             },
         ),
     ];
-    let table = RouteTable::from_entries(&entries, &policy);
+    let table = from_entries(&entries, &policy);
     assert!(table.lookup_tcp_service(&kp.id(), "ssh").is_none());
 }
 
@@ -788,7 +806,7 @@ fn tcp_service_isolated_across_tenants() {
             },
         ),
     ];
-    let table = RouteTable::from_entries(&entries, &policy);
+    let table = from_entries(&entries, &policy);
 
     let alice_set = table.lookup_tcp_service(&alice.id(), "ssh").unwrap();
     assert!(alice_set.contains(&alice_agent.id()));
@@ -821,7 +839,7 @@ fn tcp_service_produces_listener_binding() {
             },
         ),
     ];
-    let table = RouteTable::from_entries(&entries, &policy);
+    let table = from_entries(&entries, &policy);
     let bindings = table.tcp_listeners();
     let binding = bindings.get(&2222).expect("port 2222 must be bound");
     assert_eq!(binding.tenant, kp.id());
@@ -858,7 +876,7 @@ fn tcp_service_listen_port_update_is_in_place() {
             },
         ),
     ];
-    let table = RouteTable::from_entries(&entries, &policy);
+    let table = from_entries(&entries, &policy);
     let bindings = table.tcp_listeners();
     assert!(bindings.get(&2222).is_none(), "old port should be released");
     let binding = bindings.get(&2223).expect("new port must be bound");
@@ -894,7 +912,7 @@ fn tcp_service_delete_releases_listener_binding() {
             },
         ),
     ];
-    let table = RouteTable::from_entries(&entries, &policy);
+    let table = from_entries(&entries, &policy);
     assert!(
         table.tcp_listeners().is_empty(),
         "deleting the service must release its port"
@@ -947,7 +965,7 @@ fn tcp_service_port_collision_resolved_deterministically() {
         ),
     ];
 
-    let table = RouteTable::from_entries(&entries, &policy);
+    let table = from_entries(&entries, &policy);
     let bindings = table.tcp_listeners();
     assert_eq!(bindings.len(), 1, "only one tenant can win the port");
     let winner = bindings.get(&2222).unwrap();
@@ -985,7 +1003,7 @@ fn tcp_service_unique_agents_includes_tcp_only_agents() {
             },
         ),
     ];
-    let table = RouteTable::from_entries(&entries, &policy);
+    let table = from_entries(&entries, &policy);
     let agents = table.unique_agents();
     assert!(agents.contains(&agent.id()));
 }
@@ -1013,7 +1031,7 @@ fn udp_service_produces_route_and_listener() {
             },
         ),
     ];
-    let table = RouteTable::from_entries(&entries, &policy);
+    let table = from_entries(&entries, &policy);
     let agents = table.lookup_udp_service(&kp.id(), "dns").unwrap();
     assert!(agents.contains(&agent.id()));
     let binding = table.udp_listeners().get(&5353).expect("port 5353 bound");
@@ -1045,7 +1063,7 @@ fn udp_service_idle_timeout_materializes_into_binding() {
             },
         ),
     ];
-    let table = RouteTable::from_entries(&entries, &policy);
+    let table = from_entries(&entries, &policy);
     let binding = table.udp_listeners().get(&3478).expect("port 3478 bound");
     assert_eq!(binding.idle_timeout_secs, Some(300));
 }
@@ -1080,7 +1098,7 @@ fn udp_service_delete_releases_route_and_listener() {
             },
         ),
     ];
-    let table = RouteTable::from_entries(&entries, &policy);
+    let table = from_entries(&entries, &policy);
     assert!(table.lookup_udp_service(&kp.id(), "dns").is_none());
     assert!(table.udp_listeners().is_empty());
 }
@@ -1109,7 +1127,7 @@ fn udp_range_materializes_one_listener_per_port() {
             },
         ),
     ];
-    let table = RouteTable::from_entries(&entries, &policy);
+    let table = from_entries(&entries, &policy);
     // One route entry for the service, one listener per port in the range.
     assert!(table.lookup_udp_service(&kp.id(), "turn-relay").is_some());
     for port in 49160..=49163 {
@@ -1157,7 +1175,7 @@ fn udp_range_replaced_by_single_port_upsert() {
             },
         ),
     ];
-    let table = RouteTable::from_entries(&entries, &policy);
+    let table = from_entries(&entries, &policy);
     // Re-publishing the same service name as a single port collapses the range.
     assert!(table.udp_listeners().get(&40000).is_some());
     for port in 40001..=40004 {
@@ -1216,7 +1234,7 @@ fn udp_range_cross_tenant_overlap_first_claim_wins() {
             },
         ),
     ];
-    let table = RouteTable::from_entries(&entries, &policy);
+    let table = from_entries(&entries, &policy);
     let winner = if alice.id().as_bytes() < bob.id().as_bytes() {
         (alice.id(), "a")
     } else {
@@ -1260,7 +1278,7 @@ fn tcp_and_udp_share_no_port_namespace() {
             },
         ),
     ];
-    let table = RouteTable::from_entries(&entries, &policy);
+    let table = from_entries(&entries, &policy);
     assert!(table.tcp_listeners().get(&9000).is_some());
     assert!(table.udp_listeners().get(&9000).is_some());
 }
@@ -1273,4 +1291,128 @@ fn reserved_route_key_prefixes() {
     assert!(is_reserved_route_key("ctrl:x"));
     assert!(!is_reserved_route_key("app.example.eu"));
     assert!(!is_reserved_route_key("tcpsvc.example.eu"));
+}
+
+#[test]
+fn config_state_survives_a_policy_change() {
+    let kp = TenantKeypair::generate();
+    let agent = AgentKeypair::generate();
+    let mut state = ConfigState::default();
+    for (seq, op) in [
+        (
+            1,
+            ConfigOp::UpsertHostname {
+                hostname: "a.example.eu".into(),
+            },
+        ),
+        (
+            2,
+            ConfigOp::UpsertHostname {
+                hostname: "b.example.eu".into(),
+            },
+        ),
+        (
+            3,
+            ConfigOp::UpsertAgent {
+                agent_id: agent.id(),
+            },
+        ),
+    ] {
+        state.apply(&sign_entry(&kp, seq, op).decode_trusted().unwrap());
+    }
+
+    let both = policy_for(&kp, &["a.example.eu", "b.example.eu"]);
+    assert_eq!(RouteTable::from_state(&state, &both, None).len(), 2);
+
+    let narrowed = policy_for(&kp, &["a.example.eu"]);
+    assert_eq!(
+        RouteTable::from_state(&state, &narrowed, None).hostnames(),
+        HashSet::from(["a.example.eu".to_string()])
+    );
+
+    let removed = OwnershipPolicy::new();
+    let table = RouteTable::from_state(&state, &removed, None);
+    assert!(table.is_empty());
+    assert!(table.signed_agents().is_empty());
+}
+
+#[test]
+fn config_state_tracks_agent_revocation_and_services() {
+    let kp = TenantKeypair::generate();
+    let agent = AgentKeypair::generate();
+    let mut state = ConfigState::default();
+    let mut seq = 0;
+    let mut apply = |state: &mut ConfigState, op| {
+        seq += 1;
+        state.apply(&sign_entry(&kp, seq, op).decode_trusted().unwrap());
+    };
+
+    assert!(!state.is_agent_signed(&kp.id(), &agent.id()));
+    apply(
+        &mut state,
+        ConfigOp::UpsertAgent {
+            agent_id: agent.id(),
+        },
+    );
+    assert!(state.is_agent_signed(&kp.id(), &agent.id()));
+    apply(
+        &mut state,
+        ConfigOp::RevokeAgent {
+            agent_id: agent.id(),
+        },
+    );
+    assert!(!state.is_agent_signed(&kp.id(), &agent.id()));
+    apply(
+        &mut state,
+        ConfigOp::UpsertAgent {
+            agent_id: agent.id(),
+        },
+    );
+    assert!(state.is_agent_signed(&kp.id(), &agent.id()));
+
+    assert_eq!(state.service_bindings(&kp.id()), (false, false));
+    apply(
+        &mut state,
+        ConfigOp::UpsertTcpService {
+            service: "ssh".into(),
+            listen_port: 2222,
+        },
+    );
+    apply(
+        &mut state,
+        ConfigOp::UpsertUdpServiceRange {
+            service: "game".into(),
+            port_start: 9000,
+            port_end: 9002,
+            idle_timeout_secs: None,
+        },
+    );
+    assert_eq!(state.service_bindings(&kp.id()), (true, true));
+    assert_eq!(
+        state.udp_services().collect::<Vec<_>>(),
+        vec![(&kp.id(), "game", 9000, 9002)]
+    );
+    apply(
+        &mut state,
+        ConfigOp::DeleteTcpService {
+            service: "ssh".into(),
+        },
+    );
+    assert_eq!(state.service_bindings(&kp.id()), (false, true));
+}
+
+#[test]
+fn config_state_remembers_each_tenants_newest_sequence() {
+    let (kp, other) = (TenantKeypair::generate(), TenantKeypair::generate());
+    let agent = AgentKeypair::generate();
+    let mut state = ConfigState::default();
+    assert_eq!(state.last_sequence(&kp.id()), None);
+    for seq in [3, 7] {
+        let op = ConfigOp::UpsertAgent {
+            agent_id: agent.id(),
+        };
+        state.apply(&sign_entry(&kp, seq, op).decode_trusted().unwrap());
+    }
+    assert_eq!(state.last_sequence(&kp.id()), Some(7));
+    assert_eq!(state.last_sequence(&other.id()), None);
 }

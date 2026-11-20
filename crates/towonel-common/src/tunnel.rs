@@ -1,4 +1,8 @@
+use std::future::Future;
 use std::net::{IpAddr, SocketAddr, SocketAddrV4, SocketAddrV6};
+use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::task::{Context, Poll};
 
 use ppp::v2;
 use tokio::io::{
@@ -34,6 +38,9 @@ pub const CONTROL_PREFIX: &str = "ctrl:";
 /// Agent supports acknowledging routing headers before client data is sent.
 pub const CONTROL_OPCODE_STREAM_ACK: u8 = 0x02;
 pub const STREAM_ACK_PREFIX: &str = "ctrl:ack:";
+/// Agent asks the edge to keep the stream open and write the edge set to it,
+/// again on every change (see [`crate::topology`]).
+pub const CONTROL_OPCODE_TOPOLOGY: u8 = 0x03;
 
 pub const CONTROL_STATUS_OK: u8 = 0;
 pub const CONTROL_STATUS_NOT_IMPLEMENTED: u8 = 1;
@@ -129,6 +136,68 @@ where
                 Err(e) => return (total, Err(e)),
             }
         }
+    }
+}
+
+/// Counts the bytes its writer accepts into `count`, so the total survives the
+/// copy feeding it being dropped part-way (see [`join_or_abort`]).
+pub struct CountingWriter<'a, W> {
+    inner: W,
+    count: &'a AtomicU64,
+}
+
+impl<'a, W> CountingWriter<'a, W> {
+    pub const fn new(inner: W, count: &'a AtomicU64) -> Self {
+        Self { inner, count }
+    }
+}
+
+impl<W: AsyncWrite + Unpin> AsyncWrite for CountingWriter<'_, W> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let this = self.get_mut();
+        let written = Pin::new(&mut this.inner).poll_write(cx, buf);
+        if let Poll::Ready(Ok(n)) = written {
+            this.count.fetch_add(n as u64, Ordering::Relaxed);
+        }
+        written
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+    }
+}
+
+/// Runs the two directions of a proxied connection.
+///
+/// One that ends cleanly lets the other run on (a half-close). One that fails
+/// ends the other at once, so neither peer keeps working for one that has
+/// gone. `None` is the direction that was cut short.
+pub async fn join_or_abort<A, B>(
+    a: A,
+    b: B,
+) -> (Option<std::io::Result<()>>, Option<std::io::Result<()>>)
+where
+    A: Future<Output = std::io::Result<()>>,
+    B: Future<Output = std::io::Result<()>>,
+{
+    tokio::pin!(a, b);
+    tokio::select! {
+        result = &mut a => match result {
+            Ok(()) => (Some(Ok(())), Some(b.await)),
+            Err(e) => (Some(Err(e)), None),
+        },
+        result = &mut b => match result {
+            Ok(()) => (Some(a.await), Some(Ok(()))),
+            Err(e) => (None, Some(Err(e))),
+        },
     }
 }
 
@@ -439,6 +508,50 @@ fn frame_eof() -> std::io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_failed_direction_cuts_the_other_short() {
+        let failed = async { Err(std::io::Error::other("client reset")) };
+        let (a, b) = join_or_abort(failed, std::future::pending()).await;
+        a.unwrap().unwrap_err();
+        assert!(b.is_none());
+
+        let failed = async { Err(std::io::Error::other("origin reset")) };
+        let (a, b) = join_or_abort(std::future::pending(), failed).await;
+        assert!(a.is_none());
+        b.unwrap().unwrap_err();
+    }
+
+    #[tokio::test]
+    async fn a_direction_that_ends_cleanly_lets_the_other_finish() {
+        let (release, held) = tokio::sync::oneshot::channel::<()>();
+        let slow = async {
+            held.await.map_err(std::io::Error::other)?;
+            Ok(())
+        };
+        let both = tokio::spawn(join_or_abort(async { Ok(()) }, slow));
+        tokio::task::yield_now().await;
+        assert!(!both.is_finished());
+        release.send(()).unwrap();
+        let (a, b) = both.await.unwrap();
+        a.unwrap().unwrap();
+        b.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn counting_writer_keeps_the_total_of_a_dropped_copy() {
+        let count = AtomicU64::new(0);
+        // Room for five bytes and nobody reading: the write stalls after them.
+        let (mut stalled, _unread) = tokio::io::duplex(5);
+        let copy = async {
+            let mut writer = CountingWriter::new(&mut stalled, &count);
+            writer.write_all(b"hello world").await
+        };
+        tokio::time::timeout(std::time::Duration::from_millis(50), copy)
+            .await
+            .unwrap_err();
+        assert_eq!(count.load(Ordering::Relaxed), 5);
+    }
 
     #[tokio::test]
     async fn copy_tcp_counting_copies_until_eof() {

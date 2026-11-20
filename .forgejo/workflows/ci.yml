@@ -62,6 +62,13 @@ jobs:
       SCCACHE_S3_USE_SSL: "true"
       AWS_ACCESS_KEY_ID: ${{ secrets.SCCACHE_AWS_ACCESS_KEY_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_AWS_SECRET_ACCESS_KEY }}
+      TOWONEL_TEST_POSTGRES_URL: postgres://postgres:postgres@postgres/towonel
+    services:
+      postgres:
+        image: postgres:19
+        env:
+          POSTGRES_DB: towonel
+          POSTGRES_PASSWORD: postgres
     steps:
       - uses: https://data.forgejo.org/actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: https://github.com/dtolnay/rust-toolchain@1.96.0
@@ -77,6 +84,7 @@ jobs:
         with:
           tool: cargo-nextest,sccache
       - run: cargo nextest run --workspace --all-features --no-fail-fast
+      - run: cargo nextest run -p towonel-node --all-features --run-ignored only postgres
       - run: sccache --show-stats
         if: always()
 

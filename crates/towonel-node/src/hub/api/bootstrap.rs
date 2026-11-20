@@ -2,6 +2,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use axum::extract::State;
+use axum::http::StatusCode;
 use axum::response::Response;
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
@@ -9,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use towonel_common::edge_cred::{EDGE_CRED_NONCE_LEN, EDGE_CRED_VERSION, EdgeCred, Kid};
 use towonel_common::identity::AgentId;
 use towonel_common::invite::hash_invite_secret;
+use towonel_common::topology::Topology;
 use tracing::warn;
 use zeroize::Zeroizing;
 
@@ -16,8 +18,8 @@ use towonel_common::time::now_ms;
 
 use super::db::InviteStatus;
 use super::{
-    AppState, constant_time_eq, gone, internal_error, invalid_request, json_ok, parse_invite_id,
-    unauthorized,
+    AppState, constant_time_eq, error_response, gone, internal_error, invalid_request, json_ok,
+    parse_invite_id, unauthorized,
 };
 
 /// 1 h — caps the worst-case revocation lag for an issued `EdgeCred`.
@@ -100,6 +102,12 @@ fn select_edge_candidates(
     candidates
 }
 
+/// How long after the first edge connects the hub declines to bootstrap.
+/// Agents that predate pushed topology take the answer as the whole edge set
+/// and drop their sessions to any edge that has not redialed yet, and an edge
+/// that lost the hub for a while redials with up to a minute of backoff.
+const EDGE_SETTLE_WINDOW: std::time::Duration = std::time::Duration::from_mins(1);
+
 #[derive(Debug, Serialize)]
 pub(super) struct BootstrapResponse {
     status: &'static str,
@@ -125,6 +133,21 @@ pub(super) struct BootstrapResponse {
     /// base64url-no-pad of the CBOR-encoded [`EdgeCred`].
     #[serde(skip_serializing_if = "Option::is_none")]
     edge_cred_b64: Option<String>,
+
+    /// The invite's regions in preference order, and every live edge. An agent
+    /// that understands them picks its own edges and ignores `trusted_edges`.
+    regions: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    topology: Option<Topology>,
+    /// Keys that sign the edge sets edges push; an agent takes no other.
+    signing_keys: Vec<SigningKey>,
+}
+
+#[derive(Debug, Serialize)]
+struct SigningKey {
+    kid: Kid,
+    /// base64url-no-pad of the ML-DSA-65 public key.
+    public_key_b64: String,
 }
 
 #[expect(
@@ -135,6 +158,13 @@ pub(super) async fn post_bootstrap(
     State(state): State<Arc<AppState>>,
     axum::Json(req): axum::Json<BootstrapRequest>,
 ) -> Response {
+    if state.identity.edge_node_id.is_none() && !state.live_edges.settled(EDGE_SETTLE_WINDOW) {
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "not_ready",
+            "edges are still connecting to the hub",
+        );
+    }
     let Some(invite_id) = parse_invite_id(&req.invite_id) else {
         return invalid_request("invite_id is not valid base64url");
     };
@@ -187,26 +217,25 @@ pub(super) async fn post_bootstrap(
         warn!(error = %e, "mark_invite_claimed failed; bootstrap proceeding");
     }
 
-    let policy = state.policy.load_full();
-    let Some(pq_pubkey) = policy.pq_public_key(&invite.tenant_id) else {
+    if !state.policy.load().is_known_tenant(&invite.tenant_id) {
         warn!(
             tenant = %invite.tenant_id,
             "bootstrap: tenant not found in ownership policy"
         );
         return internal_error();
-    };
+    }
 
-    let (needs_tcp, needs_udp) = match state
-        .db
-        .tenant_has_service_bindings(&invite.tenant_id, pq_pubkey)
+    // A hub that was a standby until now has not folded the writes it missed.
+    if let Err(e) = super::sync_config(&state).await {
+        warn!(error = %e, "failed to sync config before bootstrap");
+        return internal_error();
+    }
+    let (needs_tcp, needs_udp) = state
+        .config
+        .read()
         .await
-    {
-        Ok((tcp, udp)) => (tcp, udp),
-        Err(e) => {
-            warn!(error = %e, "failed to fetch tenant service bindings for bootstrap");
-            return internal_error();
-        }
-    };
+        .state
+        .service_bindings(&invite.tenant_id);
 
     // Candidate edges (colocated first, then remote) after dedup, before the
     // region filter.
@@ -289,6 +318,16 @@ pub(super) async fn post_bootstrap(
         kid,
         edge_cred_b64,
         edge_cred_sig_b64,
+        regions: allowed,
+        topology: state
+            .topology
+            .borrow()
+            .as_ref()
+            .map(|published| published.topology.clone()),
+        signing_keys: vec![SigningKey {
+            kid: state.signer.kid(),
+            public_key_b64: B64.encode(state.signer.public_key().as_bytes()),
+        }],
     })
 }
 

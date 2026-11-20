@@ -251,6 +251,7 @@ pub struct HubParams {
     pub health_listen_addr: String,
     pub database: crate::config::DatabaseConfig,
     pub route_tx: broadcast::Sender<RouteTable>,
+    pub topology_tx: crate::edge::hub_client::TopologyTx,
     pub static_policy: OwnershipPolicy,
     pub identity: HubIdentity,
     pub operator_api_key: zeroize::Zeroizing<String>,
@@ -402,6 +403,7 @@ impl Hub {
             db,
             is_leader: Arc::clone(&is_leader),
             route_tx: self.p.route_tx.clone(),
+            topology: self.p.topology_tx.clone(),
             policy: arc_swap::ArcSwap::from_pointee(policy),
             identity: HubIdentity {
                 node_id: self.p.identity.node_id,
@@ -445,6 +447,7 @@ impl Hub {
             signup_open: self.p.signup_open,
             max_udp_port_range: self.p.max_udp_port_range,
             port_index: arc_swap::ArcSwap::from_pointee(api::PortIndex::default()),
+            config: tokio::sync::RwLock::default(),
             port_reservations: arc_swap::ArcSwap::from_pointee(Vec::new()),
             oidc,
             webauthn,
@@ -455,13 +458,14 @@ impl Hub {
             rate_limit: self.p.rate_limit,
         });
 
-        // Seed the port index from the DB before serving any upsert; the first
-        // call to `find_port_conflict` would otherwise see an empty index and
-        // let a tenant re-claim someone else's port. After this seed the index
-        // is maintained incrementally on the write path.
-        if let Err(e) = api::refresh_port_index(&state).await {
-            tracing::warn!(error = %e, "initial port_index seed failed");
+        // Seed the config cache and port index from the DB before serving any
+        // upsert; the first call to `find_port_conflict` would otherwise see an
+        // empty index and let a tenant re-claim someone else's port. After this
+        // seed both are maintained incrementally on the write path.
+        if let Err(e) = api::sync_config(&state).await {
+            tracing::warn!(error = %e, "initial config seed failed");
         }
+        api::publish_topology(&state, 0);
         if let Err(e) = api::rebuild_and_broadcast_routes(&state).await {
             tracing::warn!(error = %e, "initial route broadcast failed");
         }

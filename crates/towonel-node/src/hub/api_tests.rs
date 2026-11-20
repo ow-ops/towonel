@@ -1151,6 +1151,46 @@ async fn bootstrap_endpoints(
     endpoint_node_ids(&body)
 }
 
+#[tokio::test]
+async fn bootstrap_carries_the_invites_regions_and_every_live_edge() {
+    let hub = TestHub::start().await;
+    let client = reqwest::Client::new();
+    let ca = inject_edge(&hub, 3, "10.0.0.3:51820", "CA");
+    // A version an edge could not really hold must not become ours.
+    super::api::publish_topology(&hub.state, u64::MAX);
+
+    let token =
+        create_invite_with_region(&hub, &client, "a", &["a.test"], Some("EU"), &["CA"]).await;
+    let (status, body) = post_json(
+        &client,
+        &hub.url("/v1/bootstrap"),
+        json!({
+            "invite_id": B64.encode(token.invite_id),
+            "invite_secret": B64.encode(token.invite_secret),
+        }),
+        None,
+    )
+    .await;
+    assert_eq!(status, 200, "bootstrap: {body}");
+    assert_eq!(body["regions"], json!(["EU", "CA"]));
+    let topology: towonel_common::topology::Topology =
+        serde_json::from_value(body["topology"].clone()).unwrap();
+    let two_days_ms = 2 * 24 * 60 * 60 * 1000;
+    assert!(topology.version < towonel_common::time::now_ms() + two_days_ms);
+    let ca_edge = topology
+        .edges
+        .iter()
+        .find(|e| e.id.to_string() == ca)
+        .expect("the CA edge is listed even though the invite prefers EU");
+    assert_eq!(ca_edge.region.as_deref(), Some("CA"));
+    assert_eq!(topology.edges.len(), 2, "colocated edge plus the CA one");
+    assert_eq!(body["signing_keys"][0]["kid"], hub.state.signer.kid());
+    assert_eq!(
+        body["signing_keys"][0]["public_key_b64"],
+        B64.encode(hub.state.signer.public_key().as_bytes())
+    );
+}
+
 // The colocated test edge serves the default region (EU).
 
 #[tokio::test]
@@ -1395,6 +1435,114 @@ async fn bootstrap_rejects_missing_invite() {
     // attacker can't enumerate which invite IDs exist.
     assert_eq!(status, 401);
     assert_eq!(body["error"]["code"], "unauthorized");
+}
+
+#[tokio::test]
+async fn entries_written_by_another_replica_reach_the_route_table() {
+    // Entries that land in the DB without going through this hub's write
+    // path (another replica was leader) must still show up on the next build.
+    use super::live_agents::SourceKey;
+
+    let hub = TestHub::start().await;
+    let client = reqwest::Client::new();
+
+    let token = create_invite(&hub, &client, "alice", &["app.alice.test"]).await;
+    let tenant = tenant_from_token(&token);
+    let agent = AgentKeypair::generate();
+    assert!(
+        super::api::current_route_table(&hub.state)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    for (seq, op) in [
+        (
+            1,
+            ConfigOp::UpsertHostname {
+                hostname: "app.alice.test".into(),
+            },
+        ),
+        (
+            2,
+            ConfigOp::UpsertAgent {
+                agent_id: agent.id(),
+            },
+        ),
+    ] {
+        let payload = ConfigPayload {
+            version: 1,
+            tenant_id: tenant.id(),
+            sequence: seq,
+            timestamp: 1_700_000_000_000,
+            op,
+        };
+        let entry = SignedConfigEntry::sign(&payload, &tenant).unwrap();
+        hub.state.db.insert(&entry, seq).await.unwrap();
+    }
+    assert!(hub.state.live_agents.record_added(
+        SourceKey::Remote([0xAB; 32], 0),
+        tenant.id(),
+        agent.id()
+    ));
+
+    let table = super::api::current_route_table(&hub.state).await.unwrap();
+    assert!(
+        table
+            .lookup("app.alice.test")
+            .unwrap()
+            .contains(&agent.id())
+    );
+    assert_eq!(hub.state.config.read().await.version, 2);
+}
+
+#[tokio::test]
+async fn an_entry_below_the_tenants_newest_sequence_is_refused() {
+    let hub = TestHub::start().await;
+    let client = reqwest::Client::new();
+    let token = create_invite(&hub, &client, "alice", &["app.alice.test"]).await;
+    let tenant = tenant_from_token(&token);
+    let agent = AgentKeypair::generate();
+
+    let mut statuses = Vec::new();
+    for (seq, op) in [
+        (
+            2,
+            ConfigOp::UpsertAgent {
+                agent_id: agent.id(),
+            },
+        ),
+        (
+            1,
+            ConfigOp::RevokeAgent {
+                agent_id: agent.id(),
+            },
+        ),
+    ] {
+        let payload = ConfigPayload {
+            version: 1,
+            tenant_id: tenant.id(),
+            sequence: seq,
+            timestamp: 1_700_000_000_000,
+            op,
+        };
+        let entry = SignedConfigEntry::sign(&payload, &tenant).unwrap();
+        let mut body = Vec::new();
+        ciborium::into_writer(&entry, &mut body).unwrap();
+        let resp = client
+            .post(hub.url("/v1/entries"))
+            .header(reqwest::header::CONTENT_TYPE, "application/cbor")
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+        statuses.push(resp.status().as_u16());
+    }
+
+    assert_eq!(statuses, [200, 409]);
+    let table = super::api::current_route_table(&hub.state).await.unwrap();
+    assert!(table.signed_agents().contains(&agent.id()));
+    assert_eq!(hub.state.db.entry_log_version().await.unwrap(), 1);
 }
 
 #[tokio::test]

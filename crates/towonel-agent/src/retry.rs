@@ -110,7 +110,7 @@ fn escalate(base: Duration, max: Duration, failures: u32) -> Duration {
 }
 
 /// Spread a delay by ±15 % so concurrent supervisors don't fire in lockstep.
-fn jitter(d: Duration) -> Duration {
+pub fn jitter(d: Duration) -> Duration {
     d.mul_f64(fastrand::f64().mul_add(0.30, 0.85))
 }
 

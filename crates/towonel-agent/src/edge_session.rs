@@ -1,5 +1,7 @@
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
@@ -8,19 +10,24 @@ use iroh::endpoint::{
 };
 use iroh::{Endpoint, EndpointAddr, RelayUrl, TransportAddr};
 use tokio::net::{TcpStream, lookup_host};
+use tokio::sync::watch;
 use tokio::task::JoinSet;
 use tokio_stream::StreamExt as _;
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, debug, error, info, info_span, warn};
 
 use towonel_common::edge_cred::AuthFrame;
+use towonel_common::metrics::GaugeGuard;
 use towonel_common::protocol::ALPN_TUNNEL;
+use towonel_common::topology::{SILENCE_LIMIT, SignedTopology, read_topology};
 use towonel_common::transport::TunnelConn;
 use towonel_common::transport::tls::TlsDialer;
-use towonel_common::tunnel::{CONTROL_STATUS_OK, read_control_status, write_control_prefix};
+use towonel_common::tunnel::{
+    CONTROL_OPCODE_TOPOLOGY, CONTROL_STATUS_OK, read_control_status, write_control_prefix,
+};
 
 use crate::metrics::AgentMetrics;
-use crate::stateless::{CachedEdgeCred, EdgeContact};
+use crate::stateless::{CachedEdgeCred, EdgeContact, EdgeSet};
 use crate::tunnel::{self, ServiceMap};
 
 const PRESENT_CRED_TIMEOUT: Duration = Duration::from_secs(5);
@@ -84,15 +91,15 @@ impl TransportMemory {
 
 struct ActiveSupervisor {
     token: CancellationToken,
-    /// Addresses this supervisor was spawned with; a change for the same edge
-    /// triggers a respawn.
-    addrs: Vec<String>,
-    tls_addrs: Vec<String>,
+    /// What the supervisor dials next. A change does not disturb a session
+    /// that is up; it takes effect on the next redial.
+    contact: watch::Sender<EdgeContact>,
+    live: Arc<AtomicBool>,
 }
 
-/// Per-edge supervisors reconciled against the hub's trusted-edge set. Each owns
-/// a child of the process shutdown token, so an edge leaving the set is stopped
-/// on its own without disturbing the others.
+/// Per-edge supervisors reconciled against the hub's edge set. Each owns a
+/// child of the process shutdown token, so one edge is stopped on its own
+/// without disturbing the others.
 pub struct SupervisorPool {
     endpoint: Endpoint,
     service_map: Arc<ServiceMap>,
@@ -100,8 +107,11 @@ pub struct SupervisorPool {
     edge_cred: Arc<arc_swap::ArcSwapOption<CachedEdgeCred>>,
     relay_urls: Arc<Vec<RelayUrl>>,
     tls: TlsDialer,
+    pinned: Option<HashSet<iroh::EndpointId>>,
     shutdown: CancellationToken,
-    active: std::collections::HashMap<iroh::EndpointId, ActiveSupervisor>,
+    edges: EdgeSet,
+    hub_check_wanted: bool,
+    active: HashMap<iroh::EndpointId, ActiveSupervisor>,
     tasks: JoinSet<()>,
     events: tokio::sync::mpsc::UnboundedReceiver<SessionEvent>,
     event_tx: tokio::sync::mpsc::UnboundedSender<SessionEvent>,
@@ -110,9 +120,16 @@ pub struct SupervisorPool {
 pub enum SessionEvent {
     Connected,
     ConnectTimeouts,
+    /// An edge pushed an edge set; whether the hub signed it is not yet known.
+    /// The permit is the session's one slot for a set the pool has not taken.
+    Topology(SignedTopology, tokio::sync::OwnedSemaphorePermit),
 }
 
 impl SupervisorPool {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "process-wide handles the supervisors share"
+    )]
     pub fn new(
         endpoint: &Endpoint,
         service_map: &Arc<ServiceMap>,
@@ -120,6 +137,7 @@ impl SupervisorPool {
         edge_cred: &Arc<arc_swap::ArcSwapOption<CachedEdgeCred>>,
         relay_urls: Vec<RelayUrl>,
         tls: TlsDialer,
+        pinned: Option<HashSet<iroh::EndpointId>>,
         shutdown: &CancellationToken,
     ) -> Self {
         let (event_tx, events) = tokio::sync::mpsc::unbounded_channel();
@@ -130,8 +148,11 @@ impl SupervisorPool {
             edge_cred: Arc::clone(edge_cred),
             relay_urls: Arc::new(relay_urls),
             tls,
+            pinned,
             shutdown: shutdown.clone(),
-            active: std::collections::HashMap::new(),
+            edges: EdgeSet::default(),
+            hub_check_wanted: false,
+            active: HashMap::new(),
             tasks: JoinSet::new(),
             events,
             event_tx,
@@ -142,43 +163,100 @@ impl SupervisorPool {
         self.events.recv().await
     }
 
-    /// Match running supervisors to `contacts`: stop supervisors whose edge is
-    /// no longer in the set, and start one for each newly-present dialable edge.
-    /// Edges already supervised are left running.
-    pub fn reconcile(&mut self, contacts: &[EdgeContact]) {
+    /// True from a pushed set that was older than the one held, or not
+    /// verifiable, until the hub answers.
+    pub const fn wants_hub_check(&self) -> bool {
+        self.hub_check_wanted
+    }
+
+    /// True while an edge is pushing the edge set, so the hub need not be asked.
+    pub fn has_topology_stream(&self) -> bool {
+        self.metrics.topology_streams.get() > 0
+    }
+
+    /// Take the hub's own answer. It is only asked while no edge pushes, so it
+    /// replaces whatever is held.
+    pub fn apply(&mut self, edges: EdgeSet) {
+        if edges.topology.version != self.edges.topology.version {
+            info!(
+                version = edges.topology.version,
+                edges = edges.topology.edges.len(),
+                "edge set taken from the hub"
+            );
+        }
+        self.edges = edges;
+        self.hub_check_wanted = false;
+        self.reconcile();
+    }
+
+    /// Take an edge set an edge pushed, if the hub signed it and none newer is
+    /// held: with several edges pushing, one can lag behind another.
+    pub fn apply_topology(&mut self, signed: &SignedTopology) {
+        let verified = self
+            .edges
+            .keys
+            .get(&signed.kid)
+            .and_then(|key| signed.verify(key));
+        let Some(topology) = verified else {
+            // The hub may have changed its key since this agent last asked.
+            if !self.hub_check_wanted {
+                warn!(
+                    kid = signed.kid,
+                    "pushed edge set is not signed by a key the hub gave; asking the hub"
+                );
+            }
+            self.hub_check_wanted = true;
+            return;
+        };
+        if topology.version > self.edges.topology.version {
+            info!(
+                version = topology.version,
+                edges = topology.edges.len(),
+                "edge set pushed by an edge"
+            );
+        }
+        if topology.version < self.edges.topology.version {
+            // Either that edge lags, or the set held here is wrong: the hub's
+            // own answer settles it.
+            self.hub_check_wanted = true;
+        } else {
+            self.edges.topology = topology;
+        }
+        self.reconcile();
+    }
+
+    /// Start, re-address and stop supervisors to match the edge set (see [`plan`]).
+    /// Call again when a session comes up: that is what lets one be given up.
+    pub fn reconcile(&mut self) {
         // Drain supervisors that have exited (only happens on cancellation),
         // so the `tasks` set doesn't accumulate finished handles.
         while self.tasks.try_join_next().is_some() {}
 
-        let desired: std::collections::HashMap<iroh::EndpointId, &EdgeContact> =
-            contacts.iter().map(|c| (c.id, c)).collect();
-
-        // Stop supervisors whose edge left the set, or whose advertised
-        // addresses changed — the spawn loop below then redials the new ones.
-        let stale: Vec<iroh::EndpointId> = self
+        let live: HashMap<iroh::EndpointId, bool> = self
             .active
             .iter()
-            .filter_map(|(id, sup)| {
-                // Set comparison: hub snapshots aren't canonically ordered, so
-                // a reordered-but-equal address list must not respawn a healthy
-                // supervisor.
-                let keep = matches!(
-                    desired.get(id),
-                    Some(c) if same_addr_set(&c.addrs, &sup.addrs)
-                        && same_addr_set(&c.tls_addrs, &sup.tls_addrs)
-                );
-                (!keep).then_some(*id)
-            })
+            .map(|(id, sup)| (*id, sup.live.load(Ordering::Relaxed)))
             .collect();
-        for id in stale {
+        let Plan { wanted, stop } = plan(&self.edges, self.pinned.as_ref(), &live);
+
+        for (id, reason) in stop {
             if let Some(sup) = self.active.remove(&id) {
-                info!(edge = %id.fmt_short(), "edge left the set or changed address; stopping supervisor");
+                info!(edge = %id.fmt_short(), reason, "stopping edge supervisor");
                 sup.token.cancel();
             }
         }
 
-        for contact in contacts {
-            if self.active.contains_key(&contact.id) {
+        for contact in wanted {
+            if let Some(sup) = self.active.get(&contact.id) {
+                // Set comparison: hub snapshots aren't canonically ordered.
+                sup.contact.send_if_modified(|current| {
+                    let same = same_addr_set(&current.addrs, &contact.addrs)
+                        && same_addr_set(&current.tls_addrs, &contact.tls_addrs);
+                    if !same {
+                        *current = contact.clone();
+                    }
+                    !same
+                });
                 continue;
             }
             if contact.addrs.is_empty()
@@ -193,10 +271,12 @@ impl SupervisorPool {
             }
             let token = self.shutdown.child_token();
             let id = contact.id;
+            let live = Arc::new(AtomicBool::new(false));
+            let (contact_tx, contact_rx) = watch::channel(contact);
             info!(edge = %id.fmt_short(), "starting edge supervisor");
             self.tasks.spawn(supervise(
                 self.endpoint.clone(),
-                contact.clone(),
+                contact_rx,
                 Arc::clone(&self.service_map),
                 Arc::clone(&self.metrics),
                 token.clone(),
@@ -204,13 +284,14 @@ impl SupervisorPool {
                 Arc::clone(&self.relay_urls),
                 self.tls.clone(),
                 self.event_tx.clone(),
+                Arc::clone(&live),
             ));
             self.active.insert(
                 id,
                 ActiveSupervisor {
                     token,
-                    addrs: contact.addrs.clone(),
-                    tls_addrs: contact.tls_addrs.clone(),
+                    contact: contact_tx,
+                    live,
                 },
             );
         }
@@ -225,10 +306,62 @@ impl SupervisorPool {
     }
 }
 
+struct Plan {
+    wanted: Vec<EdgeContact>,
+    /// Each with why, for the log.
+    stop: Vec<(iroh::EndpointId, &'static str)>,
+}
+
+/// Which edges to supervise, and which running supervisors (`live` says
+/// whether each holds a session) to stop.
+///
+/// A session that is up is only given up for an edge the hub lists but this
+/// agent should not be on (wrong region, or not pinned), and only once a wanted
+/// edge is up. An edge the hub does not list has not necessarily gone: a hub
+/// that just restarted lists only the edges that have redialed it so far.
+fn plan(
+    edges: &EdgeSet,
+    pinned: Option<&HashSet<iroh::EndpointId>>,
+    live: &HashMap<iroh::EndpointId, bool>,
+) -> Plan {
+    let listed = |id: &iroh::EndpointId| edges.topology.edges.iter().find(|e| e.id == *id);
+    let in_region = || {
+        let wanted = edges.topology.wanted(&edges.regions);
+        wanted.into_iter().map(EdgeContact::from).collect()
+    };
+    // An unlisted pinned edge can still be reached through a relay.
+    let unlisted = |id: &iroh::EndpointId| EdgeContact {
+        id: *id,
+        addrs: Vec::new(),
+        tls_addrs: Vec::new(),
+    };
+    let wanted: Vec<EdgeContact> = pinned.map_or_else(in_region, |pinned| {
+        pinned
+            .iter()
+            .map(|id| listed(id).map_or_else(|| unlisted(id), EdgeContact::from))
+            .collect()
+    });
+    let replaced = wanted.iter().any(|c| live.get(&c.id) == Some(&true));
+    let stop = live
+        .iter()
+        .filter(|(id, _)| !wanted.iter().any(|c| c.id == **id))
+        .filter_map(|(id, is_live)| {
+            if !is_live {
+                Some((*id, "not connected and no longer wanted"))
+            } else if replaced && listed(id).is_some() {
+                Some((*id, "not wanted and a wanted edge is connected"))
+            } else {
+                None
+            }
+        })
+        .collect();
+    Plan { wanted, stop }
+}
+
 /// Order-insensitive equality of two advertised-address lists.
 fn same_addr_set(a: &[String], b: &[String]) -> bool {
     a.len() == b.len() && {
-        let set: std::collections::HashSet<&str> = a.iter().map(String::as_str).collect();
+        let set: HashSet<&str> = a.iter().map(String::as_str).collect();
         b.iter().all(|x| set.contains(x.as_str()))
     }
 }
@@ -239,7 +372,7 @@ fn same_addr_set(a: &[String], b: &[String]) -> bool {
 )]
 async fn supervise(
     endpoint: Endpoint,
-    contact: EdgeContact,
+    contact: watch::Receiver<EdgeContact>,
     service_map: Arc<ServiceMap>,
     metrics: Arc<AgentMetrics>,
     shutdown: CancellationToken,
@@ -247,8 +380,9 @@ async fn supervise(
     relay_urls: Arc<Vec<RelayUrl>>,
     tls: TlsDialer,
     events: tokio::sync::mpsc::UnboundedSender<SessionEvent>,
+    live: Arc<AtomicBool>,
 ) {
-    let edge_label = contact.id.fmt_short().to_string();
+    let edge_label = contact.borrow().id.fmt_short().to_string();
     let memory = TransportMemory::new(QUIC_RETRY_AFTER);
     let timeouts = std::sync::atomic::AtomicU32::new(0);
     let span = info_span!("edge_supervisor", edge = %edge_label);
@@ -266,6 +400,7 @@ async fn supervise(
         memory,
         events,
         timeouts,
+        live,
     ) = (
         &endpoint,
         &contact,
@@ -277,6 +412,7 @@ async fn supervise(
         &memory,
         &events,
         &timeouts,
+        &live,
     );
     crate::retry::supervise(
         &format!("edge:{edge_label}"),
@@ -284,6 +420,7 @@ async fn supervise(
         REDIAL_DELAY,
         REDIAL_MAX_DELAY,
         || async move {
+            let contact = &contact.borrow().clone();
             let session = match dial_and_serve(
                 endpoint,
                 contact,
@@ -295,6 +432,7 @@ async fn supervise(
                 memory,
                 events,
                 timeouts,
+                live,
             )
             .await
             {
@@ -539,6 +677,7 @@ async fn dial_and_serve(
     memory: &TransportMemory,
     events: &tokio::sync::mpsc::UnboundedSender<SessionEvent>,
     timeouts: &std::sync::atomic::AtomicU32,
+    live: &Arc<AtomicBool>,
 ) -> anyhow::Result<Duration> {
     let dialed = match dial(endpoint, contact, relay_urls, tls, memory).await {
         Ok(dialed) => dialed,
@@ -571,7 +710,22 @@ async fn dial_and_serve(
         .inc();
     // Marks the session live; resets the gauge and aborts the path watcher on
     // Drop, surviving a mid-session cancellation (see `EdgeSessionGuard`).
-    let mut guard = EdgeSessionGuard::live(Arc::clone(metrics), edge_label.clone(), conn.clone());
+    let mut guard = EdgeSessionGuard::live(
+        Arc::clone(metrics),
+        edge_label.clone(),
+        conn.clone(),
+        Arc::clone(live),
+    );
+    let follow = |conn: &TunnelConn| {
+        let following = follow_topology(
+            conn.clone(),
+            events.clone(),
+            Arc::clone(metrics),
+            SILENCE_LIMIT,
+        );
+        Some(tokio::spawn(following))
+    };
+    guard.topology = follow(&conn);
     drop(events.send(SessionEvent::Connected));
     guard.path_watcher = quic.map(|quic| watch_path(&quic, &edge_label, metrics));
     if transport == Transport::Tls {
@@ -608,6 +762,7 @@ async fn dial_and_serve(
                 conn = moved;
                 transport = Transport::Quic;
                 guard.switch_to(conn.clone(), Some(watch_path(&quic, &edge_label, metrics)));
+                guard.topology = follow(&conn);
             }
             () = serving => break,
         }
@@ -636,11 +791,19 @@ struct EdgeSessionGuard {
     metrics: Arc<AgentMetrics>,
     edge_label: String,
     path_watcher: Option<tokio::task::JoinHandle<()>>,
+    topology: Option<tokio::task::JoinHandle<()>>,
     conn: TunnelConn,
+    live: Arc<AtomicBool>,
 }
 
 impl EdgeSessionGuard {
-    fn live(metrics: Arc<AgentMetrics>, edge_label: String, conn: TunnelConn) -> Self {
+    fn live(
+        metrics: Arc<AgentMetrics>,
+        edge_label: String,
+        conn: TunnelConn,
+        live: Arc<AtomicBool>,
+    ) -> Self {
+        live.store(true, Ordering::Relaxed);
         metrics.quic.insert(&edge_label, &conn);
         metrics
             .edge_session_state
@@ -650,7 +813,9 @@ impl EdgeSessionGuard {
             metrics,
             edge_label,
             path_watcher: None,
+            topology: None,
             conn,
+            live,
         }
     }
 }
@@ -665,11 +830,18 @@ impl EdgeSessionGuard {
         if let Some(old) = std::mem::replace(&mut self.path_watcher, path_watcher) {
             old.abort();
         }
+        if let Some(old) = self.topology.take() {
+            old.abort();
+        }
     }
 }
 
 impl Drop for EdgeSessionGuard {
     fn drop(&mut self) {
+        self.live.store(false, Ordering::Relaxed);
+        if let Some(h) = self.topology.take() {
+            h.abort();
+        }
         self.metrics
             .quic
             .remove(&self.edge_label, self.conn.stable_id());
@@ -682,6 +854,63 @@ impl Drop for EdgeSessionGuard {
             .edge_session_state
             .with_label_values(&[&self.edge_label])
             .set(0);
+    }
+}
+
+/// Asks the edge to push the hub's edge set and forwards each one, for as long
+/// as the session lasts. When the edge has none to give (no hub link, or it or
+/// its hub predates this), or a stream ends, it asks again after `patience`;
+/// a stream silent for `patience` is replaced at once. The hub is polled
+/// whenever no stream is open.
+async fn follow_topology(
+    conn: TunnelConn,
+    events: tokio::sync::mpsc::UnboundedSender<SessionEvent>,
+    metrics: Arc<AgentMetrics>,
+    patience: Duration,
+) {
+    // An edge is not trusted to pace itself: without this it could queue sets
+    // faster than the pool verifies them.
+    let untaken = Arc::new(tokio::sync::Semaphore::new(1));
+    'subscribe: loop {
+        let subscribe = async {
+            let (mut send, mut recv) = conn.open_bi().await?;
+            write_control_prefix(&mut send).await?;
+            send.write_all(&[CONTROL_OPCODE_TOPOLOGY]).await?;
+            send.finish().await?;
+            let status = read_control_status(&mut recv).await?;
+            std::io::Result::Ok((status == CONTROL_STATUS_OK).then_some(recv))
+        };
+        match tokio::time::timeout(PRESENT_CRED_TIMEOUT, subscribe).await {
+            Ok(Ok(Some(mut recv))) => {
+                let _streaming = GaugeGuard::inc(&metrics.topology_streams);
+                loop {
+                    match tokio::time::timeout(patience, read_topology(&mut recv)).await {
+                        Ok(Ok(Some(topology))) => {
+                            let Ok(slot) = Arc::clone(&untaken).acquire_owned().await else {
+                                return;
+                            };
+                            if events.send(SessionEvent::Topology(topology, slot)).is_err() {
+                                return;
+                            }
+                        }
+                        Ok(Ok(None)) => {}
+                        Ok(Err(_)) => break,
+                        Err(_) => {
+                            warn!("edge stopped pushing topology; subscribing again");
+                            continue 'subscribe;
+                        }
+                    }
+                }
+            }
+            Ok(Ok(None)) => debug!("edge has no topology to push; the hub is polled instead"),
+            // The session is gone.
+            Ok(Err(e)) => {
+                debug!(error = %e, "subscribing to topology failed");
+                return;
+            }
+            Err(_) => debug!("subscribing to topology timed out"),
+        }
+        tokio::time::sleep(patience).await;
     }
 }
 
@@ -795,6 +1024,8 @@ fn is_routable(addr: &SocketAddr) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use towonel_common::topology::{Topology, TopologyEdge};
+
     use super::*;
 
     #[tokio::test]
@@ -973,6 +1204,7 @@ mod tests {
                     &memory,
                     &tokio::sync::mpsc::unbounded_channel().0,
                     &std::sync::atomic::AtomicU32::new(0),
+                    &Arc::new(AtomicBool::new(false)),
                 )
                 .await
             }
@@ -1093,6 +1325,7 @@ mod tests {
             &memory,
             &tokio::sync::mpsc::unbounded_channel().0,
             &std::sync::atomic::AtomicU32::new(0),
+            &Arc::new(AtomicBool::new(false)),
         )
         .await
         .unwrap_err();
@@ -1140,6 +1373,7 @@ mod tests {
             &memory,
             &tokio::sync::mpsc::unbounded_channel().0,
             &std::sync::atomic::AtomicU32::new(0),
+            &Arc::new(AtomicBool::new(false)),
         )
         .await
         .unwrap_err();
@@ -1190,6 +1424,7 @@ mod tests {
                     &memory,
                     &tokio::sync::mpsc::unbounded_channel().0,
                     &std::sync::atomic::AtomicU32::new(0),
+                    &Arc::new(AtomicBool::new(false)),
                 )
                 .await
             }
@@ -1287,18 +1522,353 @@ mod tests {
         let tls = TlsDialer::new(
             towonel_common::transport::tls::TlsIdentity::new(&iroh::SecretKey::generate()).unwrap(),
         );
-        let mut pool =
-            SupervisorPool::new(&agent, &services, &metrics, &cred, vec![], tls, &shutdown);
-        pool.reconcile(&[EdgeContact {
+        let mut pool = SupervisorPool::new(
+            &agent,
+            &services,
+            &metrics,
+            &cred,
+            vec![],
+            tls,
+            None,
+            &shutdown,
+        );
+        let only_edge = TopologyEdge {
             id: edge.id(),
-            addrs: edge
+            addresses: edge
                 .bound_sockets()
                 .iter()
                 .map(ToString::to_string)
                 .collect(),
-            tls_addrs: Vec::new(),
-        }]);
+            tls_addresses: Vec::new(),
+            region: None,
+        };
+        pool.apply(EdgeSet {
+            topology: Topology {
+                version: 1,
+                edges: vec![only_edge],
+            },
+            regions: Vec::new(),
+            keys: HashMap::from([(HUB_KID, hub_key(HUB_KID).1)]),
+        });
         (edge, agent, origin, metrics, pool)
+    }
+
+    #[tokio::test]
+    async fn a_live_session_outlives_an_edge_set_that_omits_its_edge() {
+        const SETUP: Duration = Duration::from_secs(3);
+
+        let (edge, _agent, _origin, metrics, mut pool) = cancellation_fixture("keep.test").await;
+        let peer =
+            tokio::time::timeout(SETUP, async { edge.accept().await.unwrap().await.unwrap() })
+                .await
+                .unwrap();
+        tokio::time::timeout(SETUP, async {
+            while !matches!(pool.next_event().await, Some(SessionEvent::Connected)) {}
+        })
+        .await
+        .unwrap();
+
+        // What a hub that just restarted says before this edge has redialed it.
+        pool.apply_topology(&pushed(2, HUB_KID));
+        assert_eq!(pool.edges.topology.version, 2);
+        assert!(pool.active.contains_key(&edge.id()));
+        assert_eq!(metrics.active_edge_sessions(), 1);
+        assert!(peer.close_reason().is_none());
+
+        // An older set, as a slower edge might still push, is not taken, and
+        // the hub is asked which is right.
+        assert!(!pool.wants_hub_check());
+        pool.apply_topology(&pushed(1, HUB_KID));
+        assert_eq!(pool.edges.topology.version, 2);
+        assert!(pool.wants_hub_check());
+
+        // The request stands until the hub has answered.
+        pool.apply(EdgeSet::default());
+        assert!(!pool.wants_hub_check());
+    }
+
+    #[tokio::test]
+    async fn a_pushed_set_the_hub_did_not_sign_is_refused() {
+        let (_edge, _agent, _origin, _metrics, mut pool) = cancellation_fixture("sig.test").await;
+
+        // Signed, but by a key the hub never gave this agent: what an edge
+        // making up its own edge set would have to send.
+        let other_kid = HUB_KID + 1;
+        pool.apply_topology(&pushed(u64::MAX, other_kid));
+        assert_eq!(pool.edges.topology.version, 1);
+        assert!(pool.wants_hub_check());
+        pool.hub_check_wanted = false;
+
+        // The hub's kid on someone else's signature fares no better.
+        let mut relabelled = pushed(u64::MAX, other_kid);
+        relabelled.kid = HUB_KID;
+        pool.apply_topology(&relabelled);
+        assert_eq!(pool.edges.topology.version, 1);
+        assert!(pool.wants_hub_check());
+    }
+
+    const HUB_KID: u32 = 7;
+
+    /// The key pair behind `kid` in these tests.
+    fn hub_key(
+        kid: u32,
+    ) -> (
+        fips204::ml_dsa_65::PrivateKey,
+        towonel_common::identity::PqPublicKey,
+    ) {
+        use fips204::traits::{KeyGen, SerDes};
+        let seed = [u8::try_from(kid).unwrap(); 32];
+        let (public, private) = fips204::ml_dsa_65::KG::keygen_from_seed(&seed);
+        let public = towonel_common::identity::PqPublicKey::from_bytes(public.into_bytes());
+        (private, public)
+    }
+
+    /// An empty edge set at `version`, signed by `kid`'s key.
+    fn pushed(version: u64, kid: u32) -> SignedTopology {
+        let topology = Topology {
+            version,
+            edges: Vec::new(),
+        };
+        SignedTopology::sign(&topology, kid, &hub_key(kid).0).unwrap()
+    }
+
+    /// A connected (agent, edge) TLS pair.
+    async fn tls_session() -> (TunnelConn, towonel_common::transport::tls::TlsConn) {
+        use tokio::net::TcpListener;
+        use towonel_common::transport::tls::{TlsIdentity, TlsListener};
+
+        let edge = TlsIdentity::new(&iroh::SecretKey::generate()).unwrap();
+        let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = socket.local_addr().unwrap();
+        let listener = TlsListener::new(&edge).unwrap();
+        let accepted = tokio::spawn(async move {
+            let (tcp, _) = socket.accept().await.unwrap();
+            listener.accept(tcp).await.unwrap()
+        });
+        let dialer = TlsDialer::new(TlsIdentity::new(&iroh::SecretKey::generate()).unwrap());
+        let tcp = TcpStream::connect(addr).await.unwrap();
+        let conn = dialer.connect(tcp, edge.id()).await.unwrap();
+        (TunnelConn::Tls(conn), accepted.await.unwrap())
+    }
+
+    /// Plays the edge's half of a topology subscription.
+    async fn answer_subscription(
+        edge: &towonel_common::transport::tls::TlsConn,
+        status: u8,
+    ) -> towonel_common::transport::tls::TlsSend {
+        use towonel_common::tunnel::{read_control_prefix, write_control_status};
+
+        let (mut send, mut recv) = edge.accept_bi().await.unwrap();
+        read_control_prefix(&mut recv).await.unwrap();
+        assert_eq!(
+            recv.read_to_end(16).await.unwrap(),
+            [CONTROL_OPCODE_TOPOLOGY]
+        );
+        write_control_status(&mut send, status).await.unwrap();
+        send
+    }
+
+    #[tokio::test]
+    async fn pushed_topology_reaches_the_pool_and_counts_as_a_stream() {
+        use towonel_common::topology::write_topology;
+
+        const WAIT: Duration = Duration::from_secs(5);
+        let (agent, edge) = tls_session().await;
+        let metrics = Arc::new(AgentMetrics::new());
+        let (events, mut received) = tokio::sync::mpsc::unbounded_channel();
+        let following = tokio::spawn(follow_topology(
+            agent,
+            events,
+            Arc::clone(&metrics),
+            SILENCE_LIMIT,
+        ));
+
+        let mut send = answer_subscription(&edge, CONTROL_STATUS_OK).await;
+        for version in [1, 2] {
+            let signed = pushed(version, HUB_KID);
+            write_topology(&mut send, &signed).await.unwrap();
+            let Some(SessionEvent::Topology(got, _)) =
+                tokio::time::timeout(WAIT, received.recv()).await.unwrap()
+            else {
+                panic!("not a topology event");
+            };
+            assert_eq!(got, signed);
+        }
+        assert_eq!(metrics.topology_streams.get(), 1);
+
+        edge.close(0, b"bye");
+        tokio::time::timeout(WAIT, async {
+            while metrics.topology_streams.get() != 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        following.abort();
+    }
+
+    #[tokio::test]
+    async fn sets_the_pool_has_not_taken_do_not_pile_up() {
+        use towonel_common::topology::write_topology;
+
+        let (agent, edge) = tls_session().await;
+        let metrics = Arc::new(AgentMetrics::new());
+        let (events, mut received) = tokio::sync::mpsc::unbounded_channel();
+        let _following = tokio::spawn(follow_topology(agent, events, metrics, SILENCE_LIMIT));
+
+        let mut send = answer_subscription(&edge, CONTROL_STATUS_OK).await;
+        for version in 1..=5 {
+            write_topology(&mut send, &pushed(version, HUB_KID))
+                .await
+                .unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(received.len(), 1);
+
+        // Taking one makes room for the next.
+        drop(received.recv().await);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(received.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_silent_stream_is_dropped_and_asked_for_again() {
+        use towonel_common::topology::write_topology;
+
+        const WAIT: Duration = Duration::from_secs(5);
+        let (agent, edge) = tls_session().await;
+        let metrics = Arc::new(AgentMetrics::new());
+        let (events, mut received) = tokio::sync::mpsc::unbounded_channel();
+        let _following = tokio::spawn(follow_topology(
+            agent,
+            events,
+            Arc::clone(&metrics),
+            Duration::from_millis(100),
+        ));
+
+        let mut stalled = answer_subscription(&edge, CONTROL_STATUS_OK).await;
+        write_topology(&mut stalled, &pushed(0, HUB_KID))
+            .await
+            .unwrap();
+        tokio::time::timeout(WAIT, received.recv()).await.unwrap();
+
+        // Nothing more on that stream: the agent opens a second one.
+        let mut fresh = tokio::time::timeout(WAIT, answer_subscription(&edge, CONTROL_STATUS_OK))
+            .await
+            .unwrap();
+        let newer = pushed(1, HUB_KID);
+        write_topology(&mut fresh, &newer).await.unwrap();
+        let Some(SessionEvent::Topology(got, _)) =
+            tokio::time::timeout(WAIT, received.recv()).await.unwrap()
+        else {
+            panic!("not a topology event");
+        };
+        assert_eq!(got, newer);
+    }
+
+    #[tokio::test]
+    async fn an_edge_without_topology_is_asked_again() {
+        use towonel_common::tunnel::CONTROL_STATUS_NOT_IMPLEMENTED;
+
+        const WAIT: Duration = Duration::from_secs(5);
+        let (agent, edge) = tls_session().await;
+        let metrics = Arc::new(AgentMetrics::new());
+        let (events, mut received) = tokio::sync::mpsc::unbounded_channel();
+        let _following = tokio::spawn(follow_topology(
+            agent,
+            events,
+            Arc::clone(&metrics),
+            Duration::from_millis(100),
+        ));
+
+        let _declined = answer_subscription(&edge, CONTROL_STATUS_NOT_IMPLEMENTED).await;
+        assert_eq!(metrics.topology_streams.get(), 0);
+        assert!(received.try_recv().is_err());
+
+        // Its hub link may come up later.
+        let _again = tokio::time::timeout(WAIT, answer_subscription(&edge, CONTROL_STATUS_OK))
+            .await
+            .unwrap();
+    }
+
+    fn listed(seed: u8, region: &str) -> TopologyEdge {
+        TopologyEdge {
+            id: iroh::SecretKey::from([seed; 32]).public(),
+            addresses: vec![format!("192.0.2.{seed}:51820")],
+            tls_addresses: Vec::new(),
+            region: Some(region.to_string()),
+        }
+    }
+
+    fn edge_set(edges: Vec<TopologyEdge>, regions: &[&str]) -> EdgeSet {
+        EdgeSet {
+            topology: Topology { version: 1, edges },
+            regions: regions.iter().map(ToString::to_string).collect(),
+            keys: HashMap::new(),
+        }
+    }
+
+    fn ids(contacts: &[EdgeContact]) -> HashSet<iroh::EndpointId> {
+        contacts.iter().map(|c| c.id).collect()
+    }
+
+    fn stopped(plan: &Plan) -> Vec<iroh::EndpointId> {
+        plan.stop.iter().map(|(id, _)| *id).collect()
+    }
+
+    #[test]
+    fn an_unlisted_edge_is_stopped_only_once_its_session_is_down() {
+        let gone = listed(9, "EU").id;
+        let edges = edge_set(vec![listed(1, "EU")], &["EU"]);
+
+        let up = plan(&edges, None, &HashMap::from([(gone, true)]));
+        assert_eq!(stopped(&up), Vec::<iroh::EndpointId>::new());
+
+        let down = plan(&edges, None, &HashMap::from([(gone, false)]));
+        assert_eq!(stopped(&down), vec![gone]);
+    }
+
+    #[test]
+    fn an_out_of_region_session_is_kept_until_an_in_region_one_is_up() {
+        let (eu, na) = (listed(1, "EU"), listed(2, "NA"));
+        let edges = edge_set(vec![eu.clone(), na.clone()], &["EU"]);
+
+        let waiting = plan(
+            &edges,
+            None,
+            &HashMap::from([(na.id, true), (eu.id, false)]),
+        );
+        assert_eq!(ids(&waiting.wanted), HashSet::from([eu.id]));
+        assert_eq!(stopped(&waiting), Vec::<iroh::EndpointId>::new());
+
+        let replaced = plan(&edges, None, &HashMap::from([(na.id, true), (eu.id, true)]));
+        assert_eq!(stopped(&replaced), vec![na.id]);
+    }
+
+    #[test]
+    fn with_no_edge_in_region_every_edge_is_wanted() {
+        let na = listed(2, "NA");
+        let edges = edge_set(vec![na.clone()], &["EU"]);
+        let fallback = plan(&edges, None, &HashMap::new());
+        assert_eq!(ids(&fallback.wanted), HashSet::from([na.id]));
+    }
+
+    #[test]
+    fn a_pin_replaces_the_hubs_choice_and_keeps_unlisted_edges() {
+        let (eu, na) = (listed(1, "EU"), listed(2, "NA"));
+        let unlisted = listed(3, "NA").id;
+        let edges = edge_set(vec![eu.clone(), na.clone()], &["EU"]);
+        let pinned = HashSet::from([na.id, unlisted]);
+
+        let pinned_plan = plan(&edges, Some(&pinned), &HashMap::from([(eu.id, false)]));
+        assert_eq!(ids(&pinned_plan.wanted), pinned);
+        assert_eq!(stopped(&pinned_plan), vec![eu.id]);
+        let relay_only = pinned_plan
+            .wanted
+            .iter()
+            .find(|c| c.id == unlisted)
+            .unwrap();
+        assert_eq!(relay_only.addrs, Vec::<String>::new());
     }
 
     #[tokio::test]
@@ -1347,7 +1917,9 @@ mod tests {
         assert_eq!(metrics.streams_active.get(), 1);
         assert!(has_quic_metrics(&metrics));
 
-        pool.reconcile(&[]);
+        for sup in pool.active.values() {
+            sup.token.cancel();
+        }
         timeout(SETUP, pool.tasks.join_next())
             .await
             .unwrap()

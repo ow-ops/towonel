@@ -7283,6 +7283,7 @@ dependencies = [
  "ciborium",
  "clap",
  "fastrand",
+ "fips204",
  "iroh",
  "k8s-openapi",
  "kube",

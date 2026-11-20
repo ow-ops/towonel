@@ -102,14 +102,15 @@ async fn stalled_agent_fails_over_before_client_data_is_consumed() {
     .unwrap()
     .unwrap();
     assert_eq!(selected.id, good.id());
-    assert!(ctx.sessions.get(&bad.id()).is_none());
-    tokio::time::timeout(Duration::from_secs(1), bad_conn.closed())
-        .await
-        .unwrap();
+    // One timeout fails this connection over; it does not cost the stalled
+    // agent's other connections their session.
+    assert!(ctx.sessions.get(&bad.id()).is_some());
+    assert!(bad_conn.close_reason().is_none());
     let mut untouched = [0; 7];
     assert_eq!(server.peek(&mut untouched).await.unwrap(), 7);
     assert_eq!(&untouched, b"request");
-    let (forwarded, response) = tokio::join!(pipe_tcp(server, "a.test", send, recv), async {
+    let piped = pipe_tcp(server, "a.test", send, recv, &ctx.metrics);
+    let (forwarded, response) = tokio::join!(piped, async {
         let mut response = Vec::new();
         client.read_to_end(&mut response).await.unwrap();
         response
@@ -119,6 +120,119 @@ async fn stalled_agent_fails_over_before_client_data_is_consumed() {
     responder.await.unwrap();
     bad.close().await;
     good.close().await;
+    edge.close().await;
+}
+
+#[tokio::test]
+async fn an_agent_that_keeps_timing_out_is_evicted() {
+    let ctx = context();
+    let edge = endpoint(100).await;
+    let agent = endpoint(100).await;
+    let (conn, session) = register(&ctx, &agent, &edge, true).await;
+    // Admissions have been timing out for most of the grace period already.
+    let now = Instant::now();
+    for ago in [12, 6] {
+        let then = now.checked_sub(Duration::from_secs(ago)).unwrap();
+        session.admission_timed_out(then, ADMISSION_FAILURE_GRACE);
+    }
+
+    open_agent_stream(&ctx, agent.id(), "a.test", addrs())
+        .await
+        .unwrap_err();
+    assert!(ctx.sessions.get(&agent.id()).is_none());
+    tokio::time::timeout(Duration::from_secs(1), conn.closed())
+        .await
+        .unwrap();
+    agent.close().await;
+    edge.close().await;
+}
+
+#[tokio::test]
+async fn timeouts_far_apart_are_not_one_run() {
+    let ctx = context();
+    let edge = endpoint(100).await;
+    let agent = endpoint(100).await;
+    let (_conn, session) = register(&ctx, &agent, &edge, false).await;
+    let now = Instant::now();
+    let half_an_hour_ago = now.checked_sub(Duration::from_mins(30)).unwrap();
+    session.admission_timed_out(half_an_hour_ago, ADMISSION_FAILURE_GRACE);
+    let failing_for = session.admission_timed_out(now, ADMISSION_FAILURE_GRACE);
+    assert_eq!(failing_for, Duration::ZERO);
+    agent.close().await;
+    edge.close().await;
+}
+
+#[tokio::test]
+async fn an_admitted_stream_ends_a_run_of_timeouts() {
+    let ctx = context();
+    let edge = endpoint(100).await;
+    let agent = endpoint(100).await;
+    let (conn, session) = register(&ctx, &agent, &edge, false).await;
+    let earlier = Instant::now().checked_sub(Duration::from_secs(5)).unwrap();
+    session.admission_timed_out(earlier, ADMISSION_FAILURE_GRACE);
+
+    let _stream = open_agent_stream(&ctx, agent.id(), "a.test", addrs())
+        .await
+        .unwrap();
+    let failing_for = session.admission_timed_out(Instant::now(), ADMISSION_FAILURE_GRACE);
+    assert_eq!(failing_for, Duration::ZERO);
+    drop(conn);
+    agent.close().await;
+    edge.close().await;
+}
+
+#[tokio::test]
+async fn a_client_reset_stops_the_agent_without_losing_the_request() {
+    let ctx = context();
+    let edge = endpoint(100).await;
+    let agent = endpoint(100).await;
+    let (conn, _) = register(&ctx, &agent, &edge, false).await;
+    let (send, recv) = open_agent_stream(&ctx, agent.id(), "a.test", addrs())
+        .await
+        .unwrap();
+    // The agent's side: an origin that takes the request and never answers.
+    let (origin_reply, mut request) = conn.accept_bi().await.unwrap();
+    read_handshake(&mut request).await.unwrap();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut client = TcpStream::connect(listener.local_addr().unwrap())
+        .await
+        .unwrap();
+    let (server, _) = listener.accept().await.unwrap();
+    let metrics = ctx.metrics.clone();
+    let piping =
+        tokio::spawn(async move { pipe_tcp(server, "a.test", send, recv, &metrics).await });
+
+    client.write_all(b"req").await.unwrap();
+    // Linger 0 makes the close a reset, as a client that gave up sends.
+    socket2::SockRef::from(&client)
+        .set_linger(Some(Duration::ZERO))
+        .unwrap();
+    drop(client);
+
+    // The request arrives whole and ends cleanly; the reply is refused.
+    let got = tokio::time::timeout(Duration::from_secs(2), request.read_to_end(16))
+        .await
+        .expect("agent stream still open after the client reset");
+    assert_eq!(got.unwrap(), b"req");
+    let stopped = tokio::time::timeout(Duration::from_secs(2), origin_reply.stopped())
+        .await
+        .expect("agent was not told to stop replying");
+    assert!(matches!(stopped, Ok(Some(_))));
+    let forwarded = tokio::time::timeout(Duration::from_secs(2), piping)
+        .await
+        .expect("pipe still running after the client reset")
+        .unwrap()
+        .unwrap();
+    assert_eq!(forwarded, (3, 0));
+    assert_eq!(
+        ctx.metrics
+            .forward_errors
+            .with_label_values(&["client_to_agent"])
+            .get(),
+        1
+    );
+    agent.close().await;
     edge.close().await;
 }
 

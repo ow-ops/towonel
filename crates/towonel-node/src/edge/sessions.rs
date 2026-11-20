@@ -1,7 +1,9 @@
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use iroh::EndpointId;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
 
 use towonel_common::identity::TenantId;
@@ -13,6 +15,11 @@ pub struct AgentSession {
     pub agent_id: EndpointId,
     conn: TunnelConn,
     stream_acks: AtomicBool,
+    /// First and latest timeout of the current run of timed-out admissions.
+    admission_timeouts: Mutex<Option<(Instant, Instant)>>,
+    /// Ends the topology subscription now served. An agent follows one at a
+    /// time, so a new one replaces it rather than adding to it.
+    topology_stream: Mutex<Option<CancellationToken>>,
 }
 
 impl AgentSession {
@@ -22,7 +29,48 @@ impl AgentSession {
             agent_id,
             conn,
             stream_acks: AtomicBool::new(false),
+            admission_timeouts: Mutex::new(None),
+            topology_stream: Mutex::new(None),
         }
+    }
+
+    /// Ends the topology subscription served so far. The token returned is
+    /// cancelled when the next one arrives.
+    pub(super) fn replace_topology_stream(&self) -> CancellationToken {
+        let token = CancellationToken::new();
+        let replaced = self
+            .topology_stream
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .replace(token.clone());
+        if let Some(replaced) = replaced {
+            replaced.cancel();
+        }
+        token
+    }
+
+    pub(super) fn admission_succeeded(&self) {
+        *self.lock_admission() = None;
+    }
+
+    /// Records a timed-out admission. Returns how long admissions have been
+    /// timing out with none succeeding. A timeout more than `grace` after the
+    /// previous one starts a new run: two stalls far apart are not one outage.
+    pub(super) fn admission_timed_out(&self, now: Instant, grace: Duration) -> Duration {
+        let mut run = self.lock_admission();
+        let since = match *run {
+            Some((since, latest)) if now.saturating_duration_since(latest) <= grace => since,
+            _ => now,
+        };
+        *run = Some((since, now));
+        drop(run);
+        now.saturating_duration_since(since)
+    }
+
+    fn lock_admission(&self) -> std::sync::MutexGuard<'_, Option<(Instant, Instant)>> {
+        self.admission_timeouts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     pub(super) fn enable_stream_acks(&self) {
@@ -41,6 +89,21 @@ impl AgentSession {
         self.conn.close(code, reason);
     }
 
+    /// Bytes received and packets lost on the session's QUIC paths so far;
+    /// `None` over TLS.
+    pub(super) fn path_counters(&self) -> Option<PathCounters> {
+        let TunnelConn::Iroh(conn) = &self.conn else {
+            return None;
+        };
+        let mut counters = PathCounters::default();
+        for path in conn.paths().iter() {
+            let stats = path.stats();
+            counters.rx_bytes += stats.udp_rx.bytes;
+            counters.lost_packets += stats.lost_packets;
+        }
+        Some(counters)
+    }
+
     pub const fn is_tls(&self) -> bool {
         matches!(self.conn, TunnelConn::Tls(_))
     }
@@ -48,6 +111,12 @@ impl AgentSession {
     pub fn conn_stable_id(&self) -> usize {
         self.conn.stable_id()
     }
+}
+
+#[derive(Clone, Copy, Default)]
+pub(super) struct PathCounters {
+    pub rx_bytes: u64,
+    pub lost_packets: u64,
 }
 
 pub struct SessionRegistry {

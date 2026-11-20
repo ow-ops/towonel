@@ -9,7 +9,7 @@ use std::io;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
-use std::task::{Context, Poll};
+use std::task::{Context, Poll, ready};
 use std::time::Duration;
 
 use iroh::{EndpointId, SecretKey};
@@ -458,6 +458,7 @@ impl TlsConn {
             closed: CancellationToken::new(),
             reason: Arc::new(OnceLock::new()),
         });
+        let io = Linger { io, shut: false };
         let conn =
             yamux::Connection::new(TokioAsyncReadCompatExt::compat(io), yamux_config(), mode);
         tokio::spawn(drive(
@@ -572,8 +573,56 @@ impl TlsConn {
     }
 }
 
+/// Reads on after shutdown until the peer closes too, within `CLOSE_TIMEOUT`.
+/// Dropping a socket that holds unread data resets the connection, and the
+/// peer then fails a write before it has read our close.
+struct Linger<T> {
+    io: T,
+    shut: bool,
+}
+
+impl<T: AsyncRead + Unpin> AsyncRead for Linger<T> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().io).poll_read(cx, buf)
+    }
+}
+
+impl<T: AsyncRead + AsyncWrite + Unpin> AsyncWrite for Linger<T> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.get_mut().io).poll_write(cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().io).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        if !this.shut {
+            ready!(Pin::new(&mut this.io).poll_shutdown(cx))?;
+            this.shut = true;
+        }
+        let mut discarded = [0u8; 4096];
+        loop {
+            let mut buf = ReadBuf::new(&mut discarded);
+            let read = ready!(Pin::new(&mut this.io).poll_read(cx, &mut buf));
+            if read.is_err() || buf.filled().is_empty() {
+                return Poll::Ready(Ok(()));
+            }
+        }
+    }
+}
+
 async fn drive<T>(
-    mut conn: yamux::Connection<Compat<T>>,
+    mut conn: yamux::Connection<Compat<Linger<T>>>,
     mut open_rx: mpsc::Receiver<OpenReply>,
     accept_tx: mpsc::UnboundedSender<yamux::Stream>,
     aborted: CancellationToken,

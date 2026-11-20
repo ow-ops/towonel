@@ -1,6 +1,7 @@
 use std::collections::HashMap;
-use std::sync::RwLock;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, RwLock};
+use std::time::{Duration, Instant};
 use towonel_common::edge_link::EdgeCapabilities;
 
 pub type EdgeId = [u8; 32];
@@ -33,6 +34,8 @@ pub struct LiveEdge {
 pub struct LiveEdges {
     inner: RwLock<HashMap<EdgeId, LiveEdge>>,
     next_generation: AtomicU64,
+    /// When the set last went from empty to non-empty.
+    populated_at: Mutex<Option<Instant>>,
 }
 
 impl LiveEdges {
@@ -61,6 +64,9 @@ impl LiveEdges {
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
+        if guard.is_empty() {
+            *self.lock_populated_at() = Some(Instant::now());
+        }
         guard.insert(
             id,
             LiveEdge {
@@ -86,7 +92,24 @@ impl LiveEdges {
             .is_some_and(|edge| edge.generation == generation)
         {
             guard.remove(id);
+            if guard.is_empty() {
+                *self.lock_populated_at() = None;
+            }
         }
+    }
+
+    fn lock_populated_at(&self) -> std::sync::MutexGuard<'_, Option<Instant>> {
+        self.populated_at
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// True once edges have been connected for `window`. A hub that just
+    /// started, or just lost every edge, knows only the first few to redial,
+    /// and an agent acting on that would drop its sessions to the others.
+    pub fn settled(&self, window: Duration) -> bool {
+        self.lock_populated_at()
+            .is_some_and(|at| at.elapsed() >= window)
     }
 
     pub fn tls_endpoints(&self, id: &EdgeId) -> Vec<String> {
@@ -176,6 +199,25 @@ mod tests {
             1,
         );
         assert_eq!(live.tls_endpoints(&id), ["edge.example:51821"]);
+    }
+
+    #[test]
+    fn settles_only_while_an_edge_has_been_connected_for_the_window() {
+        let live = LiveEdges::new();
+        assert!(!live.settled(Duration::ZERO));
+        let generation = live.upsert(
+            [1u8; 32],
+            vec![],
+            EdgeCapabilities::default(),
+            vec![],
+            None,
+            vec![],
+            0,
+        );
+        assert!(live.settled(Duration::ZERO));
+        assert!(!live.settled(Duration::from_hours(1)));
+        live.remove_if_current(&[1u8; 32], generation);
+        assert!(!live.settled(Duration::ZERO));
     }
 
     #[test]
