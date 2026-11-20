@@ -18,14 +18,14 @@ async fn join(hub: &TestHub, seed: u8, auth_key: &str, name: &str) -> Peer {
     let key = iroh::SecretKey::from([seed; 32]);
     let client = MeshClient::new(&hub.base_url, key.clone()).unwrap();
     client.enroll(auth_key, name, "linux").await.unwrap();
-    let node = MeshNode::start(
+    let node = Box::pin(MeshNode::start(
         MeshClient::new(&hub.base_url, key.clone()).unwrap(),
         key.clone(),
         NodeOptions {
             bind: Some("127.0.0.1:0".parse().unwrap()),
             ..Default::default()
         },
-    )
+    ))
     .await
     .unwrap();
     Peer {
@@ -310,7 +310,9 @@ async fn ffi_mesh_carries_packets() {
             .unwrap();
         assert_eq!(mesh.enrollment().unwrap().unwrap().ipv4, info.ipv4);
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        mesh.start(std::sync::Arc::new(Collect(tx))).await.unwrap();
+        Box::pin(mesh.start(std::sync::Arc::new(Collect(tx))))
+            .await
+            .unwrap();
         meshes.push((mesh, info));
         inboxes.push(rx);
     }
