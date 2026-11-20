@@ -84,7 +84,8 @@ jobs:
         with:
           tool: cargo-nextest,sccache
       - run: cargo nextest run --workspace --all-features --no-fail-fast
-      - run: cargo nextest run -p towonel-node --all-features --run-ignored only postgres
+      # Same package selection as the run above, so nothing recompiles.
+      - run: cargo nextest run --workspace --all-features --run-ignored only -E 'package(towonel-node) & test(postgres)'
       - run: sccache --show-stats
         if: always()
 
@@ -187,6 +188,10 @@ jobs:
   e2e:
     if: github.ref == 'refs/heads/main'
     runs-on: docker
+    env:
+      ENABLE_SCCACHE: "1"
+      SCCACHE_AWS_ACCESS_KEY_ID: ${{ secrets.SCCACHE_AWS_ACCESS_KEY_ID }}
+      SCCACHE_AWS_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_AWS_SECRET_ACCESS_KEY }}
     steps:
       - uses: https://data.forgejo.org/actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - run: make e2e

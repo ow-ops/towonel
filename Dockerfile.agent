@@ -19,7 +19,7 @@ RUN apt-get update \
 
 RUN case "${BUILDARCH}" in \
         amd64) HOST_TARGET=x86_64-unknown-linux-musl; ZIG_ARCH=x86_64; SCCACHE_ARCH=x86_64 ;; \
-        arm64) HOST_TARGET=aarch64-unknown-linux-musl; ZIG_ARCH=aarch64; SCCACHE_ARCH=aarch64 ;; \
+        arm64) HOST_TARGET=aarch64-unknown-linux-gnu; ZIG_ARCH=aarch64; SCCACHE_ARCH=aarch64 ;; \
         *) echo "Unsupported BUILDARCH: ${BUILDARCH}" >&2; exit 1 ;; \
     esac \
     && curl -fsSL "https://ziglang.org/download/${ZIG_VERSION}/zig-${ZIG_ARCH}-linux-${ZIG_VERSION}.tar.xz" \
@@ -113,6 +113,18 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,id=cargo-registry-${TARG
 
 FROM scratch AS artifact
 COPY --from=builder /towonel-agent /towonel-agent
+
+# e2e only (docker-compose.e2e.yml, `target: e2e`): the release image is
+# distroless, so this rebases on debian-slim for an entrypoint that polls the
+# test-runner's token broker before exec'ing the agent.
+FROM debian:bookworm-slim@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc AS e2e
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl iptables \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=builder /towonel-agent /usr/local/bin/towonel-agent
+COPY tests/e2e/agent-entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
 
 FROM debian:bookworm-slim@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc AS runtime-prep
 RUN groupadd -g 10001 nonroot \
