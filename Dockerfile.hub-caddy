@@ -137,7 +137,7 @@ RUN GOOS=linux GOARCH=${TARGETARCH} CGO_ENABLED=0 \
 # ============================================================
 # Stage 3: runtime prep — users, dirs, binaries
 # ============================================================
-FROM debian:bookworm-slim@sha256:7ff6ba31527b9e336162fa061746c366c4b2032f4d2cff2078bea43f78efe3f8 AS runtime-prep
+FROM debian:bookworm-slim@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc AS runtime-prep
 RUN groupadd -g 10001 nonroot \
     && useradd -u 10001 -g 10001 -M -s /sbin/nologin nonroot \
     && install -d -o 10001 -g 10001 /var/lib/towonel /etc/towonel /data /data/certs /home/nonroot
@@ -148,7 +148,7 @@ COPY --from=caddy-builder /caddy-build/caddy /usr/local/bin/caddy
 # ============================================================
 # Stage 4: final runtime image
 # ============================================================
-FROM debian:bookworm-slim@sha256:7ff6ba31527b9e336162fa061746c366c4b2032f4d2cff2078bea43f78efe3f8
+FROM debian:bookworm-slim@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc
 ARG VERSION=dev
 ARG REVISION=unknown
 ARG CREATED=
