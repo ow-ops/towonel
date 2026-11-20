@@ -6,14 +6,14 @@ services:
       context: .
       dockerfile: Dockerfile.e2e-pebble
     container_name: towonel-e2e-pebble
-    command: ["-config", "/pebble-config.json", "-dnsserver", "127.0.0.11:53"]
+    command: ["-config", "/certs/pebble-config.json", "-dnsserver", "127.0.0.11:53"]
     environment:
       # Deterministic validation: no random sleeps, no random nonce rejects.
       PEBBLE_VA_NOSLEEP: "1"
       PEBBLE_WFE_NONCEREJECT: "0"
     volumes:
-      - ./tests/e2e/fixtures/pebble-config.json:/pebble-config.json:ro
-      - ./tests/e2e/fixtures:/certs:ro
+      # Writable here only: `make e2e` copies the fixtures in through this mount.
+      - fixtures:/certs
     healthcheck:
       test: ["CMD", "curl", "-fsSk", "https://127.0.0.1:14000/dir"]
       interval: 2s
@@ -56,7 +56,7 @@ services:
       SSL_CERT_FILE: /certs/pebble-ca.pem
     volumes:
       - hub-data:/data
-      - ./tests/e2e/fixtures:/certs:ro
+      - fixtures:/certs:ro
     networks:
       default:
         ipv4_address: 10.171.83.10
@@ -119,7 +119,7 @@ services:
         done
         wait
     volumes:
-      - ./tests/e2e/fixtures:/certs:ro
+      - fixtures:/certs:ro
     healthcheck:
       test: ["CMD", "sh", "-c", "nc -z 127.0.0.1 9000"]
       interval: 2s
@@ -162,7 +162,7 @@ services:
       E2E_LIVENESS_BUDGET_SECS: "30"
       E2E_RECOVERY_BUDGET_SECS: "60"
     volumes:
-      - ./tests/e2e/fixtures:/fixtures:ro
+      - fixtures:/fixtures:ro
       - hub-data:/hub-data:ro
       - /var/run/docker.sock:/var/run/docker.sock:ro
 
@@ -199,6 +199,9 @@ services:
 
 volumes:
   hub-data:
+  # A volume, not a bind mount: in CI the Docker daemon runs outside the job
+  # container and cannot see paths in the checkout.
+  fixtures:
 
 secrets:
   SCCACHE_AWS_ACCESS_KEY_ID:

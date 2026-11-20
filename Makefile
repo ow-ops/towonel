@@ -39,7 +39,12 @@ E2E_FILES ?= -f docker-compose.e2e.yml
 e2e:
 	./tests/e2e/fixtures/make-fixtures.sh
 	docker compose --env-file .env.e2e $(E2E_FILES) down -v
-	docker compose --env-file .env.e2e $(E2E_FILES) up --build --detach
+	docker compose --env-file .env.e2e $(E2E_FILES) up --build --no-start
+	docker compose --env-file .env.e2e $(E2E_FILES) cp tests/e2e/fixtures/. pebble:/certs
+	docker compose --env-file .env.e2e $(E2E_FILES) up --detach || { \
+		docker compose --env-file .env.e2e $(E2E_FILES) logs --no-color; \
+		docker compose --env-file .env.e2e $(E2E_FILES) down -v; \
+		exit 1; }
 	@code=$$(docker wait towonel-e2e-runner); \
 		docker compose --env-file .env.e2e $(E2E_FILES) logs --no-color test-runner; \
 		echo "test-runner exit code: $$code"; \
