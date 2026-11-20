@@ -172,7 +172,7 @@ impl MeshClient {
         let now = now_ms();
         let prev = self
             .last_ts
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |last| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |last| {
                 Some(now.max(last + 1))
             })
             .unwrap_or_else(|last| last);

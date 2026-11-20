@@ -1,3 +1,8 @@
+#![expect(
+    clippy::empty_enums,
+    reason = "sea-orm's DeriveRelation needs a `Relation` enum even when an entity has none"
+)]
+
 pub mod admin_actions;
 pub mod api_keys;
 pub mod email_verification_tokens;

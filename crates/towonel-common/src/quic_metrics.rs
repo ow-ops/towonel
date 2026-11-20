@@ -335,10 +335,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[expect(
-        clippy::float_cmp,
-        reason = "these counts and boolean gauges are exact integers"
-    )]
     async fn exports_live_connection_stats() {
         let edge = endpoint().await;
         let agent = endpoint().await;

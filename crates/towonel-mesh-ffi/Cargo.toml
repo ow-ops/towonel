@@ -28,3 +28,4 @@ uniffi = { workspace = true }
 
 # No `[lints] workspace = true`: UniFFI's generated scaffolding needs
 # `unsafe`, which the workspace forbids.
+[lints]

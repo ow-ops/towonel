@@ -26,6 +26,8 @@ correctness = { level = "deny", priority = -1 }
 module_name_repetitions = "allow"
 missing_errors_doc = "allow"
 missing_panics_doc = "allow"
+# New in 1.100; its suggested fix spells out `[] as [T; 0]` in every test assert.
+assert_is_empty = "allow"
 
 # Don't Panic - prevent panics from unwraps and unsafe slicing or indexing.
 # Denied so they also surface on bare `cargo check`, not just CI clippy.
@@ -111,6 +113,8 @@ iroh = { workspace = true }
 tokio = { workspace = true }
 
 
+[lints]
+
 [workspace.dependencies]
 iroh = { version = "1.4.1" }
 noq-proto = { version = "1.4", default-features = false }
@@ -128,7 +132,6 @@ sea-orm-migration = { version = "2", default-features = false, features = [
   "sqlx-postgres",
   "runtime-tokio-rustls",
 ] }
-sea-query = "1.0"
 async-trait = "0.1"
 bytes = "1"
 serde = { version = "1", features = ["derive"] }
@@ -157,11 +160,9 @@ tower-http = { version = "0.7", features = [
   "util",
   "limit",
 ] }
-rand_core = { version = "0.10.0" }
 getrandom = "0.4"
 fastrand = "2"
 reqwest = { version = "0.13", features = ["json", "stream"] }
-eventsource-stream = "0.2"
 prometheus = { version = "0.14", default-features = false, features = [
   "process",
 ] }
@@ -173,7 +174,6 @@ fips204 = { version = "0.4", default-features = false, features = [
   "default-rng",
 ] }
 tokio-stream = { version = "0.1", features = ["sync"] }
-async-stream = "0.3"
 tower_governor = { version = "0.8", default-features = false, features = [
   "axum",
 ] }
@@ -217,7 +217,6 @@ smallvec = "1"
 tokio-util = { version = "0.7", features = ["rt", "compat"] }
 yamux = "0.14"
 blake3 = "1"
-normpath = "1"
 petname = { version = "3", default-features = false, features = [
   "default-rng",
   "default-words",
