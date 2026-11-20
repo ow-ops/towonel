@@ -130,6 +130,9 @@ jobs:
       - name: Build and push towonel-node
         id: build-node
         uses: https://data.forgejo.org/docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.SCCACHE_AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_AWS_SECRET_ACCESS_KEY }}
         with:
           context: .
           file: Dockerfile.node
@@ -144,10 +147,13 @@ jobs:
           secrets: |
             SCCACHE_AWS_ACCESS_KEY_ID=${{ secrets.SCCACHE_AWS_ACCESS_KEY_ID }}
             SCCACHE_AWS_SECRET_ACCESS_KEY=${{ secrets.SCCACHE_AWS_SECRET_ACCESS_KEY }}
-          cache-from: type=registry,ref=git.ow-ops.eu/towonel/towonel-buildcache:node
-          cache-to: type=registry,ref=git.ow-ops.eu/towonel/towonel-buildcache:node,mode=max,ignore-error=true
+          cache-from: type=s3,region=gra,bucket=ow-oops-sccache,endpoint_url=https://s3.gra.io.cloud.ovh.net,prefix=buildkit/towonel/,name=node
+          cache-to: type=s3,region=gra,bucket=ow-oops-sccache,endpoint_url=https://s3.gra.io.cloud.ovh.net,prefix=buildkit/towonel/,name=node,mode=max,ignore-error=true
       - name: Extract node binaries
         uses: https://data.forgejo.org/docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.SCCACHE_AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_AWS_SECRET_ACCESS_KEY }}
         with:
           context: .
           file: Dockerfile.node
@@ -159,7 +165,7 @@ jobs:
           secrets: |
             SCCACHE_AWS_ACCESS_KEY_ID=${{ secrets.SCCACHE_AWS_ACCESS_KEY_ID }}
             SCCACHE_AWS_SECRET_ACCESS_KEY=${{ secrets.SCCACHE_AWS_SECRET_ACCESS_KEY }}
-          cache-from: type=registry,ref=git.ow-ops.eu/towonel/towonel-buildcache:node
+          cache-from: type=s3,region=gra,bucket=ow-oops-sccache,endpoint_url=https://s3.gra.io.cloud.ovh.net,prefix=buildkit/towonel/,name=node
       - name: Compute agent image metadata
         id: meta-agent
         uses: https://data.forgejo.org/docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6
@@ -174,6 +180,9 @@ jobs:
       - name: Build and push towonel-agent
         id: build-agent
         uses: https://data.forgejo.org/docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.SCCACHE_AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_AWS_SECRET_ACCESS_KEY }}
         with:
           context: .
           file: Dockerfile.agent
@@ -188,10 +197,13 @@ jobs:
           secrets: |
             SCCACHE_AWS_ACCESS_KEY_ID=${{ secrets.SCCACHE_AWS_ACCESS_KEY_ID }}
             SCCACHE_AWS_SECRET_ACCESS_KEY=${{ secrets.SCCACHE_AWS_SECRET_ACCESS_KEY }}
-          cache-from: type=registry,ref=git.ow-ops.eu/towonel/towonel-buildcache:agent
-          cache-to: type=registry,ref=git.ow-ops.eu/towonel/towonel-buildcache:agent,mode=max,ignore-error=true
+          cache-from: type=s3,region=gra,bucket=ow-oops-sccache,endpoint_url=https://s3.gra.io.cloud.ovh.net,prefix=buildkit/towonel/,name=agent
+          cache-to: type=s3,region=gra,bucket=ow-oops-sccache,endpoint_url=https://s3.gra.io.cloud.ovh.net,prefix=buildkit/towonel/,name=agent,mode=max,ignore-error=true
       - name: Extract agent binaries
         uses: https://data.forgejo.org/docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.SCCACHE_AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_AWS_SECRET_ACCESS_KEY }}
         with:
           context: .
           file: Dockerfile.agent
@@ -203,7 +215,7 @@ jobs:
           secrets: |
             SCCACHE_AWS_ACCESS_KEY_ID=${{ secrets.SCCACHE_AWS_ACCESS_KEY_ID }}
             SCCACHE_AWS_SECRET_ACCESS_KEY=${{ secrets.SCCACHE_AWS_SECRET_ACCESS_KEY }}
-          cache-from: type=registry,ref=git.ow-ops.eu/towonel/towonel-buildcache:agent
+          cache-from: type=s3,region=gra,bucket=ow-oops-sccache,endpoint_url=https://s3.gra.io.cloud.ovh.net,prefix=buildkit/towonel/,name=agent
       - name: Compute hub-caddy image metadata
         id: meta-hub-caddy
         uses: https://data.forgejo.org/docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6
@@ -218,6 +230,9 @@ jobs:
       - name: Build and push towonel-hub-caddy
         id: build-hub-caddy
         uses: https://data.forgejo.org/docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.SCCACHE_AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_AWS_SECRET_ACCESS_KEY }}
         with:
           context: .
           file: Dockerfile.hub-caddy
@@ -232,8 +247,8 @@ jobs:
           secrets: |
             SCCACHE_AWS_ACCESS_KEY_ID=${{ secrets.SCCACHE_AWS_ACCESS_KEY_ID }}
             SCCACHE_AWS_SECRET_ACCESS_KEY=${{ secrets.SCCACHE_AWS_SECRET_ACCESS_KEY }}
-          cache-from: type=registry,ref=git.ow-ops.eu/towonel/towonel-buildcache:hub-caddy
-          cache-to: type=registry,ref=git.ow-ops.eu/towonel/towonel-buildcache:hub-caddy,mode=max,ignore-error=true
+          cache-from: type=s3,region=gra,bucket=ow-oops-sccache,endpoint_url=https://s3.gra.io.cloud.ovh.net,prefix=buildkit/towonel/,name=hub-caddy
+          cache-to: type=s3,region=gra,bucket=ow-oops-sccache,endpoint_url=https://s3.gra.io.cloud.ovh.net,prefix=buildkit/towonel/,name=hub-caddy,mode=max,ignore-error=true
       - name: Install cosign
         run: |
           set -euo pipefail
