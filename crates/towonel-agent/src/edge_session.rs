@@ -356,10 +356,10 @@ fn record_dial_failure(
 
     if error
         .chain()
-        .any(|cause| cause.is::<tokio::time::error::Elapsed>())
+        .any(<dyn std::error::Error>::is::<tokio::time::error::Elapsed>)
     {
         if timeouts.fetch_add(1, Ordering::Relaxed) + 1 >= REBUILD_AFTER_TIMEOUTS {
-            let _ = events.send(SessionEvent::ConnectTimeouts);
+            drop(events.send(SessionEvent::ConnectTimeouts));
         }
     } else {
         timeouts.store(0, Ordering::Relaxed);
@@ -572,7 +572,7 @@ async fn dial_and_serve(
     // Marks the session live; resets the gauge and aborts the path watcher on
     // Drop, surviving a mid-session cancellation (see `EdgeSessionGuard`).
     let mut guard = EdgeSessionGuard::live(Arc::clone(metrics), edge_label.clone(), conn.clone());
-    let _ = events.send(SessionEvent::Connected);
+    drop(events.send(SessionEvent::Connected));
     guard.path_watcher = quic.map(|quic| watch_path(&quic, &edge_label, metrics));
     if transport == Transport::Tls {
         metrics.set_edge_path(&edge_label, "tls");
@@ -842,7 +842,7 @@ mod tests {
             let blocked = Arc::clone(&blocked);
             async move {
                 let mut client = None;
-                let mut buf = [0; 65536];
+                let mut buf = vec![0; 65536];
                 loop {
                     let (len, source) = proxy.recv_from(&mut buf).await.unwrap();
                     if source == edge_addr {
@@ -863,7 +863,7 @@ mod tests {
             async move {
                 while let Some(incoming) = edge.accept().await {
                     tokio::spawn(async move {
-                        let _ = incoming.await;
+                        drop(incoming.await);
                     });
                 }
             }
@@ -876,7 +876,7 @@ mod tests {
         assert!(
             error
                 .chain()
-                .any(|cause| cause.is::<tokio::time::error::Elapsed>())
+                .any(<dyn std::error::Error>::is::<tokio::time::error::Elapsed>)
         );
 
         let replacement = quic_endpoint(None, false).await;

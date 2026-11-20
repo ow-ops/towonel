@@ -249,6 +249,11 @@ mod pktinfo {
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
+#[expect(
+    clippy::missing_const_for_fn,
+    clippy::unnecessary_wraps,
+    reason = "stubs mirror the Linux signatures"
+)]
 mod fallback {
     use super::{IpAddr, SocketAddr, io};
     use tokio::net::UdpSocket;

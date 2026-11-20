@@ -155,6 +155,7 @@ async fn setup_exit(
 }
 
 #[cfg(not(target_os = "linux"))]
+#[expect(clippy::unused_async, reason = "stub mirrors the Linux signature")]
 async fn setup_exit(
     _node: &MeshNode,
     _hub_url: &str,
