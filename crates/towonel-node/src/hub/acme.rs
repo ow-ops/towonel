@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 use anyhow::Context as _;
 use async_trait::async_trait;
 use certon::{
-    AcmeIssuer, CacheOptions, CertCache, CertIssuer, CertResolver, Config, FileStorage,
+    AcmeIssuer, CacheOptions, CertCache, CertIssuer, CertManager, CertResolver, FileStorage,
     LETS_ENCRYPT_PRODUCTION, LETS_ENCRYPT_STAGING, Solver, Storage,
 };
 use rcgen::{CertificateParams, CustomExtension, KeyPair, PKCS_ECDSA_P256_SHA256};
@@ -60,7 +60,7 @@ pub async fn load_account_info(
 const FAILURE_COOLDOWN: Duration = Duration::from_mins(15);
 
 pub struct AcmeManager {
-    config: Arc<Config>,
+    config: Arc<CertManager>,
     server_config: Arc<rustls::ServerConfig>,
     inflight: Arc<papaya::HashMap<String, ()>>,
     failures: papaya::HashMap<String, Instant>,
@@ -115,7 +115,7 @@ impl AcmeManager {
             .build();
         let issuers: Vec<Arc<dyn CertIssuer>> = vec![Arc::new(issuer)];
 
-        let config = Config::builder()
+        let config = CertManager::builder()
             .storage(storage)
             .cache(cache)
             .issuers(issuers)
@@ -147,15 +147,15 @@ impl AcmeManager {
 
     pub async fn ensure_cert(&self, hostname: &str) -> anyhow::Result<()> {
         self.config
-            .manage_sync(&[hostname.to_string()])
+            .manage(&[hostname.to_string()])
             .await
-            .with_context(|| format!("ACME manage_sync failed for {hostname}"))?;
-        // `obtain_cert_sync` (inside `manage_sync` on a fresh order) writes
+            .with_context(|| format!("ACME manage failed for {hostname}"))?;
+        // `obtain` (inside `manage` on a fresh order) writes
         // the cert to storage but doesn't push it into the cache the rustls
         // resolver reads from. Without this load, the first handshake after
         // issuance still misses.
-        if let Err(e) = self.config.cache_managed_certificate(hostname).await {
-            warn!(%hostname, error = %e, "failed to refresh cert cache after manage_sync");
+        if let Err(e) = self.config.cache_certificate(hostname).await {
+            warn!(%hostname, error = %e, "failed to refresh cert cache after manage");
         }
         Ok(())
     }

@@ -182,7 +182,7 @@ utoipa-swagger-ui = { version = "10", default-features = false, features = [
   "axum",
 ] }
 aes-gcm = "0.11"
-argon2 = "0.5"
+argon2 = "0.6"
 totp-rs = { version = "6", default-features = false, features = ["alloc"] }
 subtle = "2.6"
 zeroize = { version = "1", features = ["derive"] }
@@ -194,7 +194,7 @@ rustls = { version = "0.23", default-features = false, features = [
   "ring",
 ] }
 rustls-pemfile = "2"
-certon = { version = "0.2", default-features = false, features = ["ring"] }
+certon = { version = "0.3", default-features = false, features = ["ring"] }
 rcgen = "0.14"
 webpki-roots = "1.0"
 arc-swap = "1.7"
@@ -223,7 +223,7 @@ petname = { version = "3", default-features = false, features = [
   "default-words",
 ] }
 envy = "0.4"
-tabled = "0.21"
+tabled = "0.22"
 qrcode = { version = "0.14", default-features = false }
 rqrr = { version = "0.11", default-features = false }
 tun-rs = { version = "2.8", features = ["async_tokio"] }

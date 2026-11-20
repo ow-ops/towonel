@@ -2,7 +2,7 @@
 //! so future parameter bumps verify old hashes transparently.
 #![allow(dead_code, reason = "consumed by web routes once mounted")]
 
-use argon2::password_hash::{PasswordHasher, PasswordVerifier, SaltString, rand_core::OsRng};
+use argon2::password_hash::{PasswordHasher, PasswordVerifier, phc::PasswordHash};
 use argon2::{Algorithm, Argon2, Params, Version};
 
 const MEMORY_KIB: u32 = 19_456; // 19 MiB — OWASP 2024 baseline
@@ -26,9 +26,8 @@ pub async fn hash(password: &str) -> anyhow::Result<String> {
 }
 
 fn hash_blocking(password: &str) -> anyhow::Result<String> {
-    let salt = SaltString::generate(&mut OsRng);
     let hash = hasher()
-        .hash_password(password.as_bytes(), &salt)
+        .hash_password(password.as_bytes())
         .map_err(|e| anyhow::anyhow!("argon2 hash: {e}"))?;
     Ok(hash.to_string())
 }
@@ -45,11 +44,10 @@ pub async fn verify(password: &str, phc: &str) -> anyhow::Result<bool> {
 }
 
 fn verify_blocking(password: &str, phc: &str) -> anyhow::Result<bool> {
-    let parsed = argon2::password_hash::PasswordHash::new(phc)
-        .map_err(|e| anyhow::anyhow!("invalid stored hash: {e}"))?;
+    let parsed = PasswordHash::new(phc).map_err(|e| anyhow::anyhow!("invalid stored hash: {e}"))?;
     match hasher().verify_password(password.as_bytes(), &parsed) {
         Ok(()) => Ok(true),
-        Err(argon2::password_hash::Error::Password) => Ok(false),
+        Err(argon2::password_hash::Error::PasswordInvalid) => Ok(false),
         Err(e) => Err(anyhow::anyhow!("argon2 verify: {e}")),
     }
 }
