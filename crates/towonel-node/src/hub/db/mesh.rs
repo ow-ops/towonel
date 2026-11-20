@@ -2,7 +2,8 @@ use std::collections::HashSet;
 use std::net::Ipv4Addr;
 
 use sea_orm::{
-    ActiveValue, ColumnTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect, TransactionTrait,
+    ActiveValue, ColumnTrait, EntityTrait, ExprTrait, QueryFilter, QueryOrder, QuerySelect,
+    TransactionTrait,
 };
 use towonel_common::identity::TenantId;
 use towonel_common::mesh::{DeviceId, MESH_IPV4_MAX_HOST, mesh_ipv4};

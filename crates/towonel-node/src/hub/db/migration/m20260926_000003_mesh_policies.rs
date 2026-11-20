@@ -46,7 +46,7 @@ impl MigrationTrait for Migration {
         if backend != DatabaseBackend::Postgres {
             manager
                 .get_connection()
-                .execute(Statement::from_string(
+                .execute_raw(Statement::from_string(
                     backend,
                     "CREATE TRIGGER delete_mesh_policies_on_invite_delete AFTER DELETE ON invites \
                      BEGIN DELETE FROM mesh_policies WHERE tenant_id = OLD.tenant_id; END",
@@ -60,7 +60,7 @@ impl MigrationTrait for Migration {
         if manager.get_database_backend() != DatabaseBackend::Postgres {
             manager
                 .get_connection()
-                .execute(Statement::from_string(
+                .execute_raw(Statement::from_string(
                     manager.get_database_backend(),
                     "DROP TRIGGER IF EXISTS delete_mesh_policies_on_invite_delete",
                 ))

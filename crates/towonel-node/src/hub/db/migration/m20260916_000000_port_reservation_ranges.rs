@@ -24,7 +24,7 @@ impl MigrationTrait for Migration {
             .await?;
 
         let db = manager.get_connection();
-        db.execute(Statement::from_string(
+        db.execute_raw(Statement::from_string(
             db.get_database_backend(),
             "UPDATE port_reservations SET port_end = port WHERE port_end = 0".to_string(),
         ))

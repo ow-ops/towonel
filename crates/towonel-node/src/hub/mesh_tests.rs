@@ -432,7 +432,7 @@ async fn exec_sql(hub: &TestHub, sql: &str) {
     hub.state
         .db
         .conn
-        .execute(Statement::from_string(
+        .execute_raw(Statement::from_string(
             sea_orm::DatabaseBackend::Sqlite,
             sql.to_string(),
         ))

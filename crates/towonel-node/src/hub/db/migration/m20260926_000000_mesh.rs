@@ -150,7 +150,7 @@ impl MigrationTrait for Migration {
         if !postgres {
             let db = manager.get_connection();
             for table in ["mesh_devices", "mesh_auth_keys"] {
-                db.execute(Statement::from_string(
+                db.execute_raw(Statement::from_string(
                     backend,
                     format!(
                         "CREATE TRIGGER delete_{table}_on_invite_delete \
@@ -168,7 +168,7 @@ impl MigrationTrait for Migration {
         if manager.get_database_backend() != DatabaseBackend::Postgres {
             let db = manager.get_connection();
             for table in ["mesh_devices", "mesh_auth_keys"] {
-                db.execute(Statement::from_string(
+                db.execute_raw(Statement::from_string(
                     manager.get_database_backend(),
                     format!("DROP TRIGGER IF EXISTS delete_{table}_on_invite_delete"),
                 ))
