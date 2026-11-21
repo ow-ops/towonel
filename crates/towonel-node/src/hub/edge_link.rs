@@ -1,4 +1,3 @@
-use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -13,6 +12,7 @@ use tracing::{Instrument, info, info_span, warn};
 use towonel_common::edge_link::{
     EdgeToHub, HubSigningKey, HubToEdge, read_edge_to_hub, write_hub_to_edge,
 };
+use towonel_common::identity::TenantId;
 use towonel_common::routing::RouteTable;
 use towonel_common::time::now_ms;
 use towonel_common::tunnel::CONTROL_STATUS_INTERNAL_ERROR;
@@ -20,7 +20,7 @@ use towonel_common::tunnel::CONTROL_STATUS_INTERNAL_ERROR;
 use crate::edge::hub_client::ControlFrameHandler;
 
 use super::api::{AppState, trigger_route_rebuild};
-use super::db::port_reservations::PortProtocol;
+use super::db::port_reservations::{PortProtocol, PortReservationRow};
 use super::live_agents::SourceKey;
 use super::live_edges::EdgeId;
 
@@ -466,32 +466,46 @@ fn canonical_ips(ips: &[String]) -> Vec<String> {
 
 fn filter_listeners_for_edge(table: &mut RouteTable, state: &Arc<AppState>, public_ips: &[String]) {
     let reservations = state.port_reservations.load();
-
-    table.retain_tcp_listeners(|port, _binding| {
-        let assigned_ips: HashSet<&str> = reservations
-            .iter()
-            .filter(|r| r.protocol == PortProtocol::Tcp && r.port == *port)
-            .filter_map(|r| r.ip_address.as_deref())
-            .collect();
-
-        assigned_ips.is_empty()
-            || assigned_ips
-                .iter()
-                .any(|ip| public_ips.iter().any(|p| p == ip))
+    table.retain_tcp_listeners(|port, binding| {
+        edge_serves(
+            &reservations,
+            PortProtocol::Tcp,
+            &binding.tenant,
+            *port,
+            public_ips,
+        )
     });
-
-    table.retain_udp_listeners(|port, _binding| {
-        let assigned_ips: HashSet<&str> = reservations
-            .iter()
-            .filter(|r| r.protocol == PortProtocol::Udp && r.port == *port)
-            .filter_map(|r| r.ip_address.as_deref())
-            .collect();
-
-        assigned_ips.is_empty()
-            || assigned_ips
-                .iter()
-                .any(|ip| public_ips.iter().any(|p| p == ip))
+    table.retain_udp_listeners(|port, binding| {
+        edge_serves(
+            &reservations,
+            PortProtocol::Udp,
+            &binding.tenant,
+            *port,
+            public_ips,
+        )
     });
+}
+
+/// Whether an edge with `public_ips` listens on `port` for `tenant`: the
+/// tenant's reservation covering the port is on one of those IPs, or names
+/// none. Another tenant may hold the same port on another edge's IP.
+fn edge_serves(
+    reservations: &[PortReservationRow],
+    protocol: PortProtocol,
+    tenant: &TenantId,
+    port: u16,
+    public_ips: &[String],
+) -> bool {
+    let mut assigned_ips = reservations
+        .iter()
+        .filter(|r| {
+            r.protocol == protocol
+                && r.tenant_id == *tenant
+                && (r.port..=r.port_end).contains(&port)
+        })
+        .filter_map(|r| r.ip_address.as_deref())
+        .peekable();
+    assigned_ips.peek().is_none() || assigned_ips.any(|ip| public_ips.iter().any(|p| p == ip))
 }
 
 fn current_signing_keys(state: &AppState) -> anyhow::Result<Vec<HubSigningKey>> {
@@ -508,6 +522,56 @@ mod tests {
     use towonel_common::topology::Topology;
 
     use crate::hub::test_helpers::TestHub;
+
+    fn reserved(tenant: u8, ip: Option<&str>, ports: (u16, u16)) -> PortReservationRow {
+        PortReservationRow {
+            id: [0; 16],
+            tenant_id: TenantId::from_bytes(&[tenant; 32]),
+            ip_address: ip.map(str::to_owned),
+            port: ports.0,
+            port_end: ports.1,
+            protocol: PortProtocol::Udp,
+            label: None,
+            claimed_at_ms: 0,
+        }
+    }
+
+    fn serves(reservations: &[PortReservationRow], tenant: u8, port: u16, edge_ip: &str) -> bool {
+        let tenant = TenantId::from_bytes(&[tenant; 32]);
+        edge_serves(
+            reservations,
+            PortProtocol::Udp,
+            &tenant,
+            port,
+            &[edge_ip.to_owned()],
+        )
+    }
+
+    #[test]
+    fn a_port_two_tenants_reserved_goes_to_the_edge_of_the_tenant_that_serves_it() {
+        let reservations = [
+            reserved(1, Some("192.0.2.1"), (3478, 3478)),
+            reserved(2, Some("192.0.2.2"), (3478, 3478)),
+        ];
+
+        assert!(serves(&reservations, 1, 3478, "192.0.2.1"));
+        assert!(!serves(&reservations, 1, 3478, "192.0.2.2"));
+    }
+
+    #[test]
+    fn every_port_of_a_reserved_range_stays_on_its_edge() {
+        let reservations = [reserved(1, Some("192.0.2.1"), (50100, 50200))];
+
+        assert!(serves(&reservations, 1, 50150, "192.0.2.1"));
+        assert!(!serves(&reservations, 1, 50150, "192.0.2.2"));
+    }
+
+    #[test]
+    fn a_reservation_without_an_ip_is_served_by_every_edge() {
+        let reservations = [reserved(1, None, (3478, 3478))];
+
+        assert!(serves(&reservations, 1, 3478, "192.0.2.2"));
+    }
 
     struct EchoControl;
 
