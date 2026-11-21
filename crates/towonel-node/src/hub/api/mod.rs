@@ -34,6 +34,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, broadcast};
 use tower_http::ServiceBuilderExt;
+use tower_http::classify::ServerErrorsFailureClass;
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::request_id::MakeRequestUuid;
 use tower_http::trace::{DefaultOnResponse, TraceLayer};
@@ -603,7 +604,21 @@ fn build_router(state: Arc<AppState>, rate_limit: bool) -> Router {
             towonel_common::telemetry::set_parent_from_headers(&span, req.headers());
             span
         })
-        .on_response(DefaultOnResponse::new().level(Level::DEBUG));
+        .on_response(DefaultOnResponse::new().level(Level::DEBUG))
+        // A 503 tells the caller to retry; it is not a fault in the hub.
+        .on_failure(
+            |class: ServerErrorsFailureClass, latency: Duration, span: &tracing::Span| {
+                let latency = format_args!("{} ms", latency.as_millis());
+                if matches!(
+                    class,
+                    ServerErrorsFailureClass::StatusCode(StatusCode::SERVICE_UNAVAILABLE)
+                ) {
+                    tracing::warn!(parent: span, classification = %class, %latency, "response failed");
+                } else {
+                    tracing::error!(parent: span, classification = %class, %latency, "response failed");
+                }
+            },
+        );
     let correlated = tower::ServiceBuilder::new()
         .set_x_request_id(MakeRequestUuid)
         .layer(trace_layer)
