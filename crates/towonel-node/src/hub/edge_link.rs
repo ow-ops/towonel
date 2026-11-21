@@ -548,7 +548,7 @@ mod tests {
     }
 
     #[test]
-    fn a_port_two_tenants_reserved_goes_to_the_edge_of_the_tenant_that_serves_it() {
+    fn a_port_reserved_on_two_edges_is_served_where_its_own_tenant_reserved_it() {
         let reservations = [
             reserved(1, Some("192.0.2.1"), (3478, 3478)),
             reserved(2, Some("192.0.2.2"), (3478, 3478)),
@@ -571,6 +571,21 @@ mod tests {
         let reservations = [reserved(1, None, (3478, 3478))];
 
         assert!(serves(&reservations, 1, 3478, "192.0.2.2"));
+    }
+
+    #[test]
+    fn a_reservation_for_the_other_protocol_does_not_place_a_listener() {
+        let reservations = [reserved(1, Some("192.0.2.1"), (3478, 3478))];
+        let tenant = TenantId::from_bytes(&[1; 32]);
+        let elsewhere = ["192.0.2.2".to_owned()];
+
+        assert!(edge_serves(
+            &reservations,
+            PortProtocol::Tcp,
+            &tenant,
+            3478,
+            &elsewhere
+        ));
     }
 
     struct EchoControl;
