@@ -117,7 +117,7 @@ COPY --from=builder /towonel-agent /towonel-agent
 # e2e only (docker-compose.e2e.yml, `target: e2e`): the release image is
 # distroless, so this rebases on debian-slim for an entrypoint that polls the
 # test-runner's token broker before exec'ing the agent.
-FROM debian:bookworm-slim@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc AS e2e
+FROM debian:bookworm-slim@sha256:e67eeead736ff7bbe258ef088bff683635c561b1fcfefad0806c1df4ab49ce0e AS e2e
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl iptables \
     && rm -rf /var/lib/apt/lists/*
@@ -126,7 +126,7 @@ COPY tests/e2e/agent-entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
 
-FROM debian:bookworm-slim@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc AS runtime-prep
+FROM debian:bookworm-slim@sha256:e67eeead736ff7bbe258ef088bff683635c561b1fcfefad0806c1df4ab49ce0e AS runtime-prep
 RUN groupadd -g 10001 nonroot \
     && useradd -u 10001 -g 10001 -M -s /sbin/nologin nonroot \
     && install -d -o 10001 -g 10001 /home/nonroot
