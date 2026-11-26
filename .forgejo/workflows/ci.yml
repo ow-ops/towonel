@@ -20,7 +20,7 @@ env:
 
 jobs:
   fmt:
-    runs-on: docker
+    runs-on: light
     steps:
       - uses: https://data.forgejo.org/actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: https://github.com/dtolnay/rust-toolchain@1.96.0
@@ -90,7 +90,7 @@ jobs:
         if: always()
 
   deny:
-    runs-on: docker
+    runs-on: light
     steps:
       - uses: https://data.forgejo.org/actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: https://github.com/dtolnay/rust-toolchain@1.96.0
@@ -100,7 +100,7 @@ jobs:
       - run: cargo deny --all-features check
 
   machete:
-    runs-on: docker
+    runs-on: light
     steps:
       - uses: https://data.forgejo.org/actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: https://github.com/taiki-e/install-action@75a7c0f87bd666af3cdb75c5b9e9d03ab6044e6f # v2
@@ -109,7 +109,7 @@ jobs:
       - run: cargo-machete
 
   typos:
-    runs-on: docker
+    runs-on: light
     steps:
       - uses: https://data.forgejo.org/actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: https://github.com/taiki-e/install-action@75a7c0f87bd666af3cdb75c5b9e9d03ab6044e6f # v2
@@ -118,7 +118,7 @@ jobs:
       - run: typos
 
   taplo:
-    runs-on: docker
+    runs-on: light
     steps:
       - uses: https://data.forgejo.org/actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: https://github.com/taiki-e/install-action@75a7c0f87bd666af3cdb75c5b9e9d03ab6044e6f # v2
@@ -127,7 +127,7 @@ jobs:
       - run: taplo fmt --check
 
   helm:
-    runs-on: docker
+    runs-on: light
     env:
       # renovate: datasource=github-releases depName=helm-unittest/helm-unittest
       HELM_UNITTEST_VERSION: "1.1.1"
