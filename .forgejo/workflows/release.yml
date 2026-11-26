@@ -93,7 +93,7 @@ jobs:
           platforms: arm64
       - uses: https://data.forgejo.org/docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
       - uses: https://github.com/dtolnay/rust-toolchain@1.96.0
-      - uses: https://github.com/taiki-e/install-action@75a7c0f87bd666af3cdb75c5b9e9d03ab6044e6f # v2
+      - uses: https://github.com/taiki-e/install-action@073e1fd0bc889c9aee68dbaaa927cde1b5653a83 # v2
         with:
           tool: cargo-edit
       - name: Set version from git tag
